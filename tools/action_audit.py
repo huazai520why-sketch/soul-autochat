@@ -11,14 +11,22 @@
 典型基线（修复前，每文件最后 4000 行）：nav_back 725 / am_start 465 /
 restart 279 / 放弃 137 —— 其中 restart 每次 20~40s，等于 2~3 小时纯停机。
 
-跑法：python tools/action_audit.py [每个文件看最后多少行]
+跑法：
+    python tools/action_audit.py                              # 历史基线（最后 4000 行）
+    python tools/action_audit.py --since "11-09 00:00:00"     # 只看某时刻之后的净增量
+    python tools/action_audit.py 8000 --since "11-08 23:59:00"
+
+🔴 `--since` 是**验证修复效果**的正确姿势（2026-11-09 加）：改完操作层、
+重启 daemon 后，只统计新产生的动作，避免几千行历史噪声把结论冲淡。
+格式 MM-DD HH:MM:SS（同一年内按字典序比较即可）；指定 --since 且未显式
+给行数时，自动把每文件扫描上限提到 100000 行。
 """
 
 import io
 import os
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 LOGS = r"E:\soul1.0\logs"
 TAIL = 4000          # 每个文件看最后多少行
@@ -63,24 +71,51 @@ def read_tail(path, n):
     return lines[-n:]
 
 
+def parse_args(argv):
+    """兼容老用法 `action_audit.py 4000`，并支持 --since。"""
+    tail, since, explicit = TAIL, None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--since" and i + 1 < len(argv):
+            since = argv[i + 1].strip()
+            i += 2
+        elif a.isdigit():
+            tail, explicit = int(a), True
+            i += 1
+        else:
+            i += 1
+    if since and not explicit:
+        tail = 100000
+    return tail, since
+
+
 def main():
+    tail, since = parse_args(sys.argv[1:])
     if not os.path.isdir(LOGS):
         print("找不到日志目录：%s" % LOGS)
         print("这个脚本要在**跑 daemon 的那台机器**上执行（日志在项目目录的 logs/ 下）。")
         print("如果你在别的机器上，先 scp 一份 logs/ 过来，或改 LOGS 常量指向实际路径。")
         return 2
+    if since and len(since) < 14:
+        print("--since 格式应为 MM-DD HH:MM:SS（例如 11-09 00:00:00）")
+        return 2
+
     files = [fn for fn in sorted(os.listdir(LOGS)) if fn.endswith(".log")]
     total_cat = Counter()
     per_file = {}
     noop = Counter()          # (from, to) 里 from == to 的
     tap_move = Counter()      # 真变化的
     minute_actions = Counter()   # 每分钟动作数
-    day_span = None
+    scanned = 0
 
     for fn in files:
-        lines = read_tail(os.path.join(LOGS, fn), TAIL)
+        lines = read_tail(os.path.join(LOGS, fn), tail)
+        if since:
+            lines = [ln for ln in lines if ln[:14] >= since]
         if not lines:
             continue
+        scanned += len(lines)
         c = Counter()
         for ln in lines:
             for name, rx in CATS:
@@ -99,16 +134,19 @@ def main():
                 minute_actions[t.group(3) + ":" + t.group(4)] += 1
         per_file[fn] = c
 
+    scope = ("自 %s 起的净增量（共 %d 行 / 每文件最多 %d 行）" % (since, scanned, tail)) \
+        if since else ("每文件最后 %d 行" % tail)
     print("=" * 72)
-    print("动作分类统计（每文件最后 %d 行）" % TAIL)
+    print("动作分类统计（%s）" % scope)
     print("=" * 72)
     names = [n for n, _ in CATS if total_cat[n]]
-    print("%-18s %s" % ("类别", "  ".join("%-12s" % f.replace(".log", "") for f in [])))
     for n in sorted(names, key=lambda x: -total_cat[x]):
         row = [f for f in per_file if per_file[f][n]]
         print("%-18s 合计 %-6d | %s" % (
             n, total_cat[n],
             "  ".join("%s:%d" % (f.replace(".log", ""), per_file[f][n]) for f in row[:6])))
+    if not names:
+        print("（窗口内没有命中任何动作分类）")
 
     print()
     print("=" * 72)

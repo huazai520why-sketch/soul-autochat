@@ -188,10 +188,29 @@ def _rows_for_lib(snap, db, lib_sids, handled=None, limit=0):
 
 
 def to_list(actor, tries=3):
-    """确保停在会话列表；有弹窗点主按钮。"""
+    """确保停在会话列表；有弹窗点主按钮。
+
+    🔴 2026-11-09（用户「操作层乱点」的第二处根因，实证 23:59:17~27）：
+       10 秒内盲点「聊天」tab 6 次全部未命中，每次还跟着按一次 back。
+       detect=unknown 时 UI 树里**根本没有底栏**，Actor.tap_tab 走
+       `n is None` 分支直接返回 `(None, unknown)`；旧代码不看这个信号，
+       照样 hand.back() → 页面仍是 unknown → 下一轮再点，形成白点循环。
+       而 unknown 页按 back 还有把 App 退到桌面的风险（日志 157 次
+       「Soul 不在前台」即此类）。
+
+       改法与 brain/nav.py 同口径：
+         ① 点前先确认底栏存在，没有就**不点**（不产生无效手势）；
+         ② 明确在会话页 chat → back 一次（快且不会退到桌面）；
+         ③ 其余无底栏页 → am start --activity-clear-top 回主框架，**绝不 back**；
+         ④ 恢复只做一次，仍不行就交回上层（sweep 有 detect!=chatlist 保护，
+            会跳过本轮，不会拿 unknown 快照乱点、更不会误发消息）。
+    """
+    from brain.nav import goto_main      # 局部导入：规避 clear ↔ nav 的 import 时序
+    recovered = False
     for _ in range(tries):
         snap = actor.snap()
-        if detect(snap) == "chatlist":
+        pg = detect(snap)
+        if pg == "chatlist":
             return snap
         p = P.detect(snap)
         if p is not None:
@@ -200,11 +219,31 @@ def to_list(actor, tries=3):
                 log.info("处理弹窗: %s", btn[0][0])
                 actor.hand.tap_node(btn[0][1], settle=1.2)
                 continue
-        log.info("不在列表页(%s)，点底栏聊天", detect(snap))
-        snap, pg = actor.tap_tab("聊天", settle=1.2)
-        if pg == "chatlist":
-            return snap
-        actor.hand.back(settle=1.0)
+
+        # 底栏都不在 → 这一下 tab 必然点不中，绝不盲点
+        if snap is None or snap.tab("聊天") is None:
+            if pg == "chat":
+                log.info("[clear] 在会话页，back 回列表")
+                actor.hand.back(settle=1.0)
+                continue
+            if recovered:
+                log.warning("[clear] 恢复后仍无底栏(%s) → 放弃本轮，不空烧", pg)
+                return snap if snap is not None else actor.snap()
+            recovered = True
+            log.warning("[clear] 无底栏(%s) → 不盲点 tab / 不 back，"
+                        "am start clear-top 回主框架", pg)
+            try:
+                goto_main(actor.dev)
+            except Exception as e:
+                log.warning("[clear] clear-top 恢复失败（交回上层跳过本轮）: %r", e)
+                return snap if snap is not None else actor.snap()
+            continue
+
+        log.info("不在列表页(%s)，点底栏聊天", pg)
+        snap2, pg2 = actor.tap_tab("聊天", settle=1.2)
+        if pg2 == "chatlist":
+            return snap2
+        # 点了没到：不 back，下一轮重新取树再判（页面可能正在切换）
     return actor.snap()
 
 

@@ -343,6 +343,11 @@ _UNREAD_BEFORE = {"set": None}
 _LIVE_CACHE = {"v": None, "ts": 0.0}
 _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
+# 🔴 2026-11-09：一轮 cycle 里「设备存活校验」会被多个子流程各调一次，
+#    uids 已有 120s 缓存、不会重复扫设备，但旧的 INFO 每次都打 →
+#    实测同一秒刷 3~4 行「205 个…剩 95 个」把真日志淹了。
+#    相同结论在 TTL 内只 INFO 一次，其余降 DEBUG（要查随时能开）。
+_LIVE_LOG = {"sig": None, "ts": 0.0}
 
 
 def _device_live_uids(db):
@@ -627,8 +632,14 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         rows = [(s, u) for (s, u) in rows if str(u) in _live_uids]
         _dead = _before - len(rows)
         if _dead:
-            log.info("设备存活校验：%d 个会话在 App 里已不存在（Soul 清过历史）→ 移出候选，剩 %d 个",
-                     _dead, len(rows))
+            _sig = (_dead, len(rows))
+            _now = time.time()
+            if _LIVE_LOG.get("sig") != _sig or (_now - _LIVE_LOG.get("ts", 0)) >= _LIVE_TTL_S:
+                log.info("设备存活校验：%d 个会话在 App 里已不存在（Soul 清过历史）→ 移出候选，剩 %d 个",
+                         _dead, len(rows))
+                _LIVE_LOG.update(sig=_sig, ts=_now)
+            else:
+                log.debug("设备存活校验(TTL 内重复)：移出 %d 个，剩 %d 个", _dead, len(rows))
 
     out = []
     for sid, to_uid in rows:
