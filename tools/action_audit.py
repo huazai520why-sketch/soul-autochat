@@ -20,6 +20,11 @@ restart 279 / 放弃 137 —— 其中 restart 每次 20~40s，等于 2~3 小时
 重启 daemon 后，只统计新产生的动作，避免几千行历史噪声把结论冲淡。
 格式 MM-DD HH:MM:SS（同一年内按字典序比较即可）；指定 --since 且未显式
 给行数时，自动把每文件扫描上限提到 100000 行。
+
+🔴 数据可信度检查（2026-11-09 事故）：行为测试用假对象重放故障阶梯时，
+那些 WARNING 会写进生产 logs/*.log，且全挤在同一秒。真实操作不可能
+1 秒内 5 次重启/回首页。脚本末尾会标出这种「疑似回放秒」，看到就换
+--since 跳过，别拿它下"修复失效"的结论。测试侧已用 tests/_nolog.py 隔离。
 """
 
 import io
@@ -107,6 +112,7 @@ def main():
     noop = Counter()          # (from, to) 里 from == to 的
     tap_move = Counter()      # 真变化的
     minute_actions = Counter()   # 每分钟动作数
+    second_recovery = Counter()  # 按秒统计「恢复类动作」→ 识别测试回放
     scanned = 0
 
     for fn in files:
@@ -118,6 +124,9 @@ def main():
         scanned += len(lines)
         c = Counter()
         for ln in lines:
+            if any(k in ln for k in ("重启 App", "强制回首页", "放弃本次导航",
+                                     "连续 ", "clear-top")):
+                second_recovery[ln[:14]] += 1
             for name, rx in CATS:
                 if rx.search(ln):
                     c[name] += 1
@@ -168,6 +177,18 @@ def main():
     print("=" * 72)
     for mm, n in minute_actions.most_common(12):
         print("  %s  %d 次动作  %s" % (mm, n, "█" * min(40, n)))
+
+    print()
+    print("=" * 72)
+    print("数据可信度检查（同一秒 >=5 条恢复类动作 = 疑似测试回放）")
+    print("=" * 72)
+    suspicious = [(s, n) for s, n in second_recovery.items() if n >= 5]
+    if suspicious:
+        for s, n in sorted(suspicious):
+            print("  [!] %s 同一秒 %d 条恢复类动作 → 疑似行为测试回放/日志重放，"
+                  "请用 --since 跳过该秒再下结论" % (s, n))
+    else:
+        print("  OK：窗口内未发现同一秒密集恢复动作")
     return 0
 
 

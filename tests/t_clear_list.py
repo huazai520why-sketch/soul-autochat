@@ -16,6 +16,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _nolog  # noqa: F401  ← 必须在 from brain import ... 之前，见 _nolog.py
 from brain import clear
 
 

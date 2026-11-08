@@ -14,11 +14,15 @@
 跑法：python tests/t_nav_ladder.py
 """
 import io
+import os
 import sys
 import types
 
-sys.path.insert(0, __file__.rsplit("tests", 1)[0])
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import _nolog  # noqa: F401  ← 必须在 from brain import ... 之前，见 _nolog.py
 from brain import nav as N
 
 
