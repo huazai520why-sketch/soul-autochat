@@ -58,12 +58,18 @@ MULTI_SEND = os.environ.get("SOUL_MULTI_SEND", "1") != "0"
 #   不再逐句调 N 次。逐句调在 V9 下纯属浪费：每句都要重跑一次完整 prompt。
 _PROMPT_V9 = (os.environ.get("SOUL_PROMPT_V9", "1") or "1").strip() == "1"
 
+# 🔴 2026-11-09（用户口径「重新安装原技能就行了」）：本地模型重新按三技能
+#   （analyze_her / ask_strategist / ask_tongjincheng）出画像 L0 + 方案 L1，
+#   执行器见 brain/skills.py，提示词已装回 config/skills/。
+#   SOUL_LOCAL_FLOW=brief 可一键回到 2026-11-04 之后的「本轮简报」。
+LOCAL_FLOW = (os.environ.get("SOUL_LOCAL_FLOW", "skills") or "skills").strip().lower()
+
 
 def engine():
     """懒加载出话引擎。并发安全（首次 import 加锁）。
 
     🔴 2026-11-04 重构：默认走**本仓 v10 引擎**（brain.engine），
-       提示词/人设/硬闸全部重写，零 E:\soul2.1 依赖。
+       提示词/人设/硬闸全部重写，零 E:\\soul2.1 依赖。
        保留 `SOUL_ENGINE=legacy` 回滚到旧 soul_brain（只在 2.1 目录还在时有效）。
     """
     global _ENGINE
@@ -691,12 +697,22 @@ def _local_worker(ctx):
     meta = ""
     try:
         import importlib
-        _brief = importlib.import_module("brain.engine.brief")
         _pack = importlib.import_module("brain.pack")
         turns = _pack.read_turns(sid, 4000)
-        meta = _brief.generate(sid, her, turns) or ""
+        if LOCAL_FLOW == "skills":
+            # 三技能：① 画像 L0 → ②③ 方案 L1 → 合成单一裁决写 brief.md
+            SK = importlib.import_module("brain.skills")
+            r = SK.run_all(sid, her, turns)
+            meta = r.get("brief") or r.get("l0") or ""
+            if r.get("ok"):
+                log.info("[三技能完成] sid=%s 画像%d字 方案%d字 裁决%d字",
+                         sid[-8:], len(r.get("l0") or ""), len(r.get("l1") or ""),
+                         len(r.get("brief") or ""))
+        else:
+            _brief = importlib.import_module("brain.engine.brief")
+            meta = _brief.generate(sid, her, turns) or ""
     except Exception as e:
-        log.warning("[简报] 生成失败: %r", e)
+        log.warning("[本地分析] 生成失败(流程=%s): %r", LOCAL_FLOW, e)
 
     # 熔断计数：连续 3 次空 → 静默 30 分钟（本地挂了就别每个会话白等 25s）
     if not meta:
@@ -704,11 +720,12 @@ def _local_worker(ctx):
         if _LOCAL_GUARD["fail"] >= 3:
             _LOCAL_GUARD["until"] = _t.time() + 1800
             _LOCAL_GUARD["fail"] = 0
-            log.warning("简报模型连续 3 次无产出 → 熔断 30 分钟（不阻塞回复）")
+            log.warning("本地分析连续 3 次无产出 → 熔断 30 分钟（不阻塞回复）")
     else:
         _LOCAL_GUARD["fail"] = 0
 
-    log.info("[简报完成] sid=%s %d字 共%.1fs", sid[-8:], len(meta), _t.time() - t0)
+    log.info("[本地完成] sid=%s %d字 共%.1fs 流程=%s",
+             sid[-8:], len(meta), _t.time() - t0, LOCAL_FLOW)
 
 
 def warm_local(sid, db=None, her_msg="", nick=""):
