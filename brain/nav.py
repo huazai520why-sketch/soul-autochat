@@ -209,7 +209,25 @@ def to_tab(actor, name="聊天", tries=8):
 
         # ── 兜底升级：只增不减，页面怎么抖都不会被清零 ──────────────
         # 第 4 次失败起强制 am start 回首页；第 7 次起重启 App（**整趟只一次**）。
-        if fails >= 7:
+        #
+        # 🔴🔴 2026-11-08 23:5x（生产实证的「瞎操作」头号根因，务必别把顺序改回去）：
+        #   这段兜底原来无条件排在「点底栏 tab」那套细粒度阶梯**前面**，于是：
+        #     iter1 square → 点 tab → 还是 square
+        #     iter2 square → 双击   → 还是 square
+        #     iter3 square → am start
+        #     iter4 fails=4 → 命中这里 → goto_main() → continue  ← **从此再也点不到 tab**
+        #     iter5/6      → 继续 am start
+        #     iter7 fails=7 → 重启 App → 落地还是 square（MainActivity 冷启固定落广场）
+        #     iter8         → "重启后仍回不到" → 放弃
+        #   而「放弃」之后调用方只点了一次底栏就回去了（日志 22:12:05 放弃 → 22:12:07 到达）。
+        #   统计代价：nav_back 725、am_start 465、**restart 279**（每次 20~40s ≈ 2~3 小时停机）、
+        #   放弃 137，全部由这个「兜底抢跑」造成。
+        #   ⇒ 当前页是**主框架页且底栏在**时，说明这是可恢复状态，细粒度阶梯优先，
+        #     兜底阈值抬高到一趟里基本触发不到（tries=8 < 10），由 dead>4 那道重启收尾。
+        _main_ok = (pg != "unknown") and (snap.tab(name) is not None)
+        _hard = 10 if _main_ok else 4
+        _fatal = 14 if _main_ok else 7
+        if fails >= _fatal:
             if restart_done:
                 # 已经重启过一次还是回不去 → 不再折腾设备，直接交还给上层。
                 log.warning("[nav] 重启后仍回不到 %s（当前 %s）→ 放弃本次导航", want, pg)
@@ -220,7 +238,7 @@ def to_tab(actor, name="聊天", tries=8):
             restart_app(dev)
             # ⚠️ 不归零 fails：保持高位，若下一轮仍失败会立刻命中 restart_done 分支退出。
             continue
-        if fails >= 4:
+        if fails >= _hard:
             log.warning("[nav] 连续 %d 次回不到 %s（当前 %s）→ 强制回首页(am start)",
                         fails, want, pg)
             goto_main(dev)
@@ -285,6 +303,26 @@ def to_tab(actor, name="聊天", tries=8):
                 stuck = 0
                 continue
             stuck += 1
+            # 🔴 2026-11-08 23:5x（「误退 App」的第二条根因）：
+            #   Activity 仍是 MainActivity = 人还在主框架里，只是 detect() 没认出来
+            #   （转场中 / 弹窗盖住 / 改版后 res-id 变了）。这时按 back 就是把 Soul
+            #   直接退到桌面 —— 日志 157 次「Soul 不在前台（app.lawnchair）」全这么来的，
+            #   随后 am start → 落广场 → 回不到 chatlist → 重启，一整条雪崩。
+            #   ⇒ 主框架内绝不 back（用户 2026-11-02 定的铁律），改 am start clear-top。
+            if "MainActivity" in (_act or ""):
+                # 一次 to_tab 里最多「1 次 clear-top + 1 次重启」：
+                # 实测这个分支若每轮都发 am start，单次导航会连发 6 次（≈60s 白等）。
+                if stuck == 0:
+                    log.warning("[nav] unknown 但 Activity 仍在 MainActivity（主框架内）"
+                                "→ 不 back，改 am start clear-top")
+                    goto_main(dev)
+                    stuck = 1
+                else:
+                    log.warning("[nav] 主框架内 unknown 且 clear-top 无效（第 %d 次）"
+                                "→ 重启 App 收尾", stuck)
+                    restart_app(dev)
+                    stuck = 0
+                continue
             # 🔴 不能只等：RnContainerActivity（瞬间/活动页）不会自己退出，
             #    实测原地等了 400+ 轮、每轮 17s。分级升级恢复手段：
             if stuck <= 2:
