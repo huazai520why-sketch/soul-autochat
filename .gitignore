@@ -65,6 +65,9 @@ data/*.json
 _bak_*/
 _bak-*/
 _backup_*/
+# 整理时的隔离区与历史留档（2026-11-08 磁盘整理）
+_attic_*/
+_trash_*/
 _stage/
 _tmp_*/
 _wal*_tmp*/
