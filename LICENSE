@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2026 huazai520why-sketch
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Additional notice / 附加声明
+
+This project automates a third-party mobile application through UI automation.
+Automating a social application very likely violates that application's Terms
+of Service and may result in account restriction or permanent ban. The authors
+accept no liability for account loss, legal consequences, or any other damages
+arising from use of this software.
+
+本项目通过 UI 自动化操作第三方 App。自动化操作社交类 App 通常违反其用户协议，
+可能导致账号被限制或永久封禁。作者不对账号损失、法律后果或任何其他损害承担责任。
+请自行评估风险，并遵守所在地法律法规。

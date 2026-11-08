@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────
+# 隐私与密钥：第一优先级，永远不要提交
+# ─────────────────────────────────────────────────────────────
+.ark_key
+*.key
+*.pem
+.env
+config/model.env
+config/model.env.bak*
+config/model.env.example.bak*
+# 上面的通配会误伤模板，这里显式放行
+!config/model.env.example
+
+# 任何人的聊天内容 / 数据库 / 截图 / 语音
+logs/
+memory/
+data/state/
+data/memory/
+data/_probe_out*
+models/
+# ⚠️ 以下是真实聊天数据的落点，任何一个漏出去都是事故：
+#   data/cache/IM-SDK-*/ 是 App 数据库的本地镜像（含全部会话与消息）
+#   data/voice_cache/    是语音消息的转写文本
+#   data/asr_cache.json  是转写缓存
+data/cache/
+data/voice_cache/
+data/ocr_cache/
+data/asr_cache.json
+data/*.json
+*.db
+*.db.*
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.bak-*
+*.bak_*
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.wav
+*.mp3
+*.apk
+*.b64
+
+# ─────────────────────────────────────────────────────────────
+# 运行时产物与临时文件（根目录锚定，避免误伤 __init__.py）
+# ─────────────────────────────────────────────────────────────
+/_*.py
+/_*.txt
+/_*.json
+/_*.jsonl
+/_*.out
+/_*.md
+/_*.log
+/_*.csv
+/_*.xml
+/_*.wav
+/_*.png
+/_*.b64
+
+# 备份目录（本项目历史上有一堆 _bak_xxx / _backup_xxx）
+_bak_*/
+_bak-*/
+_backup_*/
+_stage/
+_tmp_*/
+_wal*_tmp*/
+_walchk_tmp/
+_dbtmp*/
+_reddot_*/
+_reddot_crops/
+_reddot_hits/
+_wake_pool_snap/
+_audit*txt/
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ─────────────────────────────────────────────────────────────
+# 编辑器 / 系统
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
