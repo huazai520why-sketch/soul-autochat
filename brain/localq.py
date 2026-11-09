@@ -55,7 +55,7 @@ _log_fn = [None]
 
 
 def set_logger(fn):
-    """注入日志函数（soul_brain._dbg 或 soul_skills._dbg），避免循环 import。"""
+    """注入日志函数，避免循环 import。"""
     _log_fn[0] = fn
 
 

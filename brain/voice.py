@@ -24,7 +24,6 @@ from core.log import get_logger
 
 log = get_logger("brain.voice")
 
-LEGACY_DB = r"E:\soul2.1\db"
 VOICE_MT = 5
 IMAGE_MT = 2      # 图片（msgContent 有 imageUrl/imageW/imageH，尺寸大）
 EMOJI_MT = 8      # 表情包（同结构但尺寸小，URL 常含 expression）
