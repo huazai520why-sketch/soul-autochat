@@ -94,12 +94,60 @@ def available():
     return all(_load(n) for n in FILES)
 
 
+def _account_context(sid, max_turns=8000, max_facts=40):
+    """拉账号档案：静态主页 profile + 沉淀事实 facts + 全部对话 turns。
+
+    这是「三技能输入 = 对方账号档案信息」的落地：画像技能①据此见到的
+    不只是一句话，而是这个人的主页标签、已确认的事实、以及完整聊天历史。
+    任何一处读失败都静默降级（绝不因档案读取失败而阻塞三技能）。
+    """
+    parts = []
+    try:
+        from brain.pack import store
+        p = store.read_profile(sid) or {}
+        if p:
+            nice = []
+            for k in ("nick", "signature", "tags", "common", "match", "ip"):
+                v = p.get(k)
+                if v not in (None, "", [], {}):
+                    nice.append("%s=%s" % (k, v))
+            if nice:
+                parts.append("【账号档案·主页】\n" + "\n".join(nice))
+        f = store.read_facts(sid) or {}
+        hers = f.get("hers") or []
+        mine = f.get("mine") or []
+        if hers or mine:
+            lines = []
+            for it in hers[:max_facts]:
+                t = (it.get("t") or "") if isinstance(it, dict) else str(it)
+                if t:
+                    lines.append("- 她: " + t)
+            for it in mine[:max_facts]:
+                t = (it.get("t") or "") if isinstance(it, dict) else str(it)
+                if t:
+                    lines.append("- 我: " + t)
+            if lines:
+                parts.append("【账号档案·已确认事实】\n" + "\n".join(lines))
+        turns = store.read_turns(sid, max_turns) or ""
+        if turns.strip():
+            parts.append("【账号档案·对话历史】\n" + turns[-max_turns:])
+    except Exception as e:
+        log.warning("[三技能] 读账号档案失败 sid=%s: %r", str(sid)[-8:], e)
+    return "\n\n".join(parts).strip()
+
+
 def _messages(name, ctx, extra_sys=""):
     sys_txt = _load(name) + DISCIPLINE + extra_sys
     her = (ctx.get("her_msg") or "").strip() or "（无）"
+    acct = (ctx.get("account") or "").strip()
     case = (ctx.get("case") or ctx.get("turns") or "").strip() or "（无历史）"
-    user = ("【她刚发来的消息】\n%s\n\n【最近的对话（时间顺序）】\n%s\n"
-            % (her, case[-3000:]))
+    if acct:
+        # 账号档案已在 ctx.account 里给全，对话历史直接用档案里的，避免重复截断
+        user = ("【她刚发来的消息】\n%s\n\n【对方账号档案信息】\n%s\n"
+                % (her, acct[-9000:]))
+    else:
+        user = ("【她刚发来的消息】\n%s\n\n【最近的对话（时间顺序）】\n%s\n"
+                % (her, case[-3000:]))
     return [{"role": "system", "content": sys_txt},
             {"role": "user", "content": user}]
 
@@ -148,6 +196,10 @@ def run_all(sid, her_msg, turns_text="", write=True):
     if not available():
         log.warning("[三技能] 提示词不全，跳过（改用简报）")
         return res
+
+    # 画像技能①吃「账号档案全量」：主页 + 事实 + 完整历史，不只最近一句。
+    account = _account_context(sid)
+    ctx["account"] = account
 
     res["l0"] = _call("analyze_her", ctx, max_tokens=700)
 
