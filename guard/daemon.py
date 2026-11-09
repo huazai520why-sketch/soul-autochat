@@ -864,13 +864,32 @@ def cycle(a, dev, db, st, dry_run=False):
             return "waked"
 
     # ⑥ 账号轮转：榨干配额 或 在线 8h 强制切
+    # 🔴 2026-11-09 R8（用户拍板「当前账号没榨干不切号」）：
+    #   切号前先看「还有没有冷却中的人在等」——冷却中≠没人可聊。
+    #   实测 21:21「待回 4 人全是冷却中」被判无人可聊 → 30 秒后切号，
+    #   那 4 个人被丢给另一账号最多 8 小时。R3 已把 notfound 冷却压到 5 分钟，
+    #   这里再多等一口气，等冷却到期重试完再决定切不切。
+    #   注意：只挡切号，不动匹配闸门（避免 11-08「匹配饿死」回潮）。
     try:
-        sw, why = AC.maybe_switch(a, dev, db, st)
-        if sw:
-            log.warning("🔄 已切号：%s", why)
-            return "switched"
-    except Exception as e:
-        log.warning("账号轮转异常（不阻断）: %r", e)
+        _n_wait, _left_min = PQ.cooldown_waiting(30.0)
+        if _n_wait and _left_min > 0:
+            log.info("切号前先等冷却：%d 个会话在冷却中（最久剩 %.0f 分钟）→ 本轮不切号",
+                     _n_wait, _left_min)
+            _skip_switch = True
+        else:
+            _skip_switch = False
+    except Exception as _e:
+        log.debug("冷却中检查异常（按可切处理）: %r", _e)
+        _skip_switch = False
+
+    if not _skip_switch:
+        try:
+            sw, why = AC.maybe_switch(a, dev, db, st)
+            if sw:
+                log.warning("🔄 已切号：%s", why)
+                return "switched"
+        except Exception as e:
+            log.warning("账号轮转异常（不阻断）: %r", e)
 
     # ⑦ 空闲：只有「确实无人可聊、无事可做」才在这里等
     log.info("空闲 %.0fs（无待回/无红点/匹配与唤醒都在冷却）", IDLE_SLEEP)

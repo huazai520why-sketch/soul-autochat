@@ -102,6 +102,18 @@ SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消�
 #   规则：同一 sid + 同一句末条，失败后冷却 SKIP_HOURS 小时；
 #         她一发新消息（末条文本变了）就自动重新试 —— 别把活人永久拉黑。
 SKIP_HOURS = 3
+
+# 🔴 2026-11-09 R3（用户拍板：「搜索不到就不搜了啊 等闲下来的时候搜」）
+#   旧实现 notfound 一次罚 3 小时 ⇒ 直接表现成「消息进来很久没人回」
+#   （实测 21:08 仍有会话「原因=notfound，剩 89 分钟」，等于把她冻到下一场对话）。
+#   新口径：本轮搜不到 = 本轮不搜，5 分钟后（≈ 闲下来时）自然重试，不冻结。
+#   防白烧：同 sid 30 分钟内 notfound ≥3 次 → 升级 30 分钟，避免反复撞墙。
+#   全部可用环境变量回调；设 SOUL_NOTFOUND_COOL_MIN=180 即回到旧行为。
+NOTFOUND_COOL_H = float(os.environ.get("SOUL_NOTFOUND_COOL_MIN", "5") or 5) / 60.0
+NOTFOUND_STORM_N = int(os.environ.get("SOUL_NOTFOUND_STORM_N", "3") or 3)
+NOTFOUND_STORM_H = float(os.environ.get("SOUL_NOTFOUND_STORM_MIN", "30") or 30) / 60.0
+# R5：她最后一条超过这么多分钟没接上 → 标红（只记日志，不插手操作）
+SLA_WARN_MIN = float(os.environ.get("SOUL_SLA_WARN_MIN", "5") or 5)
 # 🔴 2026-11-04（P1）：12h → 3h。原来的 12h 是在「只能靠搜索定位」的前提下定的，
 #   而现在 find_row 会翻 3 屏，很多 notfound 的会话下一轮就能在列表里点进去；
 #   12h 冷却反而让它们白等半天（实测生效 29 条、中位剩 11.1h）。
@@ -623,6 +635,76 @@ def mark_skip(sid, txt, reason="notfound", hours=None):
     log.info("记入失败台账 sid=%s（%s），%.2f 小时内不再试", sid, reason, h)
 
 
+def _nf_hits(sid):
+    """30 分钟内该 sid 累计 notfound 次数（进程内计数，重启即清）。"""
+    now = time.time()
+    arr = [t for t in _NF_HITS.get(str(sid), []) if now - t < 1800]
+    arr.append(now)
+    _NF_HITS[str(sid)] = arr
+    if len(_NF_HITS) > 500:                      # 防止常驻进程无限增长
+        for k in [k for k, v in _NF_HITS.items() if not v or now - v[-1] > 3600]:
+            _NF_HITS.pop(k, None)
+    return len(arr)
+
+
+_NF_HITS = {}
+_SLA_WARNED = {}
+
+
+def _sla_warn(sid, to_uid, her_ts_ms, why):
+    """R5：她最后一条超过 SLA_WARN_MIN 分钟还没被接上 → 标红一行（不插手操作）。
+
+    同一 sid 10 分钟内只报一次，避免每 30s 刷屏。
+    """
+    try:
+        age_min = (time.time() - float(her_ts_ms or 0) / 1000.0) / 60.0
+    except Exception:
+        return
+    if age_min < SLA_WARN_MIN:
+        return
+    now = time.time()
+    if now - _SLA_WARNED.get(str(sid), 0) < 600:
+        return
+    _SLA_WARNED[str(sid)] = now
+    log.warning("⏰ 超 %.0f 分钟未回 uid=%s sid=%s（%s）→ 标红，留队列按等待时长重排",
+                age_min, to_uid, sid, why)
+
+
+def cooldown_waiting(max_min=30.0):
+    """还有「冷却中但没到 24h 淘汰」的会话在等人回吗？
+
+    🔴 2026-11-09 R8（用户拍板「当前账号没榨干不切号」）
+        切号前提①「真待回 = 0」原来直接用 candidates()==0 判，而 candidates()
+        会滤掉冷却中的人 ⇒ 21:21 实测「待回 4 人全是冷却中/已回」被判成
+        「无人可聊」→ 30 秒后切号，把 4 个可能还在等的人丢给另一账号 8 小时。
+        这个函数只用于「切号前多等一口气」，不影响匹配闸门（避免 11-08 的饿死回潮）。
+
+    返回 (n, 最早还剩多少分钟)；n=0 表示确实没人。
+    """
+    try:
+        d = _load_skip()
+    except Exception:
+        return (0, 0.0)
+    now = time.time()
+    left = []
+    for sid, rec in (d or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("reason") or "") not in ("notfound", "notfound_fresh",
+                                             "notfound_storm", "slow", "timeout"):
+            continue
+        ts = float(rec.get("ts") or 0)
+        if now - ts > 86400:                    # 超过 24h 的陈旧台账不算
+            continue
+        h = float(rec.get("hours") or 0)
+        rem = h * 60 - (now - ts) / 60.0
+        if rem > 0:
+            left.append(rem)
+    if not left:
+        return (0, 0.0)
+    return (len(left), max(left))
+
+
 def _burst_n(db, sid, uid):
     """她**最新连发**的条数（用于排序优先级：多条 > 单条）。
 
@@ -831,6 +913,7 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         if _recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=last.ts) \
                 or _l2_last_is_me(sid, her_ts_ms=last.ts):
             log.info("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
+            _sla_warn(sid, to_uid, last.ts, "被判已回")
             continue
 
         if should_skip(sid, txt):
@@ -839,6 +922,7 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                          - (time.time() - float(_r.get("ts") or 0)) / 60.0)
             log.info("跳过冷却中的会话 sid=%s（原因=%s，剩 %.0f 分钟）",
                      sid, _r.get("reason") or "?", max(0.0, _left_min))
+            _sla_warn(sid, to_uid, last.ts, "冷却中 剩%.0f分" % max(0.0, _left_min))
             continue
         out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
 
@@ -1645,15 +1729,19 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     log.info("搜索超时（未判定未找到），10 分钟后再试")
                     mark_skip(sid, txt, "timeout", hours=TIMEOUT_RETRY_H)
                 else:
-                    # 🔴 2026-11-04：刚发来的消息（≤30 分钟）只罚 10 分钟 ——
-                    #   实测 09:33 两条刚到的（'[切]' / '？？'）被 3 小时冷却锁死。
-                    #   她很可能马上补一句能搜到的话，短冷却才能接上。
-                    if age_h * 60.0 <= 30.0:
-                        log.info("刚发来的消息搜索未找到 → 只罚 10 分钟（不按 3 小时锁）")
-                        mark_skip(sid, txt, "notfound_fresh", hours=0.17)
+                    # 🔴 2026-11-09 R3（用户拍板「搜索不到就不搜了啊 等闲下来的时候搜」）
+                    #   旧：notfound 罚 3 小时 + 新消息 10 分钟。表现为「消息进来很久没人回」，
+                    #   实测 21:08 仍有会话剩 89 分钟冷冻结。冻结惩罚本就不该用在这个人身上。
+                    #   新：本轮不搜 → 5 分钟后（闲着时）自然重试；30 分钟内撞墙 ≥3 次才升级 30 分钟。
+                    _nf = _nf_hits(sid)
+                    if _nf >= NOTFOUND_STORM_N:
+                        log.warning("搜索无结果累计 %d 次/30min → 升级 %.0f 分钟冷却（防白烧）sid=%s",
+                                    _nf, NOTFOUND_STORM_H * 60, sid)
+                        mark_skip(sid, txt, "notfound_storm", hours=NOTFOUND_STORM_H)
                     else:
-                        log.info("搜索无结果/未找到相关结果，记台账后放弃")
-                        mark_skip(sid, txt, "notfound")
+                        log.info("搜索无结果（第 %d 次/30min）→ %.0f 分钟后重试，不冻结 3 小时 sid=%s",
+                                 _nf, NOTFOUND_COOL_H * 60, sid)
+                        mark_skip(sid, txt, "notfound", hours=NOTFOUND_COOL_H)
                 S.leave(actor)
                 out["skipped"] += 1
                 continue
