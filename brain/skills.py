@@ -25,6 +25,7 @@ git 历史与本机镜像里也没有副本；三份技能提示词原件仍在
 """
 import io
 import os
+import re
 from pathlib import Path
 
 try:
@@ -64,6 +65,17 @@ MERGE_SYS = (
     "## 别踩\n最多 1 条，只写真会翻车的。\n\n"
     "🔴 禁止写「禁止再提…/禁止解释…」这类禁令清单（实测会把出话压平）；"
     "禁止给整段话术模板（会被照抄成口头禅）。全文不超过 240 字。\n"
+)
+
+FACT_SYS = (
+    "你是事实抽取器。从对话里挑出**关于她的、能长期成立的新事实**，"
+    "每条一行，格式「事实 | 她原话片段」，只写这一轮新出现、档案里还没有的。\n\n"
+    "硬规矩：\n"
+    "1. 只写「她本人说过的客观信息」（身份/职业/住址/喜好/作息/关系状态等），"
+    "不写推测、不写评价、不写「我」说过的事。\n"
+    "2. 竖线右边必须是**从她原话里逐字复制**的一句话，一个字都不能改。\n"
+    "3. 没有新事实就输出「无」。\n"
+    "4. 最多 6 条。\n"
 )
 
 
@@ -136,6 +148,57 @@ def _account_context(sid, max_turns=8000, max_facts=40):
     return "\n\n".join(parts).strip()
 
 
+def _parse_fact_lines(block, evidence_pool):
+    """从模型输出的「事实」块抽 (内容, 原话片段)。
+
+    复用 brief._parse_facts 的「竖线分隔 + 逐字校验」思路，但证据源从
+    「单条 her_msg」扩大到「当前消息 + 档案全文」——证据必须逐字出现在
+    evidence_pool 里才收，模型改写过的直接丢弃（防编造）。
+    """
+    out = []
+    for ln in (block or "").splitlines():
+        s = ln.strip()
+        if not s or s == "无" or s.startswith("（") or s.startswith("#"):
+            continue
+        s = re.sub(r"^[-*·\d.)、\s]*", "", s)
+        if "|" not in s:
+            continue
+        content, _, ev = s.partition("|")
+        content, ev = content.strip(), ev.strip()
+        if not content or not ev:
+            continue
+        if ev not in (evidence_pool or ""):
+            continue
+        out.append((content[:40], ev[:60]))
+    return out
+
+
+def _extract_facts(sid, her_msg, account=""):
+    """独立调一次本地模型，抽取「关于她的新事实」并走 add_fact 落库。
+
+    返回 (新增条数, 错误)。绝不抛：任何失败返回 (0, err)，不影响三技能主链。
+    """
+    try:
+        from brain.engine import llm
+        from brain.pack import store
+        # 证据池 = 当前消息 + 档案全文（这样跨轮出现的事实也能落地）
+        pool = (her_msg or "") + "\n" + (account or "")
+        raw = llm.analyze(
+            [{"role": "system", "content": FACT_SYS},
+             {"role": "user", "content":
+              "【她刚说的】\n%s\n\n【已有档案（避免重复抽取）】\n%s"
+              % ((her_msg or "（无）"), (account or "（无）")[:5000])}],
+            timeout=40, temperature=0.3, max_tokens=500)
+        added = 0
+        for content, ev in _parse_fact_lines(raw, pool):
+            if store.add_fact(sid, content, side="hers", ev=ev, conf=0.9):
+                added += 1
+                log.info("[事实] + %s（出处 %r）", content[:20], ev[:16])
+        return added, ""
+    except Exception as e:
+        return 0, str(e)
+
+
 def _messages(name, ctx, extra_sys=""):
     sys_txt = _load(name) + DISCIPLINE + extra_sys
     her = (ctx.get("her_msg") or "").strip() or "（无）"
@@ -206,9 +269,10 @@ def run_all(sid, her_msg, turns_text="", write=True):
     s2, s3 = _load("ask_strategist"), _load("ask_tongjincheng")
     merged_sys = ("\n\n──────── 技能② 推进策略 ────────\n%s\n\n"
                   "──────── 技能③ 人性判断 ────────\n%s" % (s2, s3))
-    # ②③ 共用一次调用：把两份原文当 system 补充，画像作为参考
+    # ②③ 也吃全量档案（复用 account），画像①的结果作为内部参考一并给
     ctx2 = dict(ctx)
-    ctx2["case"] = ((turns_text or "") + "\n\n【①画像（内部参考）】\n" + res["l0"])[-3200:]
+    ctx2["account"] = (account + "\n\n【①画像（内部参考）】\n" + res["l0"])[-9000:]
+    ctx2["case"] = ""          # account 分支里已含完整历史，不再重复塞 case
     res["l1"] = _call("ask_strategist", ctx2, extra_sys=merged_sys, max_tokens=900)
 
     if os.environ.get("SOUL_SKILLS_MERGE", "1") != "0":
@@ -223,6 +287,18 @@ def run_all(sid, her_msg, turns_text="", write=True):
             res["brief"] = _clean(raw)[:600]
         except Exception as e:
             log.warning("[三技能] 合成裁决失败: %r", e)
+
+    # 事实提取：独立一步，从对话里抽「带原话出处的新事实」增量写 facts.json。
+    # 复用 brief 那套「竖线分隔 + 逐字校验」防编造闸门，证据池扩到档案全文。
+    res["facts"] = 0
+    if os.environ.get("SOUL_FACTS_ON", "1") != "0":
+        try:
+            added, err = _extract_facts(sid, her_msg, account)
+            res["facts"] = added
+            if err:
+                log.warning("[三技能] 事实提取失败: %r", err)
+        except Exception as e:
+            log.warning("[三技能] 事实提取异常: %r", e)
 
     res["ok"] = bool(res["l0"] or res["l1"])
     if write:
