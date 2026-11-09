@@ -77,9 +77,20 @@ MATCH_STREAK_FAIL_MAX = 3   # 连打里连续失败几次就停（通道坏了�
 DEV_RESCUE_GAP = 300.0     # 两次自愈动作最短间隔（别把刚起来的设备又打断）
 DEV_RESCUE_L3 = os.environ.get("SOUL_DEV_RESCUE_L3", "1") != "0"
 _RESCUE = {"at": 0.0}
+# 启动首巡只在本进程内布防一次（不写盘）：每次启动/重启后也按「先红点、后奇遇铃」走一遍。
+_BOOT_SWEEP = {"armed": False}
 ROUND_BUDGET = 600.0      # 单轮墙钟上限（超了就结束本轮，防阶段闸自杀）
 MATCH_SILENT = 1800.0     # 匹配连续失败后的静默期
 DB_CHECK_EVERY = 1800.0   # 库完整性体检间隔（30 分钟）
+# 🔴 2026-11-09 21:44（用户口径）：「切号之后优先消除红点，然后再找聊天页面的
+#    奇遇铃 稍后再聊，点进去看看里面有没有人等着我去聊」。
+#   原链 ①-b（奇遇铃-稍后再聊）排在 ②红点**之前** —— 切号进来时先钻铃列表，
+#   而这个号上积压的真未读一直没人动，正是「来了消息半天不回」的一部分。
+#   现在切号后首巡拆两阶段：
+#     阶段 dot  → 先清红点（①-b 本轮延后，日志写明）
+#     阶段 bell → 红点这一轮扫完，立刻进「稍后再聊」看有没有人等我去聊
+#   只作用于**切号后的首巡**；非切号轮次仍按原链（奇遇铃最高，2026-11-08 口径）。
+POST_SWITCH_MAX_S = float(os.environ.get("SOUL_POST_SWITCH_MAX_S", "1800") or 1800)
 
 HAVE_DOT_BLOCK_MATCH = True   # 有红点就不匹配（用户口径）
 
@@ -246,6 +257,37 @@ def _hb(tag=""):
         pass
 
 
+def _post_switch_phase(st, db):
+    """切号后首巡当前处在哪一段。
+
+    返回：
+      "dot"  → 还在清红点阶段，奇遇铃「稍后再聊」本轮必须延后
+      "bell" → 红点这一轮已经扫完，可以去「稍后再聊」看有没有人等我去聊
+      ""     → 不在切号首巡，走原优先级链
+
+    只读状态、不做任何设备动作，便于单测直接断言。
+    超过 POST_SWITCH_MAX_S 自动作废：万一红点永远清不完（僵尸积压），
+    也不能把奇遇铃永久压住。
+    """
+    try:
+        uid = str(getattr(db, "uid", "") or "")
+    except Exception:
+        return ""
+    if not uid or str(st.get("post_switch_uid") or "") != uid:
+        return ""
+    t0 = float(st.get("post_switch_t0", 0) or 0)
+    if t0 and (time.time() - t0) > POST_SWITCH_MAX_S:
+        for _k in ("post_switch_uid", "post_switch_t0",
+                   "post_switch_dot_seen", "post_switch_bell_done"):
+            st.pop(_k, None)
+        log.info("切号首巡超时（>%.0f 分钟）→ 作废，恢复原优先级链",
+                 POST_SWITCH_MAX_S / 60.0)
+        return ""
+    if st.get("post_switch_bell_done"):
+        return ""
+    return "bell" if st.get("post_switch_dot_seen") else "dot"
+
+
 def cycle(a, dev, db, st, dry_run=False):
     """跑一轮。返回本轮的 'what'。
 
@@ -289,6 +331,24 @@ def cycle(a, dev, db, st, dry_run=False):
             st["match_quota_uid"] = str(db.uid)
             st.pop("match_quota_day", None)
             st.pop("bell_list_n", None)
+            # 🔴 2026-11-09 21:44（用户口径）：切号之后先清红点，再看奇遇铃「稍后再聊」。
+            #   布防后就由 _post_switch_phase() 决定本轮走到哪一段，
+            #   `bell_list_n` 已在上面随账号重置，所以新号首巡能重新进一次铃列表。
+            st["post_switch_uid"] = str(db.uid)
+            st["post_switch_t0"] = time.time()
+            st.pop("post_switch_dot_seen", None)
+            st.pop("post_switch_bell_done", None)
+            log.info("切号首巡布防：先清红点 → 再进奇遇铃「稍后再聊」（uid=%s）", db.uid)
+
+        # 启动首巡（每进程一次）：daemon 起来时和切号后是同一个场景 ——
+        # 这个号上可能积压了一堆真未读，必须先清红点再去钻铃列表。
+        if not _BOOT_SWEEP["armed"]:
+            _BOOT_SWEEP["armed"] = True
+            st["post_switch_uid"] = str(db.uid)
+            st["post_switch_t0"] = time.time()
+            st.pop("post_switch_dot_seen", None)
+            st.pop("post_switch_bell_done", None)
+            log.info("启动首巡布防：先清红点 → 再进奇遇铃「稍后再聊」（uid=%s）", db.uid)
         # 跨天也重置一次（daemon 连续跑几天时不至于永久卡住）
         if st.get("bell_list_day") != time.strftime("%Y-%m-%d"):
             st["bell_list_day"] = time.strftime("%Y-%m-%d")
@@ -372,7 +432,11 @@ def cycle(a, dev, db, st, dry_run=False):
     #   限 3 人/轮，避免一轮被它吃光预算（还有红点/匹配要跑）。
     try:
         _bell_n = int(st.get("bell_list_n", 0) or 0)
-        if _bell_n < 3:
+        _psw = _post_switch_phase(st, db)
+        if _psw:
+            # 切号首巡期间铃列表统一由 ③-b 在**红点之后**处理（用户 2026-11-09 21:44）
+            log.info("切号首巡（阶段 %s）：铃列表让位给红点，清完红点当轮再进 ③-b", _psw)
+        elif _bell_n < 3:
             ok_l, why_l = BELL.open_list(a)
             if ok_l:
                 log.info("🔔 进入奇遇铃「稍后再聊」：%s", why_l)
@@ -545,6 +609,70 @@ def cycle(a, dev, db, st, dry_run=False):
                             "先让匹配带来新会话", _z)
     except Exception as _e:
         log.debug("空烧计数更新失败（不阻断）: %r", _e)
+
+    # ③-b 切号首巡 · 第二阶段：红点这一轮已经扫完 → 再去奇遇铃「稍后再聊」看有没有人等我去聊
+    #
+    #   🔴 2026-11-09 21:44 用户原话：「切号之后优先消除红点，然后再找聊天页面的
+    #      奇遇铃 稍后再聊，点进去看看里面有没有人等着我去聊」。
+    #   原来 ①-b 在红点之前，切号进来先钻铃列表；现在切号首巡把顺序倒过来：
+    #     本轮 ②/③ 红点段已跑完 → 打上 post_switch_dot_seen → 这里进铃列表。
+    #   只跑一次（post_switch_bell_done 置位后 _post_switch_phase 返回 ""），
+    #   之后的轮次恢复「奇遇铃最高」的原链，不会每轮都去铃列表吃预算。
+    try:
+        _psw = _post_switch_phase(st, db)
+        if _psw == "dot":
+            # 红点段已经走完（不管清干净没清干净，这一轮该做的都做了）→ 进入阶段 B
+            st["post_switch_dot_seen"] = True
+            _psw = _post_switch_phase(st, db)
+        if _psw == "bell":
+            _bell_n = int(st.get("bell_list_n", 0) or 0)
+            if _bell_n >= 3:
+                # 🔴 2026-11-09 21:44 用户原话：「**点进去看看**里面有没有人等着我去聊」。
+                #   今日已聊满 3 人（bell_list_n 是**按账号累计**，切号/跨天重置）时
+                #   不再发开场白，但仍要进去看一眼，把「还有几个人在等」写进日志，
+                #   否则用户看到的就是「悄无声息地没进去」。
+                _ok_l, _why_l = BELL.open_list(a)
+                if _ok_l:
+                    try:
+                        _rows = BELL.bell_list_rows(a.snap(force=True))
+                    except Exception:
+                        _rows = []
+                    if _rows:
+                        log.info("切号首巡：稍后再聊还有 %d 人等着（今日已聊 %d 人，不超额）"
+                                 "：%s", len(_rows), _bell_n,
+                                 "、".join([r[0] for r in _rows[:5]]))
+                    else:
+                        log.info("切号首巡：稍后再聊没人等着")
+                    try:
+                        nav.to_chatlist(a)
+                    except Exception:
+                        pass
+                else:
+                    log.info("切号首巡：没有「奇遇铃-稍后再聊」入口（%s）", _why_l)
+                st["post_switch_bell_done"] = True
+            else:
+                _ok_l, _why_l = BELL.open_list(a)
+                if not _ok_l:
+                    log.info("切号首巡：会话列表没有「奇遇铃-稍后再聊」或没人在等（%s）"
+                             "→ 首巡结束", _why_l)
+                    st["post_switch_bell_done"] = True
+                else:
+                    log.info("🔔 切号首巡：红点已扫过一轮 → 进入奇遇铃「稍后再聊」：%s", _why_l)
+                    _n_l, _msg_l = BELL.handle_list(a, dev, dry_run=dry_run, limit=3)
+                    st["bell_list_n"] = _bell_n + _n_l
+                    st["last_bell"] = time.time()
+                    st["post_switch_bell_done"] = True
+                    log.info("🔔 切号首巡：「稍后再聊」结果 %s（累计 %d 人）→ 恢复原链",
+                             _msg_l, st["bell_list_n"])
+                    # 处理完回会话列表，别把后续阶段丢在铃页面里
+                    try:
+                        nav.to_chatlist(a)
+                    except Exception:
+                        pass
+                    if _n_l:
+                        return "bell"
+    except Exception as _e:
+        log.warning("切号首巡「稍后再聊」异常（不阻断）: %r", _e)
 
     # 🔴 2026-11-03 修复：预算判断原来放在 `if replied_any: return` 之后 —
     #    只要回过人，本轮永远不会被 600s 预算截断（实测 max 155.8s 尚未越界，
