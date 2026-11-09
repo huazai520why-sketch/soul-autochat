@@ -372,6 +372,17 @@ def _device_unread_sids(db):
     return out
 
 
+def invalidate_live_cache():
+    """🔴 2026-11-09 P0：库变化时清掉「设备存活 uid」缓存。
+
+    和 invalidate_unread_cache 同理：`_device_live_uids` 有 120s TTL，
+    库刚同步进新会话时，缓存里可能还没有这个人 → 被当成「App 里已不存在」
+    移出候选（实测一次移出 180 个）。新消息到达时清掉，逼它重新扫设备库。
+    """
+    _LIVE_CACHE.update(v=None, ts=0.0)
+    log.info("设备存活缓存已清除（库变化信号触发）")
+
+
 def invalidate_unread_cache():
     """🔴 2026-11-09 P0 修复：库变化时清掉设备未读缓存。
 
@@ -692,6 +703,7 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     out = []
     for sid, to_uid in rows:
         if str(to_uid).startswith(SKIP_UID_PREFIX):
+            log.debug("跳过官方号 uid=%s（SKIP_UID_PREFIX）", to_uid)
             continue
         try:
             # 🔴 2026-11-04：取 latest —— 入向不落 chatmsg 的账号（实测 402857053）
@@ -701,9 +713,44 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         except Exception:
             continue
         if last is None:
+            log.debug("候选跳过 sid=%s：latest() 返回 None（chatmsg 与摘要都空）", sid)
             continue
         if str(last.sender) == str(db.uid):
-            continue                      # 最后一条是我发的 -> 不用回
+            # 🔴🔴 2026-11-09 P0（18:42 新消息未处理 · 真正的锁芯）
+            #
+            #   【改前】这里是一句**没有任何日志**的 `continue`。
+            #   而这个账号（402857053）的特性是「入向消息不落 chatmsg、只更新 session 摘要」，
+            #   `latest()` 在「摘要时间 <= chatmsg 时间」时直接返回 chatmsg 那条
+            #   ⇒ 她 18:42 刚说的话，被判成「最后一条是我发的 → 不用回」，
+            #   静默丢弃、零日志。实测 18:48 连续多轮 `待回 1 人` 但 `candidates 为空`，
+            #   就是这条路径吃掉的（其余过滤全都有日志可查）。
+            #
+            #   【改后】末条是我 + 设备库说这个会话 unReadCount>0
+            #   ⇒ 以「设备未读」为准（它是强真值，镜像只是缓存），
+            #   用 session 摘要里她的话硬放行进队列；只有摘要也证明是我说的才跳过。
+            #   这样 `_recently_replied` 的「她更新于我的回复」语义仍然生效，不会重复发。
+            if str(sid) in _unread_sids:
+                _dig = {}
+                try:
+                    _dig = db.session_digest(sid) or {}
+                except Exception:
+                    _dig = {}
+                _d_txt = (_dig.get("text") or "").strip()
+                _d_ts = int(_dig.get("ts") or 0)
+                if _d_txt and _d_ts and not _recently_replied(
+                        to_uid, sid=sid, text=_d_txt, her_ts_ms=_d_ts):
+                    log.info("设备未读硬放行·镜像滞后 uid=%s sid=%s 摘要=%r"
+                             "（chatmsg 末条是我，但设备说未读 → 判定是她新话）",
+                             to_uid, sid, _d_txt[:24])
+                    out.append((sid, to_uid, _d_txt, _d_ts,
+                                _burst_n(db, sid, db.uid)))
+                    continue
+                log.info("跳过末条是我 sid=%s uid=%s（设备说未读，但摘要也证明是我说的"
+                         "或取不到摘要：%r）", sid, to_uid, _d_txt[:20])
+            else:
+                log.debug("跳过末条是我 sid=%s uid=%s（设备未读集合里没有 → 真·无需回）",
+                          sid, to_uid)
+            continue
         # 🔴 2026-11-03（最老优先的配套闸）：`session.timestamp` 会被「未读推送 /
         #    推荐位刷新」更新，与 chatmsg 里她**真正**的末条时间差得很远 ——
         #    实测第二个账号里混进了 257h（10 天）前的会话，session 时间却被刷成近几天。
@@ -761,7 +808,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             txt = (last.text or "").strip()
 
         if not txt:
-            continue                      # 无文本（图片/系统消息/分享卡片），不在此处理
+            log.info("候选跳过 sid=%s uid=%s：末条无文本（kind=%s），不在此队列处理",
+                     sid, to_uid, k)
+            continue
         if txt in SYS_TEXTS:
             # 2026-11-03：实测库里混着「[互动消息]」这类系统会话（她末条就是这四个字），
             # 它不是真人说的话，回了等于对机器说话 —— 直接跳过。
@@ -792,6 +841,51 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                      sid, _r.get("reason") or "?", max(0.0, _left_min))
             continue
         out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
+
+    # 🔴🔴🔴 2026-11-09 P0（最后一道闸 · 设备未读对账）
+    #
+    #   上面每一个过滤都对，但**组合起来**会把「设备明说有未读」的会话漏掉：
+    #     · 镜像滞后 → latest() 返回我的旧消息 → 末条是我
+    #     · 设备存活缓存陈旧 → 被判定「App 里不存在」
+    #     · 20 分钟/24 小时口径、冷却台账、L2 末行 …
+    #   用户口径很清楚：**设备库里 unReadCount>0 的会话，就是有人真的在等我回**。
+    #   所以这里做一次无条件对账：设备说未读、但没进 out 的，逐个查明原因并强制补入。
+    #   任何上游过滤都不能把它杀掉 —— 这是「新消息不被漏处理」的最后保证。
+    #   补入后仍然走「定位 / 身份校验 / 发送三态确认」，不会发错人。
+    try:
+        _have = {str(x[0]) for x in out}
+        _missing = [s for s in _unread_sids if s not in _have]
+        _added = 0
+        for _s in _missing:
+            if _added >= 5:            # 一次最多补 5 个，别把队列冲爆
+                break
+            try:
+                _dig = db.session_digest(_s) or {}
+            except Exception:
+                _dig = {}
+            _t = (_dig.get("text") or "").strip()
+            _uid2 = str(_dig.get("to_uid") or "")
+            _ts2 = int(_dig.get("ts") or 0)
+            if not _t or not _uid2 or not _ts2:
+                log.debug("设备未读对账：sid=%s 摘要不完整（text=%r uid=%r ts=%s）→ 无法补入",
+                          _s, _t[:16], _uid2, _ts2)
+                continue
+            if _uid2.startswith(SKIP_UID_PREFIX):
+                continue
+            if _t in SYS_TEXTS:
+                log.info("设备未读对账：sid=%s 末条是系统文本 %r → 不补", _s, _t[:16])
+                continue
+            log.warning("设备未读对账：sid=%s uid=%s 设备说未读却没进队列 "
+                        "（被上游过滤漏掉）→ 强制补入，末条=%r",
+                        _s, _uid2, _t[:24])
+            out.append((_s, _uid2, _t, _ts2, _burst_n(db, _s, db.uid)))
+            _added += 1
+        if _missing:
+            _lv = log.info if _added else log.debug
+            _lv("设备未读对账：设备未读 %d 个，其中 %d 个不在队列（已补 %d 个）",
+                len(_unread_sids), len(_missing), _added)
+    except Exception as _e:
+        log.warning("设备未读对账异常（不影响已有候选）: %r", _e)
 
     # 🔴 2026-11-03 用户口径：**最老待回优先**（先灭火，再聊新的）。
     #    原来按 session.timestamp 倒序 + 凑够 limit 就 break = 最新优先，

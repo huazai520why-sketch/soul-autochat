@@ -314,8 +314,15 @@ def cycle(a, dev, db, st, dry_run=False):
             #     A. 清掉 _device_unread_sids 缓存 → 让 candidates() 重新查设备库
             #     B. 设一个 _dirty_recheck 标志 → 在步骤②入口处重新跑 candidates()
             #        确保新消息能进入待回队列
+            #   顺带把「设备存活 uid」缓存也清掉：它 120s TTL，
+            #   新会话刚进来时缓存里没有这个人 → 会被当成「App 里已不存在」
+            #   从候选里移出（实测一次移出 180 个），和未读缓存是同一个病。
             try:
                 PQ.invalidate_unread_cache()
+            except Exception:
+                pass
+            try:
+                PQ.invalidate_live_cache()
             except Exception:
                 pass
     except Exception as e:
