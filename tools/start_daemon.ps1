@@ -17,7 +17,8 @@ $ErrorActionPreference = "Continue"
 Set-Location "E:\soul1.0"
 
 $py = $env:SOUL_PY
-if (-not $py) { $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
+if (-not $py) { $py = 'C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
 if (-not $py) { throw "python.exe not found; set SOUL_PY env var to your interpreter" }
 $log = "E:\soul1.0\logs\daemon.out"
 
