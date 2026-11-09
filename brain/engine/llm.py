@@ -68,7 +68,7 @@ BRAIN_TIMEOUT = float(os.environ.get("SOUL_BRAIN_TIMEOUT", "40"))
 
 # 本地/云端分析模型
 LOCAL_URL = os.environ.get("SOUL_LOCAL_URL", "http://127.0.0.1:11434/v1/chat/completions")
-LOCAL_MODEL = os.environ.get("SOUL_LOCAL_MODEL", "qwen3.5:9b-q5_K_M")
+LOCAL_MODEL = os.environ.get("SOUL_LOCAL_MODEL", "qwen3.5:9b-q4_K_M")
 LOCAL_KEY = os.environ.get("SOUL_LOCAL_KEY", "")
 LOCAL_TIMEOUT = float(os.environ.get("SOUL_LOCAL_TIMEOUT", "60"))
 
