@@ -15,7 +15,6 @@
 import io
 import json
 import os
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -117,42 +116,49 @@ def _post(url, body, key, timeout):
 
 
 # ────────────────────────── 出话（方舟 character）──────────────────────────
-_think_lock = threading.Lock()
-_think_state = {"last": 0.0}
-THINK_GAP = 300.0          # 白天升档 5 分钟限一次
 
-_REL_UP = ("加个好友", "加你", "微信", "电话", "见面", "出来", "约", "有空", "住哪", "哪儿")
-_REL_RISK = ("删了", "拉黑", "不理你", "生气了", "算了", "别聊了", "没意思")
-_EMO_STRONG = ("哭", "难受", "烦", "委屈", "累", "不想活", "抑郁", "崩溃", "吵架")
+def thinking_for(her_msg, sid=""):
+    """本次请求的 thinking 配置（四挡：关 / low / high / max，按投入度档分配）。
 
+    白天：冷→关（disabled）、温→low、热→high、燃→max；
+    夜间（21:00~6:00）：只用 high / max —— 冷/温→high、热/燃→max
+        （夜里她情绪更浓，值得更深思考，所以不用关/低档）。
+    投入度唯一口径 = stage.score(sid)（0~1；样本不足返回 None → 白天按冷档关、
+    夜间按 high）。
 
-def thinking_for(her_msg):
-    """本次请求的 thinking 配置。
-
-    夜间（21:00~次日 6:00）用 medium —— 夜里她情绪更浓，细腻值这点延迟；
-    白天默认 low；命中关系升级/风险/强情绪时升 medium（5min 限一次）。
-    实测四档：disabled 1.1s / low 1.4~2.1s / medium 1.5~2.5s，都远不到必回天花板。
+    为什么从「时间 + 关键词升 medium」改成按投入度档：
+      2026-11-09 60 条实测：白天全 low 时 reasoning 占输出 96%，纯烧钱；
+      而 medium 会被 DeepSeek 映射成 high（深度档）。用户拍板四挡「关/low/high/max」，
+      高投入（热/燃）才值得开深思考，冷/敷衍直接关，夜里只留 high/max。
     """
     h = time.localtime().tm_hour
     # character 系模型必须显式 disabled（不传该字段默认开思考，27s/1010 reasoning tokens）
     if "character" in (ARK_MODEL or "").lower():
         return {"type": "disabled"}
-    if h >= 21 or h < 6:
-        return {"type": "enabled", "reasoning_effort": "medium"}
-    t = str(her_msg or "")
-    hit = ""
-    for name, kws in (("关系升级", _REL_UP), ("关系风险", _REL_RISK), ("强情绪", _EMO_STRONG)):
-        if t and any(k in t for k in kws):
-            hit = name
-            break
-    if not hit:
+    is_night = (h >= 21 or h < 6)
+    # 投入度档：0冷 / 1温 / 2热 / 3燃；None=样本不足
+    band = None
+    if sid:
+        try:
+            from brain import stage
+            sc = stage.score(sid, her_msg)
+            if sc is not None:
+                band = stage.band(sc)[0]
+        except Exception:
+            band = None
+    if is_night:
+        # 夜间只用 high / max：冷/温→high，热/燃→max；样本不足→high
+        if band is not None and band >= 2:
+            return {"type": "enabled", "reasoning_effort": "max"}
+        return {"type": "enabled", "reasoning_effort": "high"}
+    # 白天按投入度：冷/样本不足→关，温→low，热→high，燃→max
+    if band is None or band == 0:
+        return {"type": "disabled"}
+    if band == 1:
         return {"type": "enabled", "reasoning_effort": "low"}
-    with _think_lock:
-        if time.time() - _think_state["last"] <= THINK_GAP:
-            return {"type": "enabled", "reasoning_effort": "low"}
-        _think_state["last"] = time.time()
-    log.info("[思考] 白天升 medium（%s）", hit)
-    return {"type": "enabled", "reasoning_effort": "medium"}
+    if band == 2:
+        return {"type": "enabled", "reasoning_effort": "high"}
+    return {"type": "enabled", "reasoning_effort": "max"}
 
 
 def _tcp_ok(url, timeout=0.8):
@@ -171,7 +177,7 @@ def _tcp_ok(url, timeout=0.8):
         return False
 
 
-def ark_chat(messages, timeout=None, her_msg="", thinking=None,
+def ark_chat(messages, timeout=None, her_msg="", sid="", thinking=None,
              temperature=0.9, max_tokens=2048, retries=1):
     """出话调用。成功返回文本，失败返回 None（**绝不抛** —— 必回链路最后一环）。"""
     key = ark_key()
@@ -179,7 +185,7 @@ def ark_chat(messages, timeout=None, her_msg="", thinking=None,
         log.warning("没有 .ark_key，出话调用跳过")
         return None
     timeout = timeout or BRAIN_TIMEOUT
-    think = thinking if thinking is not None else thinking_for(her_msg)
+    think = thinking if thinking is not None else thinking_for(her_msg, sid=sid)
     last = None
     for attempt in range(retries + 1):
         try:

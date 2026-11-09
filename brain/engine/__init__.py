@@ -34,10 +34,10 @@ def recent_mine(sid, n=4):
     return out[-n:]
 
 
-def _call(system, user, her_msg):
+def _call(system, user, her_msg, sid=""):
     msgs = [{"role": "system", "content": system},
             {"role": "user", "content": user}]
-    return llm.ark_chat(msgs, her_msg=her_msg)
+    return llm.ark_chat(msgs, her_msg=her_msg, sid=sid)
 
 
 def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
@@ -54,7 +54,7 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
         llm.log.warning("prompt 组装失败: %r", e)
         return None
 
-    raw = _call(system, user, her_msg)
+    raw = _call(system, user, her_msg, sid)
     if not raw:
         return None
 
@@ -99,7 +99,7 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
              "content": "换一个具体画面。不超过 12 字。可以说半句，不用完整。"
                         "如果还是想问，就问「我要不要给你点啥」这种给得起的东西，"
                         "别问她会怎么想。"}]
-    raw2 = llm.ark_chat(msgs, her_msg=her_msg, temperature=0.8)
+    raw2 = llm.ark_chat(msgs, her_msg=her_msg, sid=sid, temperature=0.8)
     if raw2:
         for c in gate.to_messages(raw2, 1):
             ok, why = gate.check(c, recent)
