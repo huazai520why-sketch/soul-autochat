@@ -964,6 +964,18 @@ def do_wake(a, dev, db, st, dry_run=False):
                 break
         except Exception:
             pass
+        # 🔔 奇遇铃抢占一切（用户 2026-11-09 定链：铃 > 新消息 > 红点 > 已读未回）：
+        #   唤醒途中铃弹出来 → 就地处理完再收工，别让铃被后续动作盖掉
+        #   （对齐 clear.py「回复途中来了奇遇铃 → 中断清扫先处理」的既有做法）。
+        if not dry_run:
+            try:
+                if BELL.is_bell(a.snap(force=True), dev=dev):
+                    log.info("🔔 唤醒途中来了奇遇铃 → 就地处理，中断本轮唤醒")
+                    _ok, _why = BELL.handle(a, dev, dry_run=dry_run)
+                    log.info("🔔 铃处理 ok=%s %s", _ok, _why)
+                    break
+            except Exception:
+                pass
         # 🔴 2026-11-08 03:42（用户口径：找不到人也算一次，三次永久放弃）
         #   send_wake() 内部对「找不到人」的各类失败已调 wake._bump_miss() 记过一次
         #   （c<uid> +1，见 wake.py）。这里**只在它整个抛异常时**补记 ——
@@ -1087,7 +1099,14 @@ def run(once=False, dry_run=False):
                 if once:
                     break
                 if what == "idle":
-                    time.sleep(IDLE_SLEEP)      # 确实无人可聊才长等
+                    # 🔔 奇遇铃抢占一切（用户 2026-11-09 定链）：
+                    #   空闲等待也要分片扫铃 —— 铃只存活几十秒，一整段睡
+                    #   IDLE_SLEEP(30s) 就错过（实测铃存活性短）。
+                    #   wait_bell 每 5s 扫一眼，弹了就立刻处理，占满整个空闲窗。
+                    try:
+                        wait_bell(a, dev, IDLE_SLEEP)
+                    except Exception:
+                        time.sleep(IDLE_SLEEP)      # 扫铃异常兜底，别让空闲段白等
                 elif what == "blocked":
                     time.sleep(30)
                 elif what in ("replied", "bell"):

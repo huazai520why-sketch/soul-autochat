@@ -1362,6 +1362,18 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 break
         except Exception:
             pass
+        # 🔔 奇遇铃抢占一切（用户 2026-11-09 定链：铃 > 新消息 > 红点 > 已读未回）：
+        #   已读未回处理途中铃弹出来 → 就地处理完再收工（对齐 clear.py 既有做法）。
+        if not dry_run:
+            try:
+                from brain import bell as _BELL
+                if _BELL.is_bell(actor.snap(force=True), dev=dev):
+                    log.info("🔔 已读未回途中来了奇遇铃 → 就地处理，中断本轮")
+                    _ok, _why = _BELL.handle(actor, dev, dry_run=dry_run)
+                    log.info("🔔 铃处理 ok=%s %s", _ok, _why)
+                    break
+            except Exception as _e:
+                log.debug("轮内铃检查异常（继续已读未回）: %r", _e)
         _t_cand = time.monotonic()
         if out["sent"] >= max_n:
             break
