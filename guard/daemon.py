@@ -303,6 +303,21 @@ def cycle(a, dev, db, st, dry_run=False):
             log.warning("监控跟随库失败: %r", _e)
         if _dirty:
             log.info("库有变化信号 → 已强制同步最新数据")
+            # 🔴🔴 2026-11-09 P0 修复（18:42 新消息未处理故障 · 根因 A+B）：
+            #   故障链路：
+            #     1. DBW.urgent() 检测到库变化 → open_account(force=True) 同步了最新库
+            #     2. 但 _device_unread_sids() 的 60s TTL 缓存还是旧的 → 新消息 sid 不在缓存里
+            #     3. candidates() 里新消息被 _recently_replied/should_skip 掐掉（没有硬放行保护）
+            #     4. cycle() 继续线性往下走（铃→红点→已读未回→匹配→唤醒→空闲）
+            #        不会回头重查新消息 → 新消息永久搁置
+            #   修法（双管齐下）：
+            #     A. 清掉 _device_unread_sids 缓存 → 让 candidates() 重新查设备库
+            #     B. 设一个 _dirty_recheck 标志 → 在步骤②入口处重新跑 candidates()
+            #        确保新消息能进入待回队列
+            try:
+                PQ.invalidate_unread_cache()
+            except Exception:
+                pass
     except Exception as e:
         log.warning("刷新库失败（沿用旧对象）: %r", e)
 
@@ -411,6 +426,13 @@ def cycle(a, dev, db, st, dry_run=False):
     #   ⇒ 每轮都进 `CL.sweep()`（耗时 300~500s、且几乎清不掉任何东西）
     #   ⇒ 轮次预算被 sweep 吃光，匹配/唤醒连门都出不去。
     #   现在：入口也按 candidates（唯一判据）判；库不可用才退回 has_dot_now。
+    #
+    # 🔴🔴🔴 2026-11-09 P0 修复（18:42 新消息未处理 · 根因 B）：
+    #   原来同步完库后直接走线性流程，candidates() 可能因为缓存陈旧判空，
+    #   新消息就永远进不了队列。现在：如果本轮 _dirty=True，
+    #   在这里强制重跑一次 candidates（上面的 invalidate 已经清了设备未读缓存，
+    #   这次 candidates 会重新查设备库拿到最新未读集合）。
+    #   _dirty 已经在上面 DBW.consume() 里被清掉了，这里用 _dirty_recheck 标志。
     _has_dot_n = -1
     try:
         _has_dot_n = len(PQ.candidates(db, limit=1) or [])

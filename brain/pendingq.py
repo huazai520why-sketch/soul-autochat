@@ -370,6 +370,25 @@ def _device_unread_sids(db):
         log.debug("设备未读集合取不到（降级为不硬放行）: %r", e)
     _UNREAD_CACHE.update(ts=now, sids=out)
     return out
+
+
+def invalidate_unread_cache():
+    """🔴 2026-11-09 P0 修复：库变化时清掉设备未读缓存。
+
+    故障链路（18:42 新消息未处理）：
+      18:42:20 cycle() 检测到 DBW.urgent() → open_account(force=True) 同步最新库
+      → 但 _device_unread_sids() 的 60s TTL 缓存还停留在 60s 前的快照
+      → 新消息 sid 不在缓存集合里 → 设备未读「硬放行」失效
+      → 新消息被 _recently_replied / _l2_last_is_me / should_skip 掐掉
+      → candidates() 返回空 → cycle() 一路走到空闲，新消息永久搁置
+
+    修法：daemon.cycle() 在 _dirty=True 时调本函数清缓存，
+    让紧接着的 candidates() 重新查设备库拿到最新的未读集合。
+    """
+    _UNREAD_CACHE.update(ts=0.0, sids=set())
+    log.info("设备未读缓存已清除（库变化信号触发）")
+
+
 # 🔴 2026-11-09：一轮 cycle 里「设备存活校验」会被多个子流程各调一次，
 #    uids 已有 120s 缓存、不会重复扫设备，但旧的 INFO 每次都打 →
 #    实测同一秒刷 3~4 行「205 个…剩 95 个」把真日志淹了。
