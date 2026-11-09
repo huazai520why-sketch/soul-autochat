@@ -2,14 +2,14 @@
 """模型调用层（v10）。
 
 两条通道，职责分开，互不 fallback（这点和旧版不同）：
-  · `ark_chat()`  —— 出话。方舟 doubao-seed-character，**只在出话链路用**。
+  · `ark_chat()`  —— 出话。方舟 DeepSeek（模型由 SOUL_ARK_MODEL_DIRECT 指定），**只在出话链路用**。
   · `oai_chat()`  —— 分析。本地 Ollama 或云端 OpenAI 兼容端点（Qwen 等），
                      用于画像/简报。协议不同，所以必须是两个函数，
                      不能"换个 URL 就调用"（旧版踩过：Ollama 走 /api/chat + options，
                      改 OpenAI 兼容端点直接 400）。
 
 🔴 密钥只有一处：`BASE/.ark_key`（或环境变量 SOUL_ARK_KEY）。绝不写进源码。
-🔴 thinking 必须显式给：character 模型不传该字段默认开思考（27s / 1010 reasoning tokens），
+🔴 thinking 必须显式给：由 thinking_for() 按投入度四挡决定；不传该字段时部分模型默认开思考，
    会直接吃掉超时预算。2026-10-18 实测：只给 enabled 不给 reasoning_effort 等于没开。
 """
 import io
@@ -30,16 +30,24 @@ BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # BASE = E:\soul1.0
 
 
+# 出话模型内置默认值 —— 唯一事实源，必须与 config/model.env.example 的
+# SOUL_ARK_MODEL_DIRECT 一致。只在「环境变量 + config/model.env 都缺失」时生效
+# （本机镜像 / 新克隆 / 离线自检），保证测试与生产永远同一个模型，不再误导。
+DEFAULT_ARK_MODEL = "deepseek-v4-1-flash-261017"
+
+
 def _load_model_env():
     """读 config/model.env（与 run.py 同源）。
 
     为什么引擎自己要读一遍：run.py 只在 `daemon` 入口调 `_load_model_env()`，
     所以**任何不走 run.py 的脚本（自检/离线 A/B/排障）都会拿到默认模型** ——
-    测试结论因此和生产不一致（2026-11-04 踩过：自检用 doubao-character 1.3s，
-    生产实际是 deepseek-v4-1-flash）。这里统一兜住，两边永远是同一个模型。
+    测试结论因此和生产不一致（2026-11-04 踩过：自检只拿到代码内置默认模型，
+    生产实际是 deepseek-v4-1-flash）。这里统一兜住；内置默认值也与
+    config/model.env.example 保持一致，任何环境下都不会再出现"测试和生产两个模型"。
     """
     p = os.path.join(BASE, "config", "model.env")
     if not os.path.isfile(p):
+        log.warning("config/model.env 不存在，出话模型走内置默认 %s", DEFAULT_ARK_MODEL)
         return
     try:
         with io.open(p, encoding="utf-8") as f:
@@ -60,7 +68,7 @@ ARK_URL = os.environ.get(
     "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
 ARK_MODEL = (os.environ.get("SOUL_ARK_MODEL_DIRECT")
              or os.environ.get("SOUL_ARK_MODEL")
-             or "doubao-seed-character-260628")
+             or DEFAULT_ARK_MODEL)
 
 # 出话超时（秒）。实测正常 6~7s，40s 是天花板（必回不能被单次调用拖死）
 BRAIN_TIMEOUT = float(os.environ.get("SOUL_BRAIN_TIMEOUT", "40"))
@@ -115,7 +123,7 @@ def _post(url, body, key, timeout):
     return json.loads(raw), time.time() - t0
 
 
-# ────────────────────────── 出话（方舟 character）──────────────────────────
+# ────────────────────────── 出话（方舟 DeepSeek）───────────────────────────
 
 def thinking_for(her_msg, sid=""):
     """本次请求的 thinking 配置（四挡：关 / low / high / max，按投入度档分配）。
@@ -132,9 +140,6 @@ def thinking_for(her_msg, sid=""):
       高投入（热/燃）才值得开深思考，冷/敷衍直接关，夜里只留 high/max。
     """
     h = time.localtime().tm_hour
-    # character 系模型必须显式 disabled（不传该字段默认开思考，27s/1010 reasoning tokens）
-    if "character" in (ARK_MODEL or "").lower():
-        return {"type": "disabled"}
     is_night = (h >= 21 or h < 6)
     # 投入度档：0冷 / 1温 / 2热 / 3燃；None=样本不足
     band = None

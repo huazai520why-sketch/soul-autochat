@@ -1006,8 +1006,12 @@ def run(once=False, dry_run=False):
         _AC0.mark_active()
     except Exception:
         pass
-    log.info("出话模型: %s  @  %s",
-             os.environ.get("SOUL_ARK_MODEL_DIRECT", "(默认 doubao-seed-character)"),
+    # 打印真正生效的模型（与 brain.engine.llm.ARK_MODEL 同源，避免日志与实跑口径不一致）
+    try:
+        from brain.engine.llm import ARK_MODEL as _ark_model_shown
+    except Exception:
+        _ark_model_shown = os.environ.get("SOUL_ARK_MODEL_DIRECT") or "(见 config/model.env.example)"
+    log.info("出话模型: %s  @  %s", _ark_model_shown,
              os.environ.get("SOUL_ARK_URL_DIRECT", "(默认方舟)"))
     _v9 = os.environ.get("SOUL_PROMPT_V9", "1") == "1"
     log.info("出话结构: %s", "V9（人设+她的档案 → system，她的话 → user）" if _v9
