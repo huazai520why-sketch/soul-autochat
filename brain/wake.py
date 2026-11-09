@@ -349,34 +349,24 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
 def _kw_list(db, sid, uid, limit=2):
     """搜索关键词候选（按命中概率排序）。
 
-    🔴 2026-11-03 实测：唤醒原来只用「我最后一句」(last_text)。
-       - 那句只有 1~2 字（"嗯"/"哦"）→ 直接「关键词太短」放弃
-         （夜间 uid=*** 反复命中这一条，唤醒整轮白跑）
-       - 她的原话在搜索索引里同样存在，且更长、更独特
-    取最近 24 条，挑「她说的最长一句」→「我说的最长一句」，去重后最多 limit 个。
+    🔴 2026-11-09 P0 修复（现场实证）：旧实现取「最近 24 条里最长的一整句」，
+       偏偏最容易挑中带全角逗号/问号的完整话术（「锅里的水还没开，你那边晋中咋样了」），
+       或我方群发开场白模板 —— 两者在 Soul 搜索里实测必然 notfound。
+       结果 15:00~15:32 连续 53 次「未找到相关结果」+ 56 次点「取消」退出，
+       屏幕上就是用户看到的「瞎操作乱点」，而一条消息都没发出去。
+       现统一复用 brain/pendingq.kw_of()（现网 5~8 字命中率 74.1% 的口径）：
+       去首尾标点 / 压空格 / 去表情 / 5 字下限 / 非纯数字 / 群发模板过滤 /
+       优先「她」的历史长句。txt 传空即强制走历史长句兜底。
     """
     try:
-        msgs = db.messages(sid, limit=24)
+        from brain.pendingq import kw_of
     except Exception:
         return []
-    hers, mines = [], []
-    for m in msgs:
-        t = (m.text or "").strip()
-        # 4~18 字：太短搜不准，太长可能含表情/换行
-        if not (4 <= len(t) <= 18) or "[" in t or "]" in t:
-            continue
-        if str(m.sender) == str(uid):
-            mines.append(t)
-        else:
-            hers.append(t)
-    out = []
-    for group in (hers, mines):
-        if not group:
-            continue
-        best = max(group, key=len)
-        if best not in out:
-            out.append(best)
-    return out[:limit]
+    try:
+        k = (kw_of(db, sid, "", min_len=5) or "").strip()
+    except Exception as e:
+        return []
+    return [k] if 5 <= len(k) <= 20 else []
 
 
 def opening(db, cand, nick=""):

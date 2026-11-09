@@ -343,6 +343,33 @@ _UNREAD_BEFORE = {"set": None}
 _LIVE_CACHE = {"v": None, "ts": 0.0}
 _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
+_UNREAD_CACHE = {"ts": 0.0, "sids": set()}
+
+
+def _device_unread_sids(db):
+    """设备库 unReadCount>0 的 sid 集合（60s TTL 缓存）。
+
+    🔴 2026-11-09 P0：msg_probe 直查设备库看到 10 条积压未读，
+       但 candidates() 只看本地镜像 + replied.json + turns.md(L2) + pending_skip.json，
+       四套本地状态都会滞后，把真红点判成「已回/冷却中」→ 连续 29 轮零回复。
+       设备库未读是「她发了且从未进会话读过」的强真值，用它兜底放行。
+       一轮内 candidates() 会被调 6+ 次，故加 60s 缓存避免重复 adb。
+    """
+    now = time.time()
+    if now - _UNREAD_CACHE["ts"] < 60.0:
+        return _UNREAD_CACHE["sids"]
+    out = set()
+    try:
+        from data import imdb as _IM
+        dev = getattr(db, "dev", None) or _DEV_REF.get("dev")
+        if dev is not None:
+            m = _IM.device_unread_map(dev, timeout=6, uid=getattr(db, "uid", None))
+            if m:
+                out = {str(k) for k, v in m.items() if v}
+    except Exception as e:
+        log.debug("设备未读集合取不到（降级为不硬放行）: %r", e)
+    _UNREAD_CACHE.update(ts=now, sids=out)
+    return out
 # 🔴 2026-11-09：一轮 cycle 里「设备存活校验」会被多个子流程各调一次，
 #    uids 已有 120s 缓存、不会重复扫设备，但旧的 INFO 每次都打 →
 #    实测同一秒刷 3~4 行「205 个…剩 95 个」把真日志淹了。
@@ -590,6 +617,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     返回 [(sessionId, to_uid, 末条文本, 末条毫秒时间)]，按她末条时间**升序**（最老优先）。
     """
     cutoff = (time.time() - days * 86400) * 1000
+    # 🔴 2026-11-09 P0：先取设备库真实未读集合（60s 缓存），供下面硬放行使用。
+    _unread_sids = _device_unread_sids(db)
     try:
         rows = db.con.execute(
             "SELECT sessionId, toUserId FROM session "
@@ -722,6 +751,15 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         # 🔴 2026-11-03 修复 P1：原来 len(txt)<2 把「嗯/好/哦」这类一字纯文本也丢弃。
         #    一字消息若红点已清且当时没发出，就会永久漏回、且无台账可恢复。
         #    现在只丢空文本；一字消息保留为候选，搜索关键词由 kw_of 退回历史长句兜底。
+        # 🔴 2026-11-09 P0：设备库 unread>0 = 真红点，硬放行。
+        #    台账(replied.json)、L2(turns.md)、冷却(pending_skip.json) 都是本地状态，
+        #    镜像滞后时会把新消息误判成「已回/冷却中」，导致红点堆着一条都不回。
+        #    这里直接入队，后续定位/身份校验/发送三态确认仍照常执行，不会乱发。
+        if str(sid) in _unread_sids:
+            log.info("设备未读硬放行 uid=%s sid=%s（跳过台账/L2/冷却）", to_uid, sid)
+            out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
+            continue
+
         if _recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=last.ts) \
                 or _l2_last_is_me(sid, her_ts_ms=last.ts):
             log.info("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
