@@ -18,7 +18,7 @@ Set-Location "E:\soul1.0"
 
 $py = $env:SOUL_PY
 if (-not $py) { $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
-if (-not $py) { throw "找不到 python.exe，请设置 SOUL_PY 环境变量指向你的解释器" }
+if (-not $py) { throw "python.exe not found; set SOUL_PY env var to your interpreter" }
 $log = "E:\soul1.0\logs\daemon.out"
 
 function Write-Log([string]$msg) {
