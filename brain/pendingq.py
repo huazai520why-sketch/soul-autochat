@@ -1686,7 +1686,10 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
                 if rn and (rn == ni or ni in rn or rn in ni):
                     _cand.append(r)
             if len(_cand) == 1:
-                return _cand[0], "列表昵称命中 %r" % _cand[0].nickname
+                try:
+                    return _cand[0], "列表昵称命中 y=%d %r" % (_cand[0].center[1], _cand[0].nickname)
+                except Exception:
+                    return _cand[0], "列表昵称命中 %r" % _cand[0].nickname
         all_rows = rows(sn)
         # 🔴🔴 2026-11-10（纯表情末条结构性命不中）：
         #   `_norm('[中午好]')` → '中午好'（3 字），而全列表层要求 mlen=4 →
@@ -1733,15 +1736,29 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
     _up_sig = _list_sig(snap)
     try:
         if _swipe_list(actor, up=False):
-            _s_up = actor.snap()
+            # 🔴🔴 2026-11-10（实测 P0：向上探屏后点错人）
+            #   23:11:38 首次生效就出事了：
+            #     `列表昵称命中 '一只羊'（向上 1 屏）'一只羊'` → 直接点列表行
+            #     → `身份校验失败（进的是别的会话：清零 ['9669164683008498']，期望 9669164631844588）`
+            #   根因：`_swipe_list` 返回后列表**还在惯性滚动**，立刻取树拿到的
+            #   是滚动中途的坐标，等真正 click 时那一行已经移位 → 点到相邻会话。
+            #   （fail-closed 挡住了错发，但这次白跑一趟 25s。）
+            #   修法：等惯性停 + 强制取新帧，坐标才是点击那一刻的真实位置。
+            time.sleep(0.8)
+            _s_up = actor.snap(force=True)
             if detect(_s_up) == "chatlist":
                 _up_sig2 = _list_sig(_s_up)
                 if _up_sig2 and _up_sig2 != _up_sig:
                     r, why = _scan(_s_up)
                     if r is not None:
-                        log.info("%s（向上 1 屏）%r", why, r.nickname)
+                        try:
+                            log.info("%s（向上 1 屏 y=%d）%r", why, r.center[1], r.nickname)
+                        except Exception:
+                            log.info("%s（向上 1 屏）%r", why, r.nickname)
                         return r
                     snap = _s_up
+                else:
+                    log.debug("向上探屏无位移（已在顶部），继续原方向")
     except Exception as _e_up:
         log.debug("向上探屏失败（继续向下翻）: %r", _e_up)
 
