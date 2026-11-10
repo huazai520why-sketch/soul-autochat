@@ -103,7 +103,8 @@ def dismiss_popups(actor, tries=3):
             # 有弹窗但找不到关闭键 → 用 back 试试（RN 弹层通常能被 back 关掉）
             log.info("[popup] 检测到弹窗但没有关闭键 → 按 back")
             try:
-                actor.dev.u2().press("back")
+                # 2026-11-10：收口到 Hand.back 护栏版（弹窗会消费 back）
+                actor.hand.back(settle=0.0, force=True)
             except Exception:
                 pass
             time.sleep(1.2)

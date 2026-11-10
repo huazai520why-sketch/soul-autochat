@@ -40,7 +40,8 @@ def ensure_no_keyboard(actor):
         log.info("键盘弹着 -> back 收起")
         from core.device import note_action
         note_action()          # A2：绕过 Hand 的裸 u2 调用，手工让帧缓存作废
-        actor.dev.u2().press("back")
+        # 2026-11-10 收口到 Hand.back 护栏版（关键盘会吞 back，退出前台仍自愈拉起）
+        actor.hand.back(settle=0.0, force=True)
         time.sleep(1.2)
         return True
     return False

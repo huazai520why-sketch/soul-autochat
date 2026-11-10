@@ -391,3 +391,35 @@ def to_tab(actor, name="聊天", tries=8):
 
 def to_chatlist(actor):
     return to_tab(actor, "聊天")
+
+
+ROOT_PAGES = ("chatlist", "me", "square", "planet")
+
+
+def back_safe(actor, settle=1.2):
+    """页面感知的安全返回：根页绝不按 back。
+
+    ?? 2026-11-10 15:50 实测：
+      列表页 Activity = MainActivity，单次 back 直接把 Soul 退出到桌面。
+      hands.Hand.back 已有护栏（重页不按 + 退出自愈），这里再按**页面**判一层：
+        chatlist/me/square/planet 这类根页，back 一定是退出 App，直接跳过。
+
+    返回 "root"（已在根页未按）/ "ok"（返回了一级）/ "relaunch"（兜底拉起过）。
+    """
+    dev = actor.dev
+    if not in_soul(dev):
+        ensure_app(dev)
+        return "relaunch"
+    try:
+        snap = actor.snap(force=True)
+        pg = detect(snap)
+    except Exception:
+        pg = "unknown"
+    if pg in ROOT_PAGES:
+        log.info("[nav] 已在根页 %s，跳过 back（防退到桌面）", pg)
+        return "root"
+    if pg == "unknown" and at_main(dev):
+        log.info("[nav] unknown 且 Activity 是 MainActivity，跳过 back")
+        return "root"
+    ok = actor.hand.back(settle=settle)
+    return "ok" if ok else "relaunch"

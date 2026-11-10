@@ -16,6 +16,7 @@
        800~2000ms     -> ×1.5
        > 2000ms       -> ×2.5（并记一条 warn，便于发现设备变卡）
 """
+import os
 import time
 
 from core.log import get_logger
@@ -92,15 +93,95 @@ class Hand(object):
         return n
 
     # ---------- 组合 ----------
-    def back(self, settle=0.3):
+    def back(self, settle=0.3, force=False):
+        """返回上一级，带「防退到模拟器桌面」护栏。
+
+        实测 2026-11-10 15:50 实弹实测（MuMu + Soul）：
+          chatlist = cn.soulapp.android/.component.startup.main.MainActivity
+          chat     = ...component.chat.ConversationActivity
+          单次 back：ConversationActivity -> MainActivity（精准回列表）
+          **但已在 MainActivity 再按 back，Soul 直接退出到桌面（启动栈被打穿）**
+
+        2026-11-10 用户点名要修的 bug：
+          演示脚本"回列表"循环盲按 back，一按到根页就把 App 退出到桌面，
+          后续所有点击全打在 launcher 上，整轮流程报废。
+
+        护栏三件套：
+          1) 前台不是 Soul        -> 不按（按了也是给桌面用），直接拉起 Soul
+          2) 前台是 MainActivity  -> 不按，只记日志（根页 back = 退出 App）
+             例外：force=True 用于确实需要"关掉 MainActivity 上的弹窗"的场合
+          3) 按完复查前台，若已退出 -> 立即拉起 Soul（自愈），返回 False
+
+        返回 True 表示"确实返回了一级且仍在 Soul 内"。
+        """
+        from core.paths import SOUL_PKG
+
+        if os.environ.get("SOUL_BACK_GUARD", "1") == "0":
+            self._do("press", "back")
+            self._settle(settle)
+            return True
+
+        pkg, act = self._cur()
+        if SOUL_PKG not in (pkg or ""):
+            log.warning("[back] 前台不是 Soul(pkg=%r act=%r) -> 不按 back，改为拉起", pkg, act)
+            self.ensure_soul()
+            return False
+        if not force and "MainActivity" in (act or ""):
+            log.info("[back] 前台是 MainActivity(根页)，跳过 back 防止退出到桌面")
+            return False
+
         self._do("press", "back")
         self._settle(settle)
+
+        pkg2, act2 = self._cur()
+        if SOUL_PKG not in (pkg2 or ""):
+            log.warning("[back] back 打穿启动栈，Soul 已退出前台(act=%r) -> 立即拉起", act2)
+            self.ensure_soul()
+            return False
+        return True
+
+    def _cur(self):
+        """当前前台 (package, activity)；异常时返回空二元组，绝不让 back 抛。"""
+        try:
+            return self.dev.current_app()
+        except Exception:
+            return ("", "")
+
+    def in_soul(self):
+        from core.paths import SOUL_PKG
+        pkg, _ = self._cur()
+        return SOUL_PKG in (pkg or "")
+
+    def ensure_soul(self, wait=15):
+        """把 Soul 拉回前台（back 打穿启动栈后的自愈），返回是否成功。"""
+        from core.paths import SOUL_PKG
+        try:
+            self.dev.u2().app_start(SOUL_PKG, wait=True)
+        except Exception as e:
+            log.warning("[back] app_start 失败 %r -> monkey 兜底", e)
+            try:
+                self.dev.sh("monkey -p %s -c android.intent.category.LAUNCHER 1" % SOUL_PKG,
+                            timeout=30)
+            except Exception as e2:
+                log.warning("[back] monkey 也失败 %r", e2)
+        t0 = time.time()
+        while time.time() - t0 < wait:
+            if self.in_soul():
+                time.sleep(1.5)
+                log.info("[back] Soul 已回到前台")
+                return True
+            time.sleep(1.0)
+        log.warning("[back] 拉起 Soul 超时(%.0fs)", wait)
+        return False
 
     def swipe(self, fx, fy, tx, ty, duration=0.3, settle=0.2):
         self._do("swipe", fx, fy, tx, ty, duration=duration)
         self._settle(settle)
 
     def press(self, key, settle=0.2):
+        # 所有 back 一律走护栏版，避免任何调用点再把 App 退到桌面（2026-11-10）
+        if key == "back":
+            return self.back(settle=settle)
         self._do("press", key)
         self._settle(settle)
 
