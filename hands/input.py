@@ -121,6 +121,11 @@ class Input(object):
 
         优先用 type_and_verify 缓存的快照（里面已经有 btn_send），
         缓存没有才去重新 dump。
+        🔴 2026-11-10（演示实弹发现）：btn_send 是灌字后才由 App 渲染出来的，
+          设备负载高时渲染会晚于两次 dump（缓存+force 重找全空）→ 误判失败。
+          实弹样本：13:17:16 等一束光 / 13:18:01 幸福约定，两次 dump 均无按钮。
+          修复：找不到时等 0.8s 第三次 dump（给渲染一帧机会）；仍失败则读
+          输入框区分「字还在（渲染慢）」与「字被吃（明确失败）」并打进日志。
         """
         s = snap or self._snap or actor.snap()
         btn = s.hit(res=SEND_RES)
@@ -128,7 +133,12 @@ class Input(object):
             s = actor.snap(force=True)
             btn = s.hit(res=SEND_RES)
         if btn is None:
-            log.warning("找不到发送按钮（可能没灌进字）")
+            time.sleep(0.8)
+            s = actor.snap(force=True)
+            btn = s.hit(res=SEND_RES)
+        if btn is None:
+            got = self.box_text(s)
+            log.warning("找不到发送按钮（三次 dump 均无；输入框文本=%r）", got)
             return False
         log.info("点发送 %s", btn.bounds)
         actor.hand.tap_node(btn, settle=settle)
