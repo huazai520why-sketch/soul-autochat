@@ -1190,7 +1190,31 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     return [x[:4] for x in merged]
 
 
-_NICK_CACHE = {}
+NICK_FILE = STATE / "nick_cache.json"
+
+
+def _load_nick_file():
+    """读盘上的昵称缓存（sid -> 昵称）。
+
+    🔴 2026-11-10：`extMap` 里的昵称只覆盖 48% 的老会话，但**列表行/会话标题上
+      一定写着昵称**。所以凡是在界面上看见过的昵称都记下来，
+      下次这批 40h+ 的老会话就有昵称可搜了（这是唯一能救它们的手段）。
+    """
+    out = {}
+    try:
+        if NICK_FILE.exists():
+            import json as _json
+            d = _json.loads(NICK_FILE.read_text(encoding="utf-8"))
+            now = time.time()
+            for k, v in (d or {}).items():
+                if isinstance(v, str) and v.strip():
+                    out[str(k)] = (now, v.strip())
+    except Exception as e:
+        log.debug("昵称缓存读取失败（当作空）: %r", e)
+    return out
+
+
+_NICK_CACHE = _load_nick_file()
 
 
 def nick_of(db, sid, uid):
@@ -1248,6 +1272,25 @@ def _usable_word(w, min_len):
         return False
     # 至少含一个汉字/字母/数字：纯 emoji、纯标点、纯空白都搜不到
     return bool(re.search(r"[0-9A-Za-z\u4e00-\u9fff\uff10-\uff19]", t))
+
+
+def remember_nick(sid, nick):
+    """把界面上看到的昵称记下来（列表行/会话标题），供以后「搜昵称」用。"""
+    t = (nick or "").strip()
+    if not _usable_word(t, 2):
+        return
+    key = str(sid)
+    old = _NICK_CACHE.get(key)
+    if old and old[1] == t:
+        return
+    _NICK_CACHE[key] = (time.time(), t)
+    try:
+        import json as _json
+        data = {k: v[1] for k, v in _NICK_CACHE.items() if v and v[1]}
+        NICK_FILE.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        log.info("记住昵称 sid=%s → %r（下次可搜昵称）", key[-10:], t)
+    except Exception as e:
+        log.debug("昵称缓存落盘失败: %r", e)
 
 
 def _sessions_with(db, text):
@@ -1897,6 +1940,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.warning("双击找行异常: %r", _e)
         if row is not None:
             log.info("直接点列表行 %r（不走搜索）", row.nickname)
+            remember_nick(sid, row.nickname)
             mark_before_enter(actor)      # 未读快照（进会话后用它做 sid 差分校验）
             actor.hand.tap_node(row.node, settle=1.8)
             s2, pg2 = actor.wait_page(("chat",), timeout=6)
