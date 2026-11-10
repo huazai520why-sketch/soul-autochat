@@ -30,8 +30,10 @@ SYS_PHRASES = (
 
 MSG_TOP = 140        # 状态栏/标题栏以下
 MSG_BOTTOM = 1400    # 快捷栏以上
-RIGHT_EDGE = 700     # 气泡右边界 >= 此值 -> 我发的
-LEFT_EDGE = 210      # 气泡左边界 <= 此值 -> 对方发的
+RIGHT_EDGE = 700     # 旧判据（先判右导致她长句误判 me），由 side_of 就近边判定取代
+LEFT_EDGE = 210      # 旧判据（存档）
+SCREEN_W = 900       # 实测分辨率（900x1600）
+NEAR_EDGE = 300      # 左右距离都超过此值 -> 居中（"?"）
 
 
 def _is_noise(it):
@@ -50,12 +52,23 @@ def _is_noise(it):
 
 
 def side_of(it):
-    """me / her / ?"""
-    if it.box[2] >= RIGHT_EDGE:
-        return "me"
-    if it.box[0] <= LEFT_EDGE:
-        return "her"
-    return "?"
+    """me / her / ?——**就近边判定**。
+
+    🔴 2026-11-10（演示实弹解剖实锤）：原实现**先判右再判左**——她的长句
+      （左起 x1≈157，长句文本框右边界可延伸过 700）会先命中 me 分支被误判
+      → 不回 → 「红点消了消息没回」。实弹样本：霜鸢Icy 13:30
+      「胆子大才能保护人嘛~…」box=(158,1316,723,1352) 被判 me（库明明 her），
+      截图存证 logs/_anatomy_134326.png；短句永不踩线，只咬她的长句。
+    修复：左边距 box[0] vs 右边距 SCREEN_W-box[2]，**小者胜**；两侧距离都
+      超过 NEAR_EDGE（居中：时间戳/资料条）→ "?"（保持原行为）。
+    实测：她长句 158<177 → her ✓；我方 (428,742) 158<428 → me ✓；
+      居中资料条 (293,490) 均>300 → "?" 与原行为一致。
+    """
+    x1, _, x2, _ = it.box
+    dl, dr = x1, SCREEN_W - x2
+    if min(dl, dr) > NEAR_EDGE:
+        return "?"
+    return "me" if dr < dl else "her"
 
 
 TITLE_RES = "id/tv_title"
