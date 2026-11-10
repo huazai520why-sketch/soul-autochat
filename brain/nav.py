@@ -59,6 +59,25 @@ def ensure_app(device, wait=18):
             time.sleep(1.5)
             return True
         time.sleep(1.0)
+    # 🔴 2026-11-10 16:5x（上线实测）：app_start / monkey 都"成功返回"但前台仍是
+    #   app.lawnchair —— 实测连喊 4 轮拉起无效，每轮白烧 30s，跨轮计数到 5/7 才
+    #   am start / 重启。手动 force-stop + monkey 冷启 3s 就回 MainActivity。
+    #   所以加二级兜底：先杀进程再冷启（只在第一级确认失败后走）。
+    log.warning("拉起无效（前台仍 %s）→ force-stop 冷启兜底",
+                (device.current_app() or ("", ""))[0])
+    try:
+        device.sh("am force-stop %s" % SOUL_PKG, timeout=30)
+        time.sleep(1.5)
+        device.sh("monkey -p %s -c android.intent.category.LAUNCHER 1" % SOUL_PKG, timeout=40)
+    except Exception as e:
+        log.warning("force-stop 冷启失败 %r", e)
+    t1 = time.time()
+    while time.time() - t1 < 30:
+        if in_soul(device):
+            time.sleep(1.5)
+            log.info("force-stop 冷启成功，Soul 已回前台")
+            return True
+        time.sleep(1.0)
     return False
 
 
