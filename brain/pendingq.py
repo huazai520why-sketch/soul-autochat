@@ -816,7 +816,19 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             try:
                 from brain import sendgate as _SGa
                 from data import reply_state as _RSa
-                if int(last.ts or 0) > _RSa.her_ts_of(str(sid)):
+                from eyes import sysmsg as _SMa
+                # 🔴 §106 交叉审查实证（P0-1）：只比 ts 会把「我方刚发的跟进」和
+                #    Soul 推的系统卡当成她的人话 → 归档复活 + 水位线被污染，
+                #    age 归零后最多可再发 6 条。必须同时判 sender 与 human。
+                _lt = (last.text or "").strip()
+                # 文本为空时（语音/图片占位）只要不是 msgType 27/35 也算真人，
+                # 避免她用语音/图片重新开口时归档永远解不开（C4）。
+                _human_ok = (_SMa.is_human(_lt, getattr(last, "msg_type", None),
+                                           uid=to_uid) if _lt else
+                             int(getattr(last, "msg_type", 0) or 0) not in (27, 35))
+                _is_new_her = (str(last.sender) != str(db.uid) and _human_ok
+                               and int(last.ts or 0) > _RSa.her_ts_of(str(sid)))
+                if _is_new_her:
                     _SGa.on_her(str(sid), int(last.ts or 0), human=True)
                     log.info("归档会话来了新的人话 sid=%s → 解除归档，重新计入待回", sid)
                 else:

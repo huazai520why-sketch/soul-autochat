@@ -74,16 +74,13 @@ def allow(
             RS.on_her(sid, float(her_ts_ms), human=has_human)
         rec = RS.get(sid)
         _her = float(rec.get("her_ts_ms") or 0) or float(her_ts_ms or 0)
+        _sends = rec.get("sends") or []
         if _her <= 0:
-            # 🔴 冷启动兜底（上线前实测发现的致命洞）：台账尚未建立水位线时，
-            #    state_of 会判 no_human 并返回 allowed=0 —— 而 flow / wake / picreq
-            #    这些路径都不经过 candidates 的 on_her，会把「必回」链路整条掐死。
-            #    处理：以当前时刻为回合起点建水位线，之后再按正常的 2/6 条额度裁决。
-            _now_s = float(now if now is not None else time.time())
-            _her = _now_s * 1000.0
-            RS.on_her(sid, _her, human=True)
-            rec = RS.get(sid)
-            log.info("发送闸 sid=%s 水位线未建立 → 以当前时刻冷启动（不阻断必回）", sid)
+            # 🔴 不伪造 her_ts 落盘：台账没有真人消息时间戳时，
+            #    用本回合最早一条发送时刻作起点（一条都没发则用当前时刻）。
+            #    这样 note_sent 写入的 sends 仍能被 state_of 正确归属，额度不会失效。
+            _her = (min(_sends) if _sends else float(now if now is not None else time.time())) * 1000.0
+            log.info("发送闸 sid=%s 无真实水位线 → 按 sends 起点裁决（不落盘、不污染台账）", sid)
         v = V.state_of(
             sid=sid,
             her_ts_ms=_her,
@@ -160,7 +157,9 @@ def state_of(sid: str, **kw):
             n_lines=kw.get("n_lines", 1),
         )
     except Exception:
-        return V.state_of(has_human=False)
+        return V.Verdict(V.PENDING, 0.0, 0, 0,
+                         max(1, int(kw.get("n_lines", 1))), V.CAP_24H,
+                         "台账异常 → 降级放行（必回优先）")
 
 
 __all__ = ["ON", "Decision", "allow", "note_sent", "on_her",

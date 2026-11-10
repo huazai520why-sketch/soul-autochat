@@ -139,6 +139,14 @@ ck(d.ok and d.n == 2, "台账未建立 → 冷启动放行，不掐死必回")
 SG.note_sent("g_cold", 2)
 d = SG.allow("g_cold", 2)
 ck(not d.ok, "冷启动后 2/6 条额度仍正常生效（发满即闸死）")
+# 🔴 §106 P1-1：冷启动不得伪造 her_ts 落盘（否则 80h 老会话 age 归零、归档延后）
+RS.reset("g_no_her")
+SG.allow("g_no_her", 1)
+ck(RS.her_ts_of("g_no_her") == 0, "冷启动不伪造 her_ts 落盘（不污染共享台账）")
+RS.reset("g_old")
+RS.note_sent("g_old", 2)
+d = SG.allow("g_old", 2)
+ck(not d.ok, "无真实水位线的老会话：sends 仍被正确归属，额度未击穿")
 
 # 一键回滚开关
 _old_on = SG.ON
@@ -158,6 +166,10 @@ ck(not SM.is_human("随便什么", msg_type=27), "msgType=27 = system")
 ck(SM.classify("积分兑换限时福利", uid="2042683123") == SM.AD, "官方营销号 = ad")
 ck(not SM.is_human(""), "空文本不当人话（不推进水位线）")
 ck(SM.is_human("我刚领了个礼物"), "普通人话含营销词不误杀为广告（误杀=永久漏回）")
+# 🔴 §106 P1-2：旧 SYSTEM_HINTS 子串匹配会把这些真人话判成系统卡 → 永久漏回
+for _t in ("嗯", "哈哈哈", "通话时长挺长的", "此消息很重要", "你已成功啦", "互相关注吧"):
+    ck(SM.is_human(_t), "真人话不被系统卡规则误杀: %r" % _t)
+ck(not SM.is_human("互相关注后即可开始聊天"), "无歧义系统卡仍能被拦住")
 
 
 # ------------------------------------------------- 6 · §6.6 常量对调断言
@@ -171,6 +183,12 @@ _m2 = re.search(r'^RESTART_H\s*=\s*float\(os\.environ\.get\("SOUL_RESTART_H",\s*
                 _pq, re.M)
 ck(bool(_m1 and _m1.group(1) == "72" and _m2 and _m2.group(1) == "24"),
    "STALE_GIVEUP_H=72 / RESTART_H=24 已对调（否则重开永不触发或 72h 还在接旧话）")
+# 🔴 §106 P0-1 防回归：归档解除判据必须同时判 sender 与 human，不能只比 ts
+_m3 = re.search(r'if str\(sid\) in _archived:(.*?)if str\(last\.sender\) == str\(db\.uid\):',
+                _pq, re.S)
+ck(bool(_m3) and "str(last.sender) != str(db.uid)" in _m3.group(1)
+   and "is_human" in _m3.group(1),
+   "归档解除判据含 sender + human 双判据（P0-1，防改回只比 ts）")
 
 
 # ---------------------------------------------- 5 · 43 会话 × 72h 容量回放

@@ -23,13 +23,18 @@ SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消�
 # 真人消息占位串：不能当系统消息
 HUMAN_PLACEHOLDERS = ("[语音]", "[图片]", "[表情]", "[视频]", "[位置]", "[文件]")
 
-# 系统引导卡 / 平台提示（2026-11-10 夜班实证 + imdb 官方号 hints）
-SYSTEM_HINTS = (
-    "互相关注后即可", "互相关注", "关注后即可", "发送一条消息即可",
+# 🔴 §106 交叉审查实证（P1-2）：旧版对 SYSTEM_HINTS 做**子串**匹配，
+#    把「通话时长挺长的」「此消息很重要」「你已成功啦」「互相关注吧」
+#    这些真人话判成系统卡 → pendingq 直接 continue，永久漏回。
+#    改成两层：无歧义固定整句（硬判据）+ 平台提示前缀且文本够长（软判据）。
+SYSTEM_HARD = (
+    "互相关注后即可", "发送一条消息即可", "对方撤回了一条消息",
+    "消息已撤回", "语音通话结束", "视频通话结束", "对方拒绝了",
+)
+SYSTEM_PREFIX = (
     "对方设置了", "系统提示", "温馨提示", "请遵守", "社区规范",
-    "你已成功", "已成为好友", "对方撤回了一条消息", "消息已撤回",
-    "通话时长", "语音通话结束", "视频通话结束", "对方拒绝了",
-    "该消息已", "此消息", "安全提醒", "实名认证", "青少年模式",
+    "实名认证", "青少年模式", "安全提醒", "该消息已", "通话时长",
+    "你已成功", "已成为好友",
 )
 
 # 营销 / 广告（_OFFICIAL_HINTS 同源）
@@ -80,7 +85,9 @@ def classify(
     u = str(uid or "")
     if u.startswith("2042683") or (u.startswith("-") and u[1:].isdigit()):
         return AD
-    if any(k in t for k in SYSTEM_HINTS):
+    if any(k in t for k in SYSTEM_HARD):
+        return SYSTEM
+    if len(t) >= 12 and any(t.startswith(p) for p in SYSTEM_PREFIX):
         return SYSTEM
     # 🔴 普通会话**不按营销关键词判广告**：她说「我刚领了个礼物」是真人话，
     #    误杀成 ad = 永久漏回，比漏判一张系统卡严重得多。
@@ -115,4 +122,5 @@ def is_system(text: str = "", msg_type: Optional[int] = None,
 
 
 __all__ = ["HUMAN", "SYSTEM", "AD", "SYS_TEXTS", "HUMAN_PLACEHOLDERS",
-           "SYSTEM_HINTS", "AD_HINTS", "classify", "is_human", "is_system"]
+           "SYSTEM_HARD", "SYSTEM_PREFIX", "AD_HINTS", "classify",
+           "is_human", "is_system"]
