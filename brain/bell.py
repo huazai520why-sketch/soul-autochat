@@ -252,6 +252,18 @@ def bell_list_rows(snap):
              and 150 <= n.bounds[0] <= 400
              and 2 <= len(n.text.strip()) <= 16
              and n.bounds[3] - n.bounds[1] < 60]
+    # 🔴 2026-11-10 §111（P0 误发）：同一行的「昵称 / 相同点：xxx / Ta距离Nkm」三个文本
+    #   节点全部满足上面的筛选条件 → 被当成 3 个人 → 每个都点同一行、各发一条开场白
+    #   （实测 16:35 给「陈陈星」连发 3 条：「我这边刚忙完…」「我可以先讲讲我自己…」
+    #    「我这人话不多…」）。实测行高约 104px、真实两行中心相距 ~164px，
+    #   所以按行中心 y 聚类（阈值 60），同一行只留**最靠上**的那个（主体昵称）。
+    _picked = []
+    for _n in sorted(nicks, key=lambda x: (x.bounds[1], x.bounds[0])):
+        _cy = (_n.bounds[1] + _n.bounds[3]) // 2
+        if any(abs(_cy - _p[0]) <= 60 for _p in _picked):
+            continue
+        _picked.append((_cy, _n))
+    nicks = [x[1] for x in _picked]
     for n in nicks:
         t = n.text.strip()
         cy = (n.bounds[1] + n.bounds[3]) // 2

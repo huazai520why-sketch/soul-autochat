@@ -1260,7 +1260,11 @@ def run(once=False, dry_run=False):
                     save_state(st)
 
                 ensure_app(dev)
-                what = cycle(a, dev, db, st)
+                # 🔴 2026-11-10 §111（P0 安全缺陷）：原来这里漏传 dry_run，
+                #   `cycle(a, dev, db, st)` 用的是默认 False —— 于是 `run.py once --dry`
+                #   **一路真发**：实测 16:34 一轮 dry 给 4 个会话发出去 9 条消息
+                #   （含给同一人连发 3 条开场白）。演练必须是演练。
+                what = cycle(a, dev, db, st, dry_run=dry_run)
                 # 🔴 2026-11-08 21:3x：把「真干了活」的轮次记成活跃时间，
                 #   供 acct 的空闲兜底切号（读不到匹配次数时按空闲时长决定是否切）。
                 if what in ("replied", "matched", "waked", "switched", "bell"):

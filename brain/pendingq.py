@@ -1653,10 +1653,23 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         if not dry_run:
             try:
                 from brain import bell as _BELL
-                if _BELL.is_bell(actor.snap(force=True), dev=dev):
+                _snap_r = actor.snap(force=True)
+                if _BELL.is_bell(_snap_r, dev=dev):
                     log.info("🔔 已读未回途中来了奇遇铃 → 就地处理，中断本轮")
                     _ok, _why = _BELL.handle(actor, dev, dry_run=dry_run)
                     log.info("🔔 铃处理 ok=%s %s", _ok, _why)
+                    break
+                # 🔴 2026-11-10 §111（用户原话）：「清理已读未回的途中 发完消息回到聊天页
+                #   如果检测到红点 那就优先处理红点」。
+                #   复用上面这张 snap（本来就要为铃检查拍一张），零额外 OCR 成本。
+                #   只在「本轮已回过人」时让位：一条没回就中断会空转，交给下一轮红点段。
+                try:
+                    from brain import clear as _CL
+                    _bd_r = _CL.badge_chat(_snap_r)
+                except Exception:
+                    _bd_r = 0
+                if _bd_r and int(out.get("sent", 0) or 0) > 0:
+                    log.info("🔴 已读未回途中聊天角标=%s → 中止本轮，优先回去清红点", _bd_r)
                     break
             except Exception as _e:
                 log.debug("轮内铃检查异常（继续已读未回）: %r", _e)
