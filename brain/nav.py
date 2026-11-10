@@ -47,6 +47,16 @@ def ensure_app(device, wait=18):
     """确保 Soul 在前台，不在就拉起（app_start，不是返回键）。"""
     if in_soul(device):
         return True
+    # 🔴 2026-11-10 17:00（上线后卡死 8 轮的真因，截图实证）：
+    #   下拉通知/快捷设置面板被拉下来后，前台是 launcher / SystemUI，detect 永远 unknown；
+    #   app_start 只能把 Soul 拉到面板**下面**，面板仍盖在上面 → 拉起"成功"但页面还是 unknown。
+    #   截图实测：整屏是「互联网 / 飞行模式 / 深色主题 / 锁屏 / 颜色反转」的快捷面板。
+    #   所以拉起前先收面板（面板没开时该命令无副作用，幂等）。
+    try:
+        device.sh("cmd statusbar collapse", timeout=20)
+        time.sleep(0.8)
+    except Exception as e:
+        log.warning("收下拉面板失败（继续）: %r", e)
     log.info("Soul 不在前台（%s），拉起", device.current_app()[0])
     try:
         device.u2().app_start(SOUL_PKG, wait=True)
