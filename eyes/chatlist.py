@@ -20,6 +20,7 @@
      改成：优先认 res-id `conversation_list` + 高度必须 > 屏高一半 + 行内必须有 name/time 结构。
 """
 import re
+import time
 
 from core.log import get_logger
 from core.paths import DEV_H
@@ -419,7 +420,44 @@ def rows(snap):
         items.sort(key=lambda n: (n.bounds[1], n.bounds[0]))
         out.append(Row(c, items))
     out.sort(key=lambda r: r.node.bounds[1])
+    _log_rows(out)
     return out
+
+
+# 🔴 2026-11-10（P0 日志缺陷修复）：本模块 430 行、`log` 建了却**一次都没打过**
+#   → `logs/eyes.chatlist.log` 长期 0 字节。代价很具体：夜间复盘时
+#   「反查不到 sid 368 次」「id_mismatch_giveup 623 次」全都没法定位到屏幕这一层，
+#   因为**唯一能证明「列表上到底有没有这个人」的证据从来没被记下来**。
+#   这里补一条摘要日志，并做内容去重：同一屏反复解析只打一次，避免刷爆文件。
+_LAST_ROWS_SIG = {"sig": None, "ts": 0.0}
+
+
+def _log_rows(rows_):
+    """把本次解析出的会话行打成一行摘要（内容不变则跳过）。
+
+    只在 DEBUG 级别不可用时也应该能看 —— 这里固定用 info，但做签名去重，
+    所以每屏内容变化最多一条，稳态下一轮（多屏）也就几条。
+    """
+    try:
+        if not rows_:
+            sig = "<empty>"
+        else:
+            sig = "|".join((r.nickname or "?")[:10] for r in rows_)
+        now = time.time()
+        if sig == _LAST_ROWS_SIG["sig"] and now - _LAST_ROWS_SIG["ts"] < 20.0:
+            return
+        _LAST_ROWS_SIG["sig"] = sig
+        _LAST_ROWS_SIG["ts"] = now
+        if not rows_:
+            log.info("列表解析：0 行（没认出任何会话行）")
+            return
+        _head = " / ".join(
+            "%s%s:%s" % (r.nickname or "?", "*" if r.has_dot else "", (r.blob or "")[:12])
+            for r in rows_[:6])
+        log.info("列表解析：%d 行 顶=%d 底=%d  前几行=[%s]",
+                 len(rows_), rows_[0].center[1], rows_[-1].center[1], _head)
+    except Exception as e:
+        log.warning("列表解析日志异常（不影响主流程）: %r", e)
 
 
 def find_row(snap, text, min_len=6):

@@ -49,6 +49,13 @@ MIN_GAP_MIN = 10             # 两次切号至少间隔 10 分钟（用户 2026-
 #   还把设备占着让回复更慢。现在失败也记时间，退避 30 分钟内不再试。
 FORCE_RETRY_GAP_MIN = 30
 
+# 🔴 2026-11-10（P0 修复）：一次切号最多点几个候选账号行。
+#   原代码是硬编码 `for attempt in range(2)` —— 面板里有 3 个号时第 3 个**永远点不到**。
+#   夜间实测（11-09 22:00~11-10 07:12）：06:27 / 07:01 两次强制切号，日志都是
+#     「面板候选账号行 3 个」→「尝试切到第 1/2 个」→「切完 uid 没变」→ 退避 30 分钟。
+#   一晚空转 4 次，同一账号硬扛 9.8h（越过 8h 强制阈值 4 次）。上限 6 只是防呆。
+SWITCH_MAX_TRY = 6
+
 SWITCH_FILE = STATE / "switch_book.json"
 
 
@@ -519,10 +526,10 @@ def switch_account(actor, dev):
                      and "添加账号" not in (r.desc or "")]
             return _cand or _rows
 
-        # 🔴 2026-11-04 修复：原循环「点完第 1 个账号行 → app_start 重启 → 面板关闭
-        #    → 第 2 个账号行的坐标失效」，导致点第 2 个账号 uid 没变。现在每次尝试
-        #    前**重新打开面板**，用最新坐标点行。
-        for attempt in range(2):
+        # 🔴 2026-11-10（P0 修复）：原来 range(2) —— 面板里有 3 个账号时，
+        #   第 3 个候选**永远点不到**（见 SWITCH_MAX_TRY 注释里的夜间实测）。
+        tried_rows = 0
+        for attempt in range(SWITCH_MAX_TRY):
             if attempt == 0:
                 s = actor.snap(force=True)
             else:
@@ -555,6 +562,16 @@ def switch_account(actor, dev):
 
             cand = _cand_rows(s)
             log.info("面板候选账号行 %d 个", len(cand))
+            # 🔴 2026-11-10（补证据）：原来失败只留一句「uid 没变」，完全看不出
+            #   点的是哪一行、面板上到底几个号、识别到的昵称对不对。夜间排障时
+            #   只能靠猜。现在把每行的 bounds / 昵称 / 描述都打出来，
+            #   下次失败能直接判断「点错行」还是「点了没反应」。
+            for _i, _r in enumerate(cand):
+                try:
+                    log.info("   面板行%d bounds=%s nick=%r desc=%r",
+                             _i, _r.bounds, (_r.label or "")[:16], (_r.desc or "")[:24])
+                except Exception:
+                    log.info("   面板行%d bounds=%s（读标签失败）", _i, getattr(_r, "bounds", "?"))
             # 🔴 2026-11-08 21:3x（实测）：面板第一行就是**当前账号**，
             #   点它当然「uid 没变」，白跑一轮 + 一次 app 重启。
             #   现在从第二行开始点（只有一个号时才回落到第一行）。
@@ -562,6 +579,7 @@ def switch_account(actor, dev):
             if attempt >= len(order):
                 break
             target = order[attempt]
+            tried_rows += 1
             log.info("尝试切到第 %d 个账号 %s", attempt + 1, target.bounds)
             actor.hand.tap_node(target, settle=1.5)
 
@@ -575,19 +593,34 @@ def switch_account(actor, dev):
                 s2, pg2 = nav.to_tab(actor, "自己")
                 if pg2 != "me":
                     continue
-                try:
-                    after = str(open_account(dev).uid)
-                except Exception:
-                    after = ""
+                # 🔴 2026-11-10（P0 误判修复）：原来只读一次 uid 就下结论。
+                #   库是 pull 缓存（REFRESH_S=300），切号后 App 刚重启、库还没同步，
+                #   第一次读到的还是旧 uid → 判「没变」→ break → 换下一个号白点。
+                #   现在读 3 次（间隔 1.5s），并把「读不到」与「真的没变」分开报。
+                after = ""
+                for _k in range(3):
+                    try:
+                        after = str(open_account(dev).uid or "")
+                    except Exception as _e:
+                        log.warning("   切号后读 uid 失败(%d/3): %r", _k + 1, _e)
+                        after = ""
+                    if after and after != before:
+                        break
+                    if _k < 2:
+                        time.sleep(1.5)
                 if before and after and after != before:
                     log.info("✓ 切号成功：%s -> %s", before, after)
                     return True, "已切号 %s -> %s" % (before, after)
                 if not before and pg2 == "me":
-                    log.info("✓ 切号后回到自己页（无法校验 uid）")
+                    log.info("✓ 切号后回到自己页（切号前就读不到 uid，无法校验）")
                     return True, "已切号（无 uid 校验）"
-                log.info("   切完 uid 没变（%s）", after or "?")
+                if not after:
+                    log.warning("   切号后 3 次都读不到 uid（库未刷新）→ 本次判失败，"
+                                "但**不确定**是否真没切过去")
+                else:
+                    log.info("   切完 uid 没变（仍是 %s）→ 这一行不是目标号，换下一行", after)
                 break
-        return False, "两个账号都试了，uid 都没变"
+        return False, "已试 %d 个候选账号，uid 都没变" % tried_rows
     except Exception as e:
         log.warning("切号异常: %r", e)
         return False, repr(e)

@@ -235,6 +235,14 @@ def append_turns(sid, rows):
         f.write("".join(buf))
     write_meta(sid)
     resync_state(sid)
+    # 🔴 2026-11-10（日志缺陷修复）：本模块只在「拒绝写无出处事实」时打 warning，
+    #   正常写入一条不留 → `logs/brain.pack.store.log` 长期 0 字节。
+    #   L2(turns.md) 是「她说了新话有没有被记住」的唯一凭据，
+    #   而 pendingq 的 `_l2_last_is_me` 判定完全依赖它 —— 写没写进去必须留痕。
+    try:
+        log.info("L2 追加 sid=%s %d 行（末行=%s）", sid, len(buf), buf[-1].strip()[:60])
+    except Exception:
+        pass
     return len(buf)
 
 

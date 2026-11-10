@@ -59,10 +59,30 @@ def sent_this_hour():
 def can_send():
     """本小时还能不能发。超了就返回 False（调用方应停止发送并进下一阶段）。"""
     n = sent_this_hour()
+    # 🔴 2026-11-10（日志缺陷修复）：本模块只有「超限/接近上限」才打日志，
+    #   正常时一条都不写 → `logs/brain.ratelimit.log` 长期 0 字节。
+    #   复盘时完全看不出「这个小时到底发了几条、离封号线多远」。
+    #   这里加低频心跳（30 分钟一条），正常情况下的余量也留痕。
+    _hb(n)
     if n >= CAP_H:
         log.warning("⛔ 本小时已发 %d 条（上限 %d）→ 暂停发送，等下一小时", n, CAP_H)
         return False
     return True
+
+
+_HB = {"ts": 0.0}
+
+
+def _hb(n):
+    """限流心跳：每 30 分钟记一次余量，正常态也留证据。"""
+    try:
+        now = time.time()
+        if now - _HB["ts"] < 1800:
+            return
+        _HB["ts"] = now
+        log.info("限流心跳：本小时已发 %d / 上限 %d（余 %d）", n, CAP_H, max(0, CAP_H - n))
+    except Exception:
+        pass
 
 
 def note_sent(n=1):

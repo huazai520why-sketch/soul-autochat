@@ -112,6 +112,14 @@ def read(snap):
 
     out["raw"] = " | ".join(t for t in ts if t not in ("手机信号满格。", "WLAN 信号满格。")
                             and not t.startswith("正在充电"))[:300]
+    # 🔴 2026-11-10（P0 日志缺陷修复）：本模块 131 行、`summary()` 专门为日志而写，
+    #   却从来没有调用点 → `logs/eyes.profile.log` 长期 0 字节。
+    #   匹配阶段「反查不到 sid，跳过建档」时，恰恰需要知道**主页到底抓到了什么**，
+    #   否则分不清是「没进主页」还是「进了但解析失败」。这里补一条。
+    try:
+        log.info("主页解析：%s（节点 %d 条）", summary(out), len(ts))
+    except Exception as _e:
+        log.warning("主页解析日志异常（不影响主流程）: %r", _e)
     return out
 
 

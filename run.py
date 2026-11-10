@@ -286,6 +286,15 @@ def main():
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
 
+    # 🔴 2026-11-10（日志缺陷修复）：本文件建了 `log = get_logger("run")` 却一次不用
+    #   → `logs/run.log` 长期 0 字节。每次启动的入口参数（daemon / clear / pending …）
+    #   是复盘时判断「这个进程到底被谁、用什么参数拉起来的」最直接的证据。
+    try:
+        import os as _os
+        log.info("run 启动：argv=%s pid=%s", sys.argv[1:], _os.getpid())
+    except Exception:
+        pass
+
     if args.cmd == "check":
         return cmd_check()
     if args.cmd == "screen":
