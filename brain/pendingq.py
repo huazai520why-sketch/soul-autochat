@@ -1236,10 +1236,13 @@ def nick_of(db, sid, uid):
         rows = db.con.execute(
             "SELECT extMap FROM chatmsg WHERE sessionId=? AND senderId<>? "
             "AND extMap IS NOT NULL AND extMap != '' "
-            "ORDER BY localTime DESC LIMIT 12", (sid, db.uid)).fetchall()
+            "ORDER BY localTime DESC LIMIT 12", (sid, str(db.uid))).fetchall()
         import json as _json
         for row in rows:
-            em = row[0] if isinstance(row, (tuple, list)) else row
+            # 🔴 2026-11-10：IMDB.con 带 row_factory=sqlite3.Row，Row 既不是 tuple
+            #   也不是 list —— 按 isinstance 判断会把它当字符串塞进 json.loads，
+            #   异常又被 debug 吞掉，表现就是「昵称永远取不到」。
+            em = row[0]
             if not em or "name" not in em:
                 continue
             try:
@@ -2000,6 +2003,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 if _got:
                     if _label == "昵称":
                         _used_nick = _word
+                        remember_nick(sid, _word)
                     break
                 # 熔断是全局通道问题：换关键词也没用，别把第二个词也白烧掉
                 if getattr(S, "LAST_REASON", "") == "breaker":
