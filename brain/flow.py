@@ -505,7 +505,44 @@ def _send_lines(actor, lines, nick, page_checked=False, sid=""):
     try:
         from brain import sendgate as SG
         if SG.ON and sid:
-            _d = SG.allow(sid, len(lines))
+            # 🔴 2026-11-10（用户口径「都读实时库，本地库没有用」）：镜像滞后会让
+            #    verdict 的 C2「她再发→清零」看不到她刚发的事实 → following 误拦
+            #    （实测 13:49 等一束光 13:42「喜欢听你说」被 2/2 拦截，强拉镜像仍
+            #    「新增 0 条」）。发送前用 data.imdb._dev_sql **直查设备库 session
+            #    行**（0.05~0.3s，不走 pull）：timestamp 显著晚于我方最后发送
+            #    （>5s）⇒ 末条必是她 ⇒ 作为 her_ts_ms 喂闸，C2 清零正常生效。
+            #    查不到/解析失败 → 不喂，按原台账走，行为向后兼容。
+            _her_ts_feed = None
+            try:
+                from data import imdb as _IM
+                from data import reply_state as _RS
+                _uid_now = _IM.current_uid(actor.dev)
+                _name = _IM._db_name_for_uid(actor.dev, _uid_now)
+                _last_send = 0.0
+                try:
+                    _sends = (_RS.get(sid) or {}).get("sends") or []
+                    _last_send = max(_sends) if _sends else 0.0
+                except Exception:
+                    pass
+                if _name:
+                    _raw = _IM._dev_sql(
+                        actor.dev, _name,
+                        "select ifnull(timestamp,0) from session where sessionId='%s' limit 1"
+                        % str(sid), timeout=8) or ""
+                    _line = ""
+                    for _ln in _raw.replace("\r", "").splitlines():
+                        if _ln.strip():
+                            _line = _ln.strip()
+                    if _line:
+                        _ts = float(_line.split("|")[0] or 0)
+                        _ts_s = _ts if _ts < 1e11 else _ts / 1000.0
+                        if _ts_s > _last_send + 5:
+                            _her_ts_feed = _ts_s * 1000.0
+                            log.info("实时库核对 sid=...%s：session.ts=%.0f > 我方末发 %.0f"
+                                     " → 她刚发，按 C2 清零喂闸", str(sid)[-8:], _ts_s, _last_send)
+            except Exception as _e:
+                log.debug("实时库核对失败（按台账走）: %r", _e)
+            _d = SG.allow(sid, len(lines), her_ts_ms=_her_ts_feed)
             if not _d.ok:
                 log.info("[%s] 跟进阶梯拦截 sid=%s state=%s（%s）", nick, sid, _d.state, _d.reason)
                 return 0, "跟进阶梯拦截(%s)" % _d.state
