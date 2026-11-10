@@ -54,6 +54,16 @@ def save_profile(sid, prof, tags=None, common=None):
     if not sid:
         return False
     prof = prof or {}
+    # 🔴 2026-11-10（演示实弹污染 ×2）：点错头像/进错页面时，P.read 会把
+    #    功能按钮文案当昵称写进档案（实测「切换用户」「我好睡得很[笑哭]」）。
+    #    写前黑名单校验：昵称含按钮/导航词 → 判定进错页，整包不写。
+    _BAD_NICK = ("切换用户", "加速", "关注后可邀请通话", "返回", "更多",
+                 "文明聊天", "查看主页", "送TA", "桌球", "醒脑咖啡")
+    _nick = (prof.get("nick") or "").strip()
+    if _nick and any(b in _nick for b in _BAD_NICK):
+        log.warning("主页昵称=%r 命中功能词黑名单 → 判定进错页面，拒绝写档案 sid=%s",
+                    _nick, str(sid)[-8:])
+        return False
     kv = {}
     if prof.get("nick"):
         kv["昵称"] = prof["nick"]

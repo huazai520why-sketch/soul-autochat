@@ -757,18 +757,25 @@ def visit_profile(actor, settle=2.5):
     n = snap.hit(text="查看主页")
 
     if n is None:
-        # ② 对方头像（userAvatar）
+        # ② 对方头像。🔴 2026-11-10（演示实弹）：Soul 6.41.0 头像 res-id 是
+        #    `chat_avatar`（`userAvatar` 已不存在）→ 原条件永远落空 → 掉昵称兜底
+        #    点错「加速」。另加左半屏过滤（对方头像 x≈10~128，我方头像在右侧）。
         av = [x for x in snap.nodes
-              if x.clickable and ("userAvatar" in (x.res_id or "") or (x.desc or "") == "头像")]
+              if x.clickable and x.center[0] < 450
+              and ("userAvatar" in (x.res_id or "") or "chat_avatar" in (x.res_id or "")
+                   or (x.desc or "") == "头像")]
         if av:
             av.sort(key=lambda x: x.center[0])
             n = av[0]
+            log.info("用头像节点 %s 进主页", n.bounds)
 
     if n is None:
         # ③ 会话页顶部的对方昵称（实测 y≈105、x≈450）——普通会话页没有「查看主页」，
         #    但点昵称能进主页；这一步让「聊天时补建档案」真正可行。
         skip = ("返回", "关注", "聊天设置", "更多", "搜索", "通讯录",
-                "8小时前", "刚刚在线", "在线")
+                "8小时前", "刚刚在线", "在线",
+                # 🔴 2026-11-10（演示实弹点错「加速」）：顶栏功能按钮全部排除
+                "加速", "关注后可邀请通话", "通话", "礼物", "桌球", "一起听")
         cands = [x for x in snap.nodes
                  if x.label and x.clickable and x.center[1] < 170
                  and 150 < x.center[0] < 800
