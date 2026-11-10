@@ -426,9 +426,37 @@ def summary(db, max_age_h=None):
         ready24 = len(should_reply(db, **_kw24))
     except Exception:
         pass
+    # 跟进阶梯接线（§104-B3）：四桶状态分布，只读不落盘。
+    #    整体 try/except：统计失败各桶填 -1，不影响原摘要返回。
+    #    verdict 共 6 档状态，本摘要按口径输出 5 个桶（pending/following/awaiting/
+    #    archived/no_human）；PENDING_RESTART（待回且需重新开场）并入 pending 桶，
+    #    不是漏了一档 —— 它与 PENDING 同属 verdict.QUEUEABLE「待回」。
+    b_pending = b_following = b_awaiting = b_archived = b_no_human = -1
+    try:
+        from brain import sendgate as SG
+        from brain import verdict as V
+        _b = {V.PENDING: 0, V.FOLLOWING: 0, V.AWAITING: 0,
+              V.ARCHIVED: 0, V.NO_HUMAN: 0}
+        for x in items:
+            v = SG.state_of(str(x.sid), her_ts_ms=x.her_ts, has_human=True)
+            _st = getattr(v, "state", "")
+            if _st == V.PENDING_RESTART:
+                _st = V.PENDING
+            if _st in _b:
+                _b[_st] += 1
+        b_pending = _b[V.PENDING]
+        b_following = _b[V.FOLLOWING]
+        b_awaiting = _b[V.AWAITING]
+        b_archived = _b[V.ARCHIVED]
+        b_no_human = _b[V.NO_HUMAN]
+    except Exception:
+        pass
+
     txt = ("待回 %d 人（未读 %d / 已读未回 %d），最老 %s 前，可立即处理 %s 人"
+           "｜ 四桶 pending=%d / following=%d / awaiting=%d / archived=%d / no_human=%d"
            % (len(items), n_unread, n_read, old_s,
-              ready if ready >= 0 else "?"))
+              ready if ready >= 0 else "?",
+              b_pending, b_following, b_awaiting, b_archived, b_no_human))
     # 内容变了才打（summary 每轮会被调多次，不能刷屏）
     try:
         if txt != _LAST_SUM["v"]:

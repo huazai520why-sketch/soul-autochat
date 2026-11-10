@@ -82,8 +82,9 @@ def classify(
         return AD
     if any(k in t for k in SYSTEM_HINTS):
         return SYSTEM
-    if any(k in t for k in AD_HINTS):
-        return AD
+    # 🔴 普通会话**不按营销关键词判广告**：她说「我刚领了个礼物」是真人话，
+    #    误杀成 ad = 永久漏回，比漏判一张系统卡严重得多。
+    #    AD_HINTS 只在官方号段（上面那一行）生效。
     return HUMAN
 
 

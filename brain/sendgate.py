@@ -9,6 +9,7 @@
 生产出任何异常可立刻退回改造前行为，不用 revert 代码。
 """
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -72,9 +73,20 @@ def allow(
         if her_ts_ms and float(her_ts_ms) > 0:
             RS.on_her(sid, float(her_ts_ms), human=has_human)
         rec = RS.get(sid)
+        _her = float(rec.get("her_ts_ms") or 0) or float(her_ts_ms or 0)
+        if _her <= 0:
+            # 🔴 冷启动兜底（上线前实测发现的致命洞）：台账尚未建立水位线时，
+            #    state_of 会判 no_human 并返回 allowed=0 —— 而 flow / wake / picreq
+            #    这些路径都不经过 candidates 的 on_her，会把「必回」链路整条掐死。
+            #    处理：以当前时刻为回合起点建水位线，之后再按正常的 2/6 条额度裁决。
+            _now_s = float(now if now is not None else time.time())
+            _her = _now_s * 1000.0
+            RS.on_her(sid, _her, human=True)
+            rec = RS.get(sid)
+            log.info("发送闸 sid=%s 水位线未建立 → 以当前时刻冷启动（不阻断必回）", sid)
         v = V.state_of(
             sid=sid,
-            her_ts_ms=float(rec.get("her_ts_ms") or 0) or float(her_ts_ms or 0),
+            her_ts_ms=_her,
             sends=rec.get("sends") or [],
             now=now,
             my_last_ts_ms=my_last_ts_ms,

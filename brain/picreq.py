@@ -102,6 +102,20 @@ def try_send(actor, dev, sid, text):
     """
     if not wants_pic(text):
         return False, "不是在要照片"
+    # §104 跟进阶梯：发图前过一次只读闸（wants_pic 之后、can_send 之前）。
+    #    归档或额度用尽则不发图，直接降级为文字回复。
+    #    只对「真 sid」（纯数字）建水位线：flow 在无 sid 时会传 nick 进来，
+    #    拿昵称当会话主键会污染台账（且冷启动会把昵称当新会话）。
+    #    台账异常一律降级放行，绝不掐死「必回」的文字回复链路。
+    _sid_ok = bool(sid) and str(sid).isdigit()
+    try:
+        from brain import sendgate as SG
+        if SG.ON and _sid_ok:
+            d = SG.allow(sid, 1)
+            if not d.ok:
+                return False, "跟进阶梯拦截(%s)" % d.state
+    except Exception:
+        pass
     ok, why = can_send(sid)
     if not ok:
         return False, why
@@ -110,6 +124,15 @@ def try_send(actor, dev, sid, text):
     sent, msg = P.send_from_chat(actor, dev, index=idx)
     if sent:
         note_sent(sid, idx)
+        # 🔴 §104 C1：图片也是我方发出的一条消息，必须计入 2/6 条额度。
+        #    flow._send_lines 随后会按「已发 1 条」重新裁决文字条数；
+        #    两处各记各的消息（1 图 + N 文字），不是双计数。
+        try:
+            from brain import sendgate as _SG
+            if _SG.ON and _sid_ok:
+                _SG.note_sent(str(sid), 1)
+        except Exception:
+            pass
         log.info("📷 她要照片 → 已发第 %d 张", idx)
         return True, "已发第 %d 张" % idx
     log.warning("发图失败（%s）→ 降级为文字", msg)

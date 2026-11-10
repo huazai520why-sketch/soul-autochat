@@ -131,6 +131,15 @@ RS.set_archived("g1", True)
 d3 = SG.allow("g1", 1)
 ck(not d3.ok and d3.state == V.ARCHIVED, "归档会话发送闸拒绝")
 
+# 🔴 冷启动兜底：台账为空 + 调用方没传 her_ts_ms（flow/wake/picreq 就是这么调的）
+#    若判 no_human 拒绝，会把「必回」链路整条掐死 —— 上线前实测发现的致命洞。
+RS.reset("g_cold")
+d = SG.allow("g_cold", 2)
+ck(d.ok and d.n == 2, "台账未建立 → 冷启动放行，不掐死必回")
+SG.note_sent("g_cold", 2)
+d = SG.allow("g_cold", 2)
+ck(not d.ok, "冷启动后 2/6 条额度仍正常生效（发满即闸死）")
+
 # 一键回滚开关
 _old_on = SG.ON
 SG.ON = False
@@ -148,6 +157,20 @@ ck(not SM.is_human("[系统消息]"), "SYS_TEXTS = system")
 ck(not SM.is_human("随便什么", msg_type=27), "msgType=27 = system")
 ck(SM.classify("积分兑换限时福利", uid="2042683123") == SM.AD, "官方营销号 = ad")
 ck(not SM.is_human(""), "空文本不当人话（不推进水位线）")
+ck(SM.is_human("我刚领了个礼物"), "普通人话含营销词不误杀为广告（误杀=永久漏回）")
+
+
+# ------------------------------------------------- 6 · §6.6 常量对调断言
+print("\n--- 6 · 常量对调（§6.6 单做任一条都会留坑） ---")
+import re  # noqa: E402
+_pq = (Path(__file__).resolve().parents[1] / "brain" / "pendingq.py").read_text(
+    encoding="utf-8", errors="replace")
+_m1 = re.search(r'^STALE_GIVEUP_H\s*=\s*float\(os\.environ\.get\("SOUL_STALE_GIVEUP_H",\s*"(\d+)"',
+                _pq, re.M)
+_m2 = re.search(r'^RESTART_H\s*=\s*float\(os\.environ\.get\("SOUL_RESTART_H",\s*"(\d+)"',
+                _pq, re.M)
+ck(bool(_m1 and _m1.group(1) == "72" and _m2 and _m2.group(1) == "24"),
+   "STALE_GIVEUP_H=72 / RESTART_H=24 已对调（否则重开永不触发或 72h 还在接旧话）")
 
 
 # ---------------------------------------------- 5 · 43 会话 × 72h 容量回放

@@ -81,7 +81,10 @@ SCAN_SESSIONS = 300
 #
 #   ⇒ 回到 24h。真要收紧，必须等搜索修复后的**新**数据（至少跑满一天）再定，
 #     而且应该用「搜索成功率」而不是「回出率」作依据。
-STALE_GIVEUP_H = float(os.environ.get("SOUL_STALE_GIVEUP_H", "24") or 24)
+# 🔴 2026-11-10 §104（用户定稿）：与 RESTART_H **必须对调**，单改任一条都留坑。
+#   原 24h 淘汰会把 24~72h 的待回全部踢出，导致「>24h 重新开场」永远触发不了；
+#   改成 72h 后，24~72h 的人交给重新开场/跟进阶梯，>72h 才由状态机归档。
+STALE_GIVEUP_H = float(os.environ.get("SOUL_STALE_GIVEUP_H", "72") or 72)
 
 # 🔴 2026-11-03（用户定 **B 方案**）：她上一条已超过 RESTART_H 小时 → 不再「接话」，
 #   改「重新开场」（换由头、不提旧话题、不道歉）。
@@ -89,7 +92,9 @@ STALE_GIVEUP_H = float(os.environ.get("SOUL_STALE_GIVEUP_H", "24") or 24)
 #   其中 11 个她只回了「嗯 / 你好 / 哈哈 / [呆] / [狗子]」——
 #   隔二十天去答一个「嗯」既没内容，也一定露馅（她早忘了自己说过）。
 #   0 = 关闭（全部按正常接话）。
-RESTART_H = float(os.environ.get("SOUL_RESTART_H", "72") or 72)
+# 🔴 2026-11-10 §104：72 → 24（用户「超过 24h 的积压重新开场」）。
+#   判据不再只看 age：handle_pending 改用 verdict 状态机（age>=24h 且本回合 0 条）。
+RESTART_H = float(os.environ.get("SOUL_RESTART_H", "24") or 24)
 # 每轮最多处理几个「重新开场」：29 个一次性发出去像群发，
 #   而且老会话会占掉本轮的发送名额。原来 1 个/轮，配 2 条/轮的额度，
 #   17 个 >72h 的会话要 17 轮（约 1 小时）才轮到一遍 —— 现在 2 个/轮。
@@ -729,6 +734,13 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     返回 [(sessionId, to_uid, 末条文本, 末条毫秒时间)]，按她末条时间**升序**（最老优先）。
     """
     cutoff = (time.time() - days * 86400) * 1000
+    # 🔴 2026-11-10 §104 C4：归档集合一次性取（循环里逐个读台账会白烧磁盘）。
+    _archived = set()
+    try:
+        from brain import sendgate as _SG0
+        _archived = set(str(x) for x in _SG0.archived_sids())
+    except Exception as _e0:
+        log.debug("归档集合取不到（本轮不排除）: %r", _e0)
     # 🔴 2026-11-09 P0：先取设备库真实未读集合（60s 缓存），供下面硬放行使用。
     _unread_sids = _device_unread_sids(db)
     try:
@@ -797,6 +809,22 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         if last is None:
             log.debug("候选跳过 sid=%s：latest() 返回 None（chatmsg 与摘要都空）", sid)
             continue
+        # 🔴 §104 C4：归档 ≠ 拉黑。她再发人话（ts 比台账水位线新）→ 回合重置、解除归档。
+        #    必须拿到 last 才能比时间，所以放在 latest() 之后、过滤链最前面。
+        #    若放在循环开头直接 continue，归档会话将永远解不开（实测推演出的洞）。
+        if str(sid) in _archived:
+            try:
+                from brain import sendgate as _SGa
+                from data import reply_state as _RSa
+                if int(last.ts or 0) > _RSa.her_ts_of(str(sid)):
+                    _SGa.on_her(str(sid), int(last.ts or 0), human=True)
+                    log.info("归档会话来了新的人话 sid=%s → 解除归档，重新计入待回", sid)
+                else:
+                    log.info("跳过已归档会话 sid=%s（C4：不回、不唤醒、不计待回）", sid)
+                    continue
+            except Exception as _e_ar:
+                log.debug("归档检查异常（本轮仍跳过）: %r", _e_ar)
+                continue
         if str(last.sender) == str(db.uid):
             # 🔴🔴 2026-11-09 P0（18:42 新消息未处理 · 真正的锁芯）
             #
@@ -893,11 +921,29 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             log.info("候选跳过 sid=%s uid=%s：末条无文本（kind=%s），不在此队列处理",
                      sid, to_uid, k)
             continue
-        if txt in SYS_TEXTS:
-            # 2026-11-03：实测库里混着「[互动消息]」这类系统会话（她末条就是这四个字），
-            # 它不是真人说的话，回了等于对机器说话 —— 直接跳过。
-            log.info("系统类文本（%s）sid=%s，不回", txt, sid)
+        # 🔴 2026-11-10 §104 C5/C8：系统/广告消息不回、不计待回、
+        #    **不更新 her_ts 水位线**、只跳过不冷却（她紧接着发人话仍要正常回）。
+        #    旧判定只认 4 个字面量，漏掉「互相关注后即可…」这类系统卡（夜班实证回错过）。
+        _human = txt not in SYS_TEXTS
+        try:
+            from eyes import sysmsg as _SM
+            _human = _SM.is_human(txt, getattr(last, "msg_type", None), uid=to_uid)
+        except Exception as _e_sm:
+            log.debug("sysmsg 分类异常（退回字面量判定）: %r", _e_sm)
+        if not _human:
+            try:
+                from brain import sendgate as _SG1
+                _SG1.on_her(str(sid), int(last.ts or 0), human=False)
+            except Exception:
+                pass
+            log.info("系统/广告消息（%s）sid=%s → 不回不计待回（C5/C8）", txt[:20], sid)
             continue
+        # C2：她末条真人消息推进水位线（只在 ts 变新时落盘，会清掉本回合发送计数）。
+        try:
+            from brain import sendgate as _SG2
+            _SG2.on_her(str(sid), int(last.ts or 0), human=True)
+        except Exception:
+            pass
         # 🔴 2026-11-03 修复 P1：原来 len(txt)<2 把「嗯/好/哦」这类一字纯文本也丢弃。
         #    一字消息若红点已清且当时没发出，就会永久漏回、且无台账可恢复。
         #    现在只丢空文本；一字消息保留为候选，搜索关键词由 kw_of 退回历史长句兜底。
@@ -910,11 +956,34 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
             continue
 
-        if _recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=last.ts) \
-                or _l2_last_is_me(sid, her_ts_ms=last.ts):
-            log.info("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
-            _sla_warn(sid, to_uid, last.ts, "被判已回")
-            continue
+        # 🔴 2026-11-10 §104：状态机取代「纯文本 old==cur / L2 末行是我」判定。
+        #    11-10 夜班实测：这两句误判「被判已回」142 次、跳过已回会话 1549 次 ——
+        #    她再发一句一模一样的「哈哈哈」就被当成回过，永久漏回。
+        #    现在只有 awaiting / following / archived / no_human 才跳过；
+        #    她说了人话且还有额度一律进队列，具体发几条由 handle_pending 的发送闸裁决。
+        _vd = None
+        try:
+            from brain import sendgate as _SG3
+            from brain import verdict as _VD
+            _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True)
+            if _vd.state == _VD.ARCHIVED:
+                try:
+                    from data import reply_state as _RSa
+                    _RSa.set_archived(str(sid), True)   # wake.candidates() 也要排除
+                except Exception:
+                    pass
+            if _vd.state in (_VD.AWAITING, _VD.FOLLOWING,
+                             _VD.ARCHIVED, _VD.NO_HUMAN):
+                log.info("状态机跳过 uid=%s sid=%s state=%s（%s）",
+                         to_uid, sid, _vd.state, _vd.reason)
+                continue
+        except Exception as _e_vd:
+            log.debug("状态机异常 → 退回旧台账判定: %r", _e_vd)
+            if _recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=last.ts) \
+                    or _l2_last_is_me(sid, her_ts_ms=last.ts):
+                log.info("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
+                _sla_warn(sid, to_uid, last.ts, "被判已回")
+                continue
 
         if should_skip(sid, txt):
             _r = _LAST_SKIP.get(str(sid)) or {}
@@ -1077,6 +1146,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     #   ⇒ 24h 这个闸太松。降到 12h 能砍掉 61.4% 的无效翻屏（约 229 分钟/44h），
     #     把单轮预算让给真正回得出的人。
     #   语义不变：**不是不回了** —— 她再发新消息 ts 变新就自动回到队列。
+    # 🔴 2026-11-10 §104：STALE_GIVEUP_H 24 → 72（与 RESTART_H 对调）。
+    #    上面历史注释里的「24h」是改前口径，保留作决策留痕；
+    #    现在 >72h 的会话由 verdict 判 archived 并写台账，本闸只作兜底。
     try:
         _stale_ms = STALE_GIVEUP_H * 3600000.0
         _keep, _dropped = [], 0
@@ -1084,6 +1156,11 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             _age = now_ms - float(x[3] or 0)
             if _age >= _stale_ms:
                 _dropped += 1
+                try:
+                    from data import reply_state as _RSd
+                    _RSd.set_archived(str(x[0]), True)
+                except Exception:
+                    pass
                 continue
             _keep.append(x)
         if _dropped:
@@ -1585,7 +1662,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         # 🔴 2026-11-03（用户定 B 方案）：断太久 → 不接旧话，改重新开场。
         #   名额按轮控：老会话（几十个）不能把这一轮的额度全吃掉。
         age_h = (time.time() * 1000.0 - float(her_ts or 0)) / 3600000.0
+        # 🔴 2026-11-10 §104 C3：重新开场由状态机判（age>=24h 且本回合 0 条），
+        #    不能只看 age —— 否则 24~72h 一律重开、已发过的人也重复开场。
         restart = bool(RESTART_H > 0 and age_h >= RESTART_H)
+        try:
+            from brain import sendgate as _SG4
+            from brain import verdict as _VD4
+            _rv = _SG4.state_of(str(sid), her_ts_ms=float(her_ts or 0), has_human=True)
+            restart = (_rv.state == _VD4.PENDING_RESTART)
+        except Exception as _e_rv:
+            log.debug("重启状态机异常（沿用 age 判据）: %r", _e_rv)
         if restart and restarts_done >= RESTART_PER_ROUND:
             log.info("跳过老会话 uid=%s（她末条 %.0fh 前）：本轮重新开场名额 %d 已用完，先留给新消息",
                      to_uid, age_h, RESTART_PER_ROUND)
@@ -1801,6 +1887,27 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             continue
         _idfail_clear(sid, txt)
 
+        # 🔴 2026-11-10 §104：发送闸 —— 先问「这个会话现在能发几条」，再按额度出话。
+        #    §6.6-2：ADAPT_CAP=2 一轮两句就会把 24h 的 2 条额度用光，
+        #    所以 n_cand 必须被闸裁过；发送成功后按真实条数记账（不等库 pull）。
+        _gate_n = 0
+        try:
+            from brain import sendgate as _SG5
+            _gate = _SG5.allow(str(sid), 99, her_ts_ms=float(her_ts or 0), has_human=True)
+            if not _gate.ok:
+                log.info("跟进阶梯拦截 sid=%s state=%s（%s）→ 本轮不回",
+                         sid, _gate.state, _gate.reason)
+                out["skipped"] += 1
+                time.sleep(2.0)
+                actor.hand.back(settle=1.5)
+                if row is None:
+                    S.leave(actor)
+                continue
+            _gate_n = _gate.n
+        except Exception as _e_gate:
+            log.debug("发送闸异常（降级按原行为）: %r", _e_gate)
+            _gate_n = 0
+
         # 出话（用库里的真实历史）
         if restart:
             # 🔴 用户 2026-11-03 定 B 方案：她那条已经 %.0fh 前，**不当接话处理**。
@@ -1822,6 +1929,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             hist = R.hist_with_her(hist, feed)
             # 条数按她最后一条算（合并后总长会撑大 target_n，见 flow.py 同处注释）
             n = R.target_n([burst[-1]] if burst else [txt], hist)
+            if _gate_n:
+                n = max(1, min(n, _gate_n))
             lines = R.generate(sid, feed, hist=hist, n_cand=n)
         if not lines:
             # 🔴 必回铁律：已读未回同样是「她说过话」，引擎给不出话也必须回一句，
@@ -1829,6 +1938,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             from brain.flow import fallback_line
             lines = [fallback_line()]
             log.warning("出话失败 → 用兜底话术 %r", lines[0])
+        if _gate_n and len(lines) > _gate_n:
+            lines = lines[:_gate_n]
+            log.info("发送闸裁剪：本轮最多发 %d 条（额度）", _gate_n)
 
         if dry_run:
             log.info("[dry] 会回 %d 条: %r", len(lines), lines)
@@ -1883,6 +1995,12 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
 
             if sent_n:
+                # 🔴 §104：按**实际发出条数**落账，不等实时库 pull（5 分钟延迟会重复发）。
+                try:
+                    from brain import sendgate as _SG6
+                    _SG6.note_sent(str(sid), sent_n)
+                except Exception as _e_ns:
+                    log.warning("跟进台账记账失败 sid=%s: %r", sid, _e_ns)
                 out["sent"] += 1
                 if restart:
                     restarts_done += 1

@@ -440,6 +440,7 @@ def handle_greeting(actor, dev, dry_run=False, max_people=4):
         if dry_run:
             log.info("[dry] 会发 %r", text)
         else:
+            # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
             ok, why = M.send(actor, dev, text)
             log.info("新招呼发送 %r -> %s %s", text, ok, why)
             if ok:

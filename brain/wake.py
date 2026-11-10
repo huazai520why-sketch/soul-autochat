@@ -294,6 +294,20 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
        现在扫 scan 条（默认 800，覆盖全库 797 个有文本的会话），
        台账一次性载入内存判定，不再每个候选读一遍 json。
     """
+    # 跟进阶梯接线（§104-B1）：一次性取归档集合（try/except 兜底成空集）。
+    #    发送额度统一由 sendgate 裁决：WOKE_COOLDOWN_H / MAX_NO_REPLY 只管
+    #    「多久挑一次人」，能发几条/能不能发由 SG.allow 在真正发送前拍板；
+    #    这里只按「已归档 / 超 72h 归档态」筛掉不该唤醒的候选。
+    try:
+        from brain import sendgate as SG
+        from brain import verdict as V
+        _arch = set(SG.archived_sids())          # SOUL_FOLLOWUP_ON=0 时返回空集
+        _ARCHIVE_H = float(V.ARCHIVE_H)
+    except Exception:
+        _arch = set()
+        _ARCHIVE_H = 72.0
+        SG = V = None
+
     cutoff_ms = (time.time() - cold_hours * 3600) * 1000
     # 🔴 2026-11-03 修复 P2：原来 `MAX(localTime)` 只算文本消息（WHERE msgType=1），
     #    我最近发的是图片/语音/礼物时，文本时间戳已冷 → 误判「冷」而唤醒。
@@ -337,6 +351,21 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
         side = "me" if str(last.sender) == str(db.uid) else "her"
         if side != "me":
             continue            # 对方在等我 -> 交给必回，不唤醒
+        # 跟进阶梯接线（§104-B1）：已归档 / 超 72h 归档态 → 不唤醒；
+        #    不主动 set_archived（归档写入由 pendingq 负责），整段降级放行。
+        try:
+            if SG is not None and SG.ON:
+                if str(sid) in _arch:
+                    log.info("唤醒候选跳过 sid=%s（已归档，不唤醒）", sid)
+                    continue
+                _her_ts = _her_last_ts(db, sid)
+                if _her_ts and (time.time() * 1000 - _her_ts) / 3600000.0 >= _ARCHIVE_H:
+                    _v = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True)
+                    if getattr(_v, "state", "") == V.ARCHIVED:
+                        log.info("唤醒候选跳过 sid=%s（age>=%gh 归档，不唤醒）", sid, _ARCHIVE_H)
+                        continue
+        except Exception:
+            pass            # 拿不到 her_ts / 台账状态机异常 → 不拦（降级放行）
         out.append(Candidate(sid, s.to_uid, n, last_ts, last.text, side,
                              kws=_kw_list(db, sid, db.uid)))
         if len(out) >= limit:
@@ -514,6 +543,27 @@ def send_wake(actor, dev, cand, text, db=None):
         except Exception as e:
             log.debug("唤醒身份校验异常（按通过处理）: %r", e)
 
+    # 跟进阶梯接线（§104-B2）：真正灌字前过发送闸，发送额度统一由 sendgate 裁决。
+    #    has_human=True：唤醒面向真人老友，不按系统卡口径降级；
+    #    异常降级放行（台账/状态机出问题绝不掐断唤醒链路）。
+    try:
+        from brain import sendgate as SG
+        if SG.ON:
+            _d = SG.allow(cand.sid, 1, has_human=True)
+            if not _d.ok:
+                log.info("唤醒被跟进阶梯拦截 sid=%s state=%s（%s）",
+                         cand.sid, _d.state, _d.reason)
+                # 闸之前已完成导航/进会话（见上方 S.search / _enter），
+                # 直接 return 会停在会话页，下一轮从错误页面起手。
+                # 按成功路径同款 back 退一层；异常吞掉不改变返回值语义。
+                try:
+                    actor.hand.back(settle=1.2)
+                except Exception:
+                    pass
+                return False, "跟进阶梯拦截(%s)" % _d.state
+    except Exception:
+        pass
+
     inp = Input(dev)
     ok, got = inp.type_and_verify(text, actor)
     if not ok:
@@ -546,5 +596,13 @@ def send_wake(actor, dev, cand, text, db=None):
 
     actor.hand.back(settle=1.2)      # 会话内 back 是安全的
     mark_woke(cand.uid)
+    # 跟进阶梯接线（§104-B2）：只有真正发送成功才按真实条数记账，
+    #    发送额度统一由 sendgate 裁决；异常吞掉不记账，绝不改变原有返回值语义。
+    try:
+        from brain import sendgate as SG
+        if SG.ON:
+            SG.note_sent(cand.sid, 1)
+    except Exception:
+        pass
     log.info("已记唤醒台账 uid=%s（24h 内不再找他）", cand.uid)
     return True, "已发送"

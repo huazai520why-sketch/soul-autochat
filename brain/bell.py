@@ -147,6 +147,7 @@ def handle(actor, dev, dry_run=False):
 
         from brain import match as M
         text = M.pick_opener()
+        # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
         ok, why = M.send(actor, dev, text)
         if ok:
             log.info("✓ 奇遇铃已发: %r", text)
@@ -310,6 +311,7 @@ def handle_list(actor, dev, dry_run=False, limit=3):
             done += 1
             continue
         text = M.pick_opener()
+        # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
         ok, why = M.send(actor, dev, text)
         if ok:
             log.info("✓ 稍后再聊已发 %r: %r", nick, text)

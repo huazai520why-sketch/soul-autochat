@@ -487,7 +487,7 @@ def fallback_line():
     return random.choice(FALLBACK_LINES)
 
 
-def _send_lines(actor, lines, nick, page_checked=False):
+def _send_lines(actor, lines, nick, page_checked=False, sid=""):
     """依次发出多条。返回 (成功条数, 错误说明)。
 
     page_checked=True：调用方**刚**用 wait_page 确认过是 chat 页、
@@ -498,6 +498,21 @@ def _send_lines(actor, lines, nick, page_checked=False):
     多条之间留 1.6s 间隔 —— 太密会被当成刷屏（Soul 有连发限制），
     太长她又会觉得对面在挤牙膏，1.5~2s 接近真人打字节奏。
     """
+    # §104 跟进阶梯：发送前先过闸（页面校验之前）。归档或额度用尽则一条不发；
+    #    额度不足时按 allow 返回的 n 截断 lines（Decision.n 已按额度截断）。
+    #    sid="" 为无主会话，放行且不纳入额度；台账异常一律降级放行，
+    #    绝不让新台账把「必回」链路掐死。
+    try:
+        from brain import sendgate as SG
+        if SG.ON and sid:
+            _d = SG.allow(sid, len(lines))
+            if not _d.ok:
+                log.info("[%s] 跟进阶梯拦截 sid=%s state=%s（%s）", nick, sid, _d.state, _d.reason)
+                return 0, "跟进阶梯拦截(%s)" % _d.state
+            if _d.n < len(lines):
+                lines = lines[:_d.n]
+    except Exception:
+        pass
     # 🔴 灌字前必须确认在会话页：搜索页也有输入框，一旦页面没退干净，
     #    整句话会灌进搜索框（实测截图里搜索框残留「这娃儿笑起来乖得很撒，你」），
     #    消息永远发不出去，还会把搜索状态彻底搞乱。
@@ -521,49 +536,61 @@ def _send_lines(actor, lines, nick, page_checked=False):
         _W.mark_self_write(15.0)
     except Exception:
         pass
-    for i, line in enumerate(lines):
-        if i:
-            time.sleep(1.6)
-        # 每条独立兜底：第 2 条抛异常不能把「已发 1 条」的事实也一起吞掉
-        try:
-            ok, got = inp.type_and_verify(line, actor)
-            if not ok:
-                return sent, "第%d条灌字失败(%r)" % (i + 1, got)
-            # settle 1.2(×2.5=3s) -> 0.25：紧跟 sent_ok（sleep 0.7 + dump 3s）已在等
-            if not inp.tap_send(actor, settle=0.25):
-                inp.clear()
-                return sent, "第%d条找不到发送按钮" % (i + 1)
-            # 🔴 2026-11-04（闭环）：按三态记账，与 pendingq.py 的发送路径保持一致。
-            #   sent_ok 的三态见 hands/input.py：ok / unknown / residual。
-            #   unknown（转场帧读不到输入框）大概率已发出 → 必须记账，否则下轮重发 = 重复消息；
-            #   只有 residual（框里还有字）= 明确没发出 → 不记账、留给下轮重试。
-            _ok = inp.sent_ok(actor, line, timeout=4)
-            _why = getattr(inp, "last_reason", "") or ""
-            if (not _ok) and _why == "residual":
-                inp.clear()
-                return sent, "第%d条确认未发出（输入框仍有内容）" % (i + 1)
-            if not _ok:
-                log.warning("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
-                            nick, i + 1)
-        except Exception as e:
-            log.warning("[%s] 第%d条发送异常: %r", nick, i + 1, e)
+    try:
+        for i, line in enumerate(lines):
+            if i:
+                time.sleep(1.6)
+            # 每条独立兜底：第 2 条抛异常不能把「已发 1 条」的事实也一起吞掉
             try:
-                inp.clear()
+                ok, got = inp.type_and_verify(line, actor)
+                if not ok:
+                    return sent, "第%d条灌字失败(%r)" % (i + 1, got)
+                # settle 1.2(×2.5=3s) -> 0.25：紧跟 sent_ok（sleep 0.7 + dump 3s）已在等
+                if not inp.tap_send(actor, settle=0.25):
+                    inp.clear()
+                    return sent, "第%d条找不到发送按钮" % (i + 1)
+                # 🔴 2026-11-04（闭环）：按三态记账，与 pendingq.py 的发送路径保持一致。
+                #   sent_ok 的三态见 hands/input.py：ok / unknown / residual。
+                #   unknown（转场帧读不到输入框）大概率已发出 → 必须记账，否则下轮重发 = 重复消息；
+                #   只有 residual（框里还有字）= 明确没发出 → 不记账、留给下轮重试。
+                _ok = inp.sent_ok(actor, line, timeout=4)
+                _why = getattr(inp, "last_reason", "") or ""
+                if (not _ok) and _why == "residual":
+                    inp.clear()
+                    return sent, "第%d条确认未发出（输入框仍有内容）" % (i + 1)
+                if not _ok:
+                    log.warning("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
+                                nick, i + 1)
+            except Exception as e:
+                log.warning("[%s] 第%d条发送异常: %r", nick, i + 1, e)
+                try:
+                    inp.clear()
+                except Exception:
+                    pass
+                return sent, "第%d条异常(%r)" % (i + 1, e)
+            sent += 1
+            log.info("[%s] 已发送(%d/%d): %r", nick, i + 1, len(lines), line)
+            try:
+                from data import watch as _W
+                _W.mark_self_write(6.0)      # 自己写的库变化，别当成别人来消息
             except Exception:
                 pass
-            return sent, "第%d条异常(%r)" % (i + 1, e)
-        sent += 1
-        log.info("[%s] 已发送(%d/%d): %r", nick, i + 1, len(lines), line)
-        try:
-            from data import watch as _W
-            _W.mark_self_write(6.0)      # 自己写的库变化，别当成别人来消息
-        except Exception:
-            pass
-        try:
-            from brain import ratelimit as _RL
-            _RL.note_sent()
-        except Exception:
-            pass
+            try:
+                from brain import ratelimit as _RL
+                _RL.note_sent()
+            except Exception:
+                pass
+    finally:
+        # §104 跟进阶梯：按真实发出条数记账，覆盖上面 for 里所有 return 早退路径。
+        #    只在末尾记一次会漏记早退时已发出的条数，额度会被击穿。
+        #    sid="" 或 SOUL_FOLLOWUP_ON=0 时 SG.note_sent 内部自行跳过，不落账。
+        #    台账异常一律吞掉，绝不改变本函数既定的返回结果（必回铁律）。
+        if sent:
+            try:
+                from brain import sendgate as SG
+                SG.note_sent(sid, sent)
+            except Exception:
+                pass
     return sent, ""
 
 
@@ -692,7 +719,7 @@ def _reply_and_send(actor, db, out, dry_run):
     # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
     # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
     sent_n, err = _send_lines(actor, out.lines, out.nick,
-                              page_checked=not _pic_sent)
+                              page_checked=not _pic_sent, sid=out.sid or "")
     if sent_n:
         out.sent = True
     if err:

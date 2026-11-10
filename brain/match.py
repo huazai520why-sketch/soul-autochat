@@ -481,7 +481,7 @@ def _local_opener(card):
     return _fallback()
 
 
-def send(actor, dev, text):
+def send(actor, dev, text, sid=""):
     """灌字 -> 发送 -> 校验输入框。返回 (ok, 说明)。"""
     from hands.input import Input
 
@@ -491,6 +491,17 @@ def send(actor, dev, text):
         from brain import ratelimit as _RL
         if not _RL.can_send():
             return False, "本小时发送已达上限"
+    except Exception:
+        pass
+
+    # 跟进阶梯发送闸：sid 为空（奇遇铃 / 匹配 / 新招呼等新会话开场白）
+    # 过闸放行，但不占 2/6 条跟进额度；将来调用方拿到 sid 传进来即自动受约束。
+    try:
+        from brain import sendgate as SG
+        _d = SG.allow(sid, 1)
+        if not _d.ok:
+            log.info("跟进阶梯拦截 sid=%s state=%s（%s）", sid, _d.state, _d.reason)
+            return False, "跟进阶梯拦截(%s)" % _d.state
     except Exception:
         pass
 
@@ -522,6 +533,12 @@ def send(actor, dev, text):
         _RL.note_sent()
     except Exception:
         pass
+    if sid:
+        try:
+            from brain import sendgate as SG
+            SG.note_sent(sid, 1)
+        except Exception:
+            pass
     return True, "已发送"
 
 
