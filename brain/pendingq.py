@@ -1958,6 +1958,25 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             log.info("跳过老会话 uid=%s（她末条 %.0fh 前）：本轮重新开场名额 %d 已用完，先留给新消息",
                      to_uid, age_h, RESTART_PER_ROUND)
             continue
+        # 🔴🔴 2026-11-10 23:3x（速度 P0：老会话是当前最大的纯浪费）
+        #   实测 23:29:15 处理 69151915（60h 前）：翻 6 屏 30s 未命中 → 搜索 32s 超时
+        #   = **62s / 人 / 0 收益**，而且它下一轮（30 分钟 nocue 冷却到期）还会再来一次。
+        #   23:32:12 的 498845877（53h）同样：6 屏 28s + 搜索 32s。
+        #   这类会话的共同点：几十小时前，列表里早被顶到十几屏之外；Soul 搜索
+        #   只索引近期记录，搜她那句 60h 前的话必超时。**无论翻还是搜都不可能成功。**
+        #   用户口径是「消息必回 + 速度优先」：把预算花在必败的会话上，
+        #   等于让真正新鲜的消息排队等。所以：>48h 且**无昵称**（无唯一强定位信号）
+        #   直接放过，6 小时冷却，不再白烧。有昵称的仍然放行（昵称是可靠信号）。
+        try:
+            _nick_pre = nick_of(db, sid, to_uid)
+        except Exception:
+            _nick_pre = None
+        if age_h >= 48.0 and not _usable_word(_nick_pre, 2):
+            log.info("老会话（%.0fh）且无昵称 → 直接放过，不翻屏不搜索 uid=%s", age_h, to_uid)
+            mark_skip(sid, txt, "stale_nocue", hours=6.0)
+            out["skipped"] += 1
+            continue
+
         out["tried"] += 1
         kw = kw_of(db, sid, txt, skip_text=str(sid) in _VOICE_SIDS)
         _used_nick = None      # 搜索若走了昵称，进会话后用它做身份校验
