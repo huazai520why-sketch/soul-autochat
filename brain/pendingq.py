@@ -36,7 +36,10 @@ CAND_SCAN = int(os.environ.get("SOUL_CAND_SCAN", "60") or 60)
 # 🔴 2026-11-04（P0 处理环节）：find_row 首屏之外最多再往下翻几屏。
 #   实测首屏只有 8~10 行，候选 60 个 → 首屏命中率仅 **14%**，86% 被迫走搜索
 #   （11~15s/次、且 Soul 不索引几天前的消息 → 常 notfound）。翻 3 屏把命中率抬上来。
-FIND_PAGES = int(os.environ.get("SOUL_FIND_PAGES", "3") or 3)
+# 🔴 2026-11-10 23:45（速度）：3 -> 5。翻一屏 ~4s，一次搜索 ~32s ——
+#   翻屏比搜索便宜 8 倍且不会触发 clear_text/切后台风险。实测 22h 的会话
+#   翻 3 屏落空、转搜索又超时；多翻 2 屏（+8s）远比搜一次（32s）划算。
+FIND_PAGES = int(os.environ.get("SOUL_FIND_PAGES", "5") or 5)
 SKIP_UID_PREFIX = ("2042683",)     # 官方营销号段（实测 2042683xx 全是积分/礼物推送）
 LOOKBACK_DAYS = 7
 SCAN_SESSIONS = 300
@@ -2051,7 +2054,17 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         #   翻 3 屏落空 → 走搜索 34s → 搜索结果全是别人 → 身份校验连续 4 次失败 →
         #   长冷却 2h → 这条**永远回不了**。深翻 6 屏只要 ~12s，比搜索快一倍多，
         #   而且不会触发 clear_text 把 App 顶回桌面。
-        _pg_n = 6 if restart else None
+        # 🔴 2026-11-10 23:45（速度）：>=48h 的会话不翻屏。
+        #   实测 69151915（61h）连续两次都是「翻 6 屏 30s 未命中 → 搜索 32s 超时」= 62s / 0 收益。
+        #   60 小时前的话在列表十几屏之外，翻屏永远够不到 —— 翻屏对它纯粹是浪费，
+        #   所以直接进搜索（一次 32s），失败后 6 小时冷却（见下面的 _cool）。
+        #   <48h 的仍按 restart 深度翻（24~48h 的会话往往只被顶下去 3~6 屏，翻得到）。
+        if age_h >= 48.0:
+            _pg_n = 0
+        elif restart:
+            _pg_n = 6
+        else:
+            _pg_n = None
         row = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid, pages=_pg_n)
         if row is None and age_h * 60.0 <= 30.0:
             # 🔴 2026-11-08（P0 修「身份校验失败 261 次」的放大器）：
@@ -2185,10 +2198,15 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     S.leave(actor)
                     out["skipped"] += 1
                     continue
+                # 🔴 2026-11-10 23:45：>=48h 的老会话搜索失败后冷 6 小时。
+                #   原来统一 10 分钟 —— 而 60h 前的会话每 10 分钟回来再烧 32s，
+                #   实测 69151915 一晚被重试 4 次 = 128s 全废。老会话本来就搜不到
+                #   （Soul 只索引近期记录），冷却拉长不影响成功率，只是不再空转。
+                _cool = 6.0 if age_h >= 48.0 else TIMEOUT_RETRY_H
                 if _why == "timeout":
-                    # 超时 ≠ 搜不到：罚 10 分钟再试，绝不 12 小时拉黑（那等于不回她）
-                    log.info("搜索超时（未判定未找到），10 分钟后再试")
-                    mark_skip(sid, txt, "timeout", hours=TIMEOUT_RETRY_H)
+                    # 超时 ≠ 搜不到：罚一段时间再试，绝不 12 小时拉黑（那等于不回她）
+                    log.info("搜索超时（未判定未找到），%.0f 分钟后再试", _cool * 60)
+                    mark_skip(sid, txt, "timeout", hours=_cool)
                 else:
                     # 🔴 2026-11-09 R3（用户拍板「搜索不到就不搜了啊 等闲下来的时候搜」）
                     #   旧：notfound 罚 3 小时 + 新消息 10 分钟。表现为「消息进来很久没人回」，
@@ -2200,9 +2218,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                                     _nf, NOTFOUND_STORM_H * 60, sid)
                         mark_skip(sid, txt, "notfound_storm", hours=NOTFOUND_STORM_H)
                     else:
+                        _cool2 = 6.0 if age_h >= 48.0 else NOTFOUND_COOL_H
                         log.info("搜索无结果（第 %d 次/30min）→ %.0f 分钟后重试，不冻结 3 小时 sid=%s",
-                                 _nf, NOTFOUND_COOL_H * 60, sid)
-                        mark_skip(sid, txt, "notfound", hours=NOTFOUND_COOL_H)
+                                 _nf, _cool2 * 60, sid)
+                        mark_skip(sid, txt, "notfound", hours=_cool2)
                 S.leave(actor)
                 out["skipped"] += 1
                 continue
