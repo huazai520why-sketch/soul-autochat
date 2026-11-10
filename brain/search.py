@@ -397,9 +397,26 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0):
             time.sleep(0.8)
             dev.u2().clear_text()
         except Exception as e2:
-            log.warning("clear_text 重试仍失败: %r → 放弃本次搜索（避免关键词粘连）", e2)
-            LAST_REASON = "timeout"
-            return 0
+            # 🔴 2026-11-10（实测事故：clear_text 失败把 App 顶到桌面）
+            #   23:13 现场探测：连搜第二个词时 AdbKeyboard 广播报
+            #     Attempt to read from field ExtractedText.text on a null object reference
+            #   （输入框已失焦）→ 紧接着整页变成桌面/游戏中心，Soul 被切到后台，
+            #   那之后所有候选全部落空。AdbKeyboard 是靠广播改文本的，
+            #   一旦输入法被换掉/焦点丢失就整条链路失效。
+            #   兜底：重新点输入框拿回焦点 → 用 KEYCODE_DEL 逐字删（不依赖广播）。
+            log.warning("clear_text 重试仍失败: %r → 改用「焦点 + DEL 键」兜底清空", e2)
+            try:
+                _b2 = actor.snap(force=True).find_one(cls="EditText")
+                if _b2 is not None:
+                    actor.hand.tap_node(_b2, settle=0.4)
+                for _i in range(40):
+                    dev.u2().press("KEYCODE_DEL")
+                time.sleep(0.3)
+                log.info("DEL 键兜底清空完成（40 次）")
+            except Exception as e3:
+                log.warning("DEL 键兜底也失败: %r → 放弃本次搜索", e3)
+                LAST_REASON = "timeout"
+                return 0
     time.sleep(0.3)
     try:
         dev.u2().send_keys(kw)

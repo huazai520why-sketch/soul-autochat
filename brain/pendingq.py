@@ -1334,10 +1334,19 @@ def _search_plan(db, sid, to_uid, kw):
         log.info("昵称 %r 太短/纯符号 → 不拿它搜", nk[:12])
     if _usable_word(kw, 5):
         n = _sessions_with(db, kw)
-        if n in (-1, 0, 1):
+        # 🔴🔴 2026-11-10（身份校验连续失败的真正来源）：
+        #   `n == 0` 原来也被放行，但它的真实含义是**这句话在任何 chatmsg 里都不存在**
+        #   —— 只可能来自 session 摘要（她的个人简介 / Soul 推荐文案）。
+        #   Soul 搜索会把「用户资料」一起搜，于是搜 `希望 Ta 能遇见 35 岁后的`
+        #   命中一堆**简介里写着这句话的陌生人**，点进去 4 次全是别人：
+        #     23:07:42 转搜索 → 23:08:51「身份校验连续 4 次失败」→ 长冷却 2h → 这条永远不回
+        #   现在：0 个会话出现过 → 判定「不是聊天内容」，不许拿去搜。
+        #   -1（查询异常）保守放行，避免误伤。
+        if n in (-1, 1):
             plan.append(("内容", kw))
-            if n > 1:                      # 不会走到，留作可读性
-                pass
+        elif n == 0:
+            log.info("内容关键词 %r 在库内 0 个会话出现（像是简介/推荐文案）→ 不拿它搜",
+                     kw[:16])
         else:
             log.info("内容关键词 %r 在 %d 个会话里都有（不独一无二）→ 不拿它搜",
                      kw[:16], n)
@@ -1601,7 +1610,7 @@ def _scroll_top(actor, rounds=4):
     return True
 
 
-def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None):
+def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid=None):
     """在**会话列表**里找这条消息所属的行（首屏 → 逐屏下翻）。
 
     用户 2026-11-02/03 反复强调：「明明这个人就在屏幕上 红点也有 为什么还要走搜索」
@@ -1633,6 +1642,15 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None):
         return None
     raw = _norm(txt)
     kwn = _norm(kw) if kw else ""
+    # 库摘要（= 列表预览原文）。纯表情/语音/短消息靠它定位，不吃长度门槛。
+    dkey = ""
+    if db is not None and sid:
+        try:
+            _dg = db.session_digest(sid) or {}
+            _dk = re.sub(r"\[[^\]]{1,6}\]", "", (_dg.get("text") or "")).strip()[:8]
+            dkey = _norm(_dk) or ""
+        except Exception:
+            dkey = ""
 
     def _hit(c, r, mlen):
         if not c or len(c) < mlen:
@@ -1670,6 +1688,18 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None):
             if len(_cand) == 1:
                 return _cand[0], "列表昵称命中 %r" % _cand[0].nickname
         all_rows = rows(sn)
+        # 🔴🔴 2026-11-10（纯表情末条结构性命不中）：
+        #   `_norm('[中午好]')` → '中午好'（3 字），而全列表层要求 mlen=4 →
+        #   她末条是纯表情、又没有红点（58h 前的老会话必然如此）时，
+        #   **任何一层都不可能命中**：
+        #     处理 '500117554'（末条 '[中午好]'，58h 前）→ 翻完 3 屏仍未命中 → 烧 43s 搜索
+        #   这里补一层「库摘要」匹配：列表预览文本 == 库里的 lastMsgText 原文，
+        #   语义精确（与 clear._rows_for_lib 已在生产验证的口径一致），不吃 mlen 门槛。
+        #   但短文本可能撞多行 → **只接受屏上唯一命中**，有歧义就退回原逻辑。
+        if dkey:
+            _hr = [r for r in all_rows if (r.blob or "") and dkey in _norm(r.blob)]
+            if len(_hr) == 1:
+                return _hr[0], "列表预览命中（库摘要 %r）" % dkey[:8]
         dotted = [r for r in all_rows if r.has_dot]
         for r in dotted:
             if _hit(raw, r, mlen=2):
@@ -1956,7 +1986,13 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         except Exception as _e_nk:
             log.debug("取昵称失败（退回纯文本定位）: %r", _e_nk)
             _nick_try = None
-        row = find_row(actor, txt, kw=kw, nick=_nick_try)
+        # 🔴 2026-11-10（必回）：重新开场的会话都是几十小时前的老会话，列表里早被顶到
+        #   十几屏之外 —— 默认 3 屏根本够不到。实测一个 58h 前的会话：
+        #   翻 3 屏落空 → 走搜索 34s → 搜索结果全是别人 → 身份校验连续 4 次失败 →
+        #   长冷却 2h → 这条**永远回不了**。深翻 6 屏只要 ~12s，比搜索快一倍多，
+        #   而且不会触发 clear_text 把 App 顶回桌面。
+        _pg_n = 6 if restart else None
+        row = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid, pages=_pg_n)
         if row is None and age_h * 60.0 <= 30.0:
             # 🔴 2026-11-08（P0 修「身份校验失败 261 次」的放大器）：
             #   改前：无条件走 first_dot_row —— 它是**设计上的「先点进去再验身份」**
@@ -2003,7 +2039,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             for _try in range(2, 4):
                 if pg2 == "chat":
                     break
-                row2 = find_row(actor, txt, kw=kw, nick=_nick_try)
+                row2 = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid, pages=_pg_n)
                 if row2 is None:
                     log.info("列表里已找不到 %r（可能被顶下去）→ 改走搜索", txt[:12])
                     break
