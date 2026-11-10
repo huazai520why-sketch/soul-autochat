@@ -1971,6 +1971,31 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             _nick_pre = nick_of(db, sid, to_uid)
         except Exception:
             _nick_pre = None
+        kw = kw_of(db, sid, txt, skip_text=str(sid) in _VOICE_SIDS)
+
+        # 🔴🔴 2026-11-10 23:38（速度 P0·最狠的一条）
+        #   实测 23:36~23:38 连续 5 个候选，全是「纯表情末条 + 无昵称 + 关键词 ''」：
+        #     281045688  '「捂脸哭」' 47h  → 翻 6 屏 28s → 昵称/内容都拿不到 → 放弃
+        #     414317126  '「夜深了」'   45h  → 翻 6 屏 27s → 同上
+        #     442658559  '「中午好」'   36h  → 翻 6 屏 28s → 同上
+        #     380724318  '「晚上好」'   28h  → 翻 6 屏 27s → 同上
+        #     48554555   '哦'         47h  → 翻 6 屏 27s → 同上
+        #   ⇒ 一轮 140s、0 收益。
+        #
+        #   为什么必然是 0：定位只有三条路 —— ①末条文本（`[捂脸哭]` 归一化后 3 字，
+        #   达不到全列表层 4 字门槛，且这种表情几十行都有）；②昵称（库里没有）；
+        #   ③内容关键词（`kw_of` 返回 ''，因为她最近 8 条全是表情/单字）。
+        #   **三条路全断的情况下，翻屏和搜索都不可能命中**，继续做只是烧时间。
+        #
+        #   判据全部是纯内存判断（`_usable_word` 只做长度/字符检查），零额外 SQL。
+        #   不误伤：她只要历史上说过一句 ≥5 字的正常话，`kw_of` 就会返回它，这里不挡。
+        if not _usable_word(_nick_pre, 2) and not _usable_word(kw, 5):
+            log.info("无昵称且无可用内容词（末条 %r，%.0fh 前）→ 翻屏/搜索都不可能有结果，直接放过 uid=%s",
+                     (txt or "")[:10], age_h, to_uid)
+            mark_skip(sid, txt, "nocue_hard", hours=6.0)
+            out["skipped"] += 1
+            continue
+
         if age_h >= 48.0 and not _usable_word(_nick_pre, 2):
             log.info("老会话（%.0fh）且无昵称 → 直接放过，不翻屏不搜索 uid=%s", age_h, to_uid)
             mark_skip(sid, txt, "stale_nocue", hours=6.0)
@@ -1978,7 +2003,6 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             continue
 
         out["tried"] += 1
-        kw = kw_of(db, sid, txt, skip_text=str(sid) in _VOICE_SIDS)
         _used_nick = None      # 搜索若走了昵称，进会话后用它做身份校验
         log.info("── 处理 %r（末条 %r，%.0fh 前%s，关键词 %r）", to_uid, txt[:14], age_h,
                  "·重新开场" if restart else "", kw[:16])
