@@ -126,6 +126,10 @@ SLA_WARN_MIN = float(os.environ.get("SOUL_SLA_WARN_MIN", "5") or 5)
 # 🔴 超时（接口慢/设备卡）**不是**搜不到：只罚 10 分钟就重试。
 #   2026-11-02 现网事故：搜索 15s 窗口太紧 → 超时被当成 notfound → 同一人冷却 12 小时没人回。
 TIMEOUT_RETRY_H = 0.17
+# 🔴 2026-11-10：搜不到任何可靠线索（昵称、独一无二内容都没有）时的冷却。
+#   用户口径「还是不行就放弃或者跳过」——但台账 key 含她末条文本，
+#   她一发新消息就会自动重新给机会，所以这里只挡「同一句反复撞墙」。
+NO_CUE_H = float(os.environ.get("SOUL_NOCUE_COOL_MIN", "30") or 30) / 60.0
 ENTER_RETRY_H = 0.5
 # 🔴 2026-11-04（A批提速）：短消息/纯表情 find_row 落空后不搜索，短冷却（30分钟）
 #   她再发新消息（新红点）下一轮 find_row 就能命中，不会永久失联。
@@ -1186,6 +1190,116 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     return [x[:4] for x in merged]
 
 
+_NICK_CACHE = {}
+
+
+def nick_of(db, sid, uid):
+    """取**对方昵称**（库里唯一可靠的昵称来源：chatmsg.extMap 的 name）。
+
+    🔴 2026-11-10（用户口径「搜昵称」）
+      IM-SDK 库没有昵称表，`soul_app.db.im_user.alias` 只缓存本人。
+      她发来的消息 `extMap` 里带发送者昵称（JSON，字段名 name/nickName 都有过），
+      实测 73 个 >20h 待回会话里 35 个能拿到（48%），拿不到就是 None。
+
+      缓存 10 分钟：一次会话内昵称不会变，避免每个候选都重查一遍 SQL。
+    """
+    key = str(sid)
+    hit = _NICK_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < 600.0:
+        return hit[1]
+    nice = None
+    try:
+        rows = db.con.execute(
+            "SELECT extMap FROM chatmsg WHERE sessionId=? AND senderId<>? "
+            "AND extMap IS NOT NULL AND extMap != '' "
+            "ORDER BY localTime DESC LIMIT 12", (sid, db.uid)).fetchall()
+        import json as _json
+        for row in rows:
+            em = row[0] if isinstance(row, (tuple, list)) else row
+            if not em or "name" not in em:
+                continue
+            try:
+                d = _json.loads(em)
+            except Exception:
+                continue
+            for k in ("name", "nickName", "nickname"):
+                v = d.get(k)
+                if isinstance(v, str) and v.strip():
+                    nice = v.strip()
+                    break
+            if nice:
+                break
+    except Exception as e:
+        log.debug("取昵称异常 sid=%s: %r", sid, e)
+    _NICK_CACHE[key] = (time.time(), nice)
+    if len(_NICK_CACHE) > 500:
+        _NICK_CACHE.clear()
+    return nice
+
+
+def _usable_word(w, min_len):
+    """这个词能不能拿去搜（Soul 搜索对短词/纯符号基本无效）。
+
+    实测：`搜索 '嗯'`、`'哦'`、`'🤝'` 一律 0 结果；
+    昵称 `。`、`🙇` 同理。拿它们搜只是白烧 30~50s 再记一次失败台账。
+    """
+    t = (w or "").strip()
+    if len(t) < min_len:
+        return False
+    # 至少含一个汉字/字母/数字：纯 emoji、纯标点、纯空白都搜不到
+    return bool(re.search(r"[0-9A-Za-z\u4e00-\u9fff\uff10-\uff19]", t))
+
+
+def _sessions_with(db, text):
+    """文本出现在几个不同会话里（前缀匹配，兼容 kw_of 的 20 字截断）。
+
+    返回 -1 = 查不到/异常（保守，不否决）。
+    """
+    t = (text or "").strip()
+    if len(t) < 4:
+        return -1
+    try:
+        r = db.con.execute(
+            "SELECT COUNT(DISTINCT sessionId) FROM chatmsg WHERE text LIKE ?",
+            (t + "%",)).fetchone()
+        return int(r[0] or 0) if r else 0
+    except Exception:
+        return -1
+
+
+def _search_plan(db, sid, to_uid, kw):
+    """搜索三级策略（用户 2026-11-10 口径）。
+
+      ① 昵称 —— 唯一性最强，命中即本人；
+      ② 对话内容里**独一无二**的一句（只在本会话出现）；多会话重复的直接不搜，
+         因为拿它搜必然进错人/搜不到（实测模板句 notfound 率极高）；
+      ③ 都没有 → 返回空，上层放弃本轮。
+
+    为什么不是「有内容就搜」：日志实证 `搜索 '就那提示，没啥用'` 能中、而
+    `'葛优躺，那是瘫出境界了'` 不中 —— 差别不在长短，在于这句话是否唯一指向一个人。
+
+    返回 [(label, word), ...]，按优先级排好。
+    """
+    plan = []
+    nk = nick_of(db, sid, to_uid)
+    if _usable_word(nk, 2):
+        plan.append(("昵称", nk))
+    elif nk:
+        log.info("昵称 %r 太短/纯符号 → 不拿它搜", nk[:12])
+    if _usable_word(kw, 5):
+        n = _sessions_with(db, kw)
+        if n in (-1, 0, 1):
+            plan.append(("内容", kw))
+            if n > 1:                      # 不会走到，留作可读性
+                pass
+        else:
+            log.info("内容关键词 %r 在 %d 个会话里都有（不独一无二）→ 不拿它搜",
+                     kw[:16], n)
+    elif kw:
+        log.info("内容关键词 %r 太短/纯符号 → 不拿它搜", kw[:12])
+    return plan
+
+
 def kw_of(db, sid, txt, min_len=3, skip_text=False):
     """选搜索关键词：末条太短就往前找一条更长的；压缩多余空格。
 
@@ -1710,6 +1824,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             continue
         out["tried"] += 1
         kw = kw_of(db, sid, txt, skip_text=str(sid) in _VOICE_SIDS)
+        _used_nick = None      # 搜索若走了昵称，进会话后用它做身份校验
         log.info("── 处理 %r（末条 %r，%.0fh 前%s，关键词 %r）", to_uid, txt[:14], age_h,
                  "·重新开场" if restart else "", kw[:16])
 
@@ -1821,10 +1936,31 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 mark_skip(sid, txt, "slow", hours=0.1)
                 out["skipped"] += 1
                 continue
+            # 🔴 2026-11-10 §113（用户口径）：搜索三级 —— 昵称 → 独一无二内容 → 放弃
+            #   先在**开搜索页之前**算计划：open_search 走慢路径要 40~50s，
+            #   没有可搜线索就该直接跳过，不能先把这 40s 烧掉再放弃。
+            _plan = _search_plan(db, sid, to_uid, kw)
+            if not _plan:
+                log.info("昵称和独一无二内容都拿不到 → 放弃本轮 uid=%s（等她发新消息再试）",
+                         to_uid)
+                mark_skip(sid, txt, "nocue", hours=NO_CUE_H)
+                out["skipped"] += 1
+                continue
             if not S.open_search(actor):
                 out["skipped"] += 1
                 continue
-            if not S.search(actor, dev, kw):
+            _got = 0
+            for _label, _word in _plan:
+                log.info("搜索[%s] %r", _label, _word[:16])
+                _got = S.search(actor, dev, _word)
+                if _got:
+                    if _label == "昵称":
+                        _used_nick = _word
+                    break
+                # 熔断是全局通道问题：换关键词也没用，别把第二个词也白烧掉
+                if getattr(S, "LAST_REASON", "") == "breaker":
+                    break
+            if not _got:
                 # 🔴🔴 2026-11-08 13:1x（`breaker` 必须单独一支，否则比原 bug 更糟）
                 #
                 #   `search.py` 现在熔断早退会记 `LAST_REASON="breaker"`（以前误记 timeout）。
@@ -1892,6 +2028,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         #    且固定安全句几十个会话都有 → 反污染 kw_of 关键词 → 定位错人。
         #    改为 fail-closed：身份不明一律不发送，记台账短冷却下轮重试。
         _nick_hint = getattr(row, "nickname", None) if row is not None else None
+        if _nick_hint is None:
+            _nick_hint = _used_nick      # 走昵称搜进来的，用同一个昵称验标题
         if not _session_matches(actor, db, sid, nick=_nick_hint):
             # 计数**落盘**（重启不清零）—— 见 IDFAIL_FILE 注释。
             _n = _idfail_bump(sid, txt)
