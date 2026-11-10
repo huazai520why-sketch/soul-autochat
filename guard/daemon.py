@@ -556,7 +556,14 @@ def cycle(a, dev, db, st, dry_run=False):
         #    （本号长期虚高）。实测角标 2~4、屏上一个行内红点都没有，仍然
         #    每轮回去"清红点"，唤醒/匹配永远轮不到。
         #    现在只有「屏上真有行内红点」或「确实进了人」才挡后续。
-        dot_blocks = bool(left != 0 and (ndots > 0 or entered > 0))
+        # 🔴🔴 2026-11-10（匹配段被饿死 11.8 小时 · 修）：
+        #   稳态流入下（每 3 分钟进一条 / 一轮 200~440s）角标几乎永不为 0，
+        #   `left != 0` 于是恒真 → dot_blocks 恒真 → 匹配段一次都进不去
+        #   （实测「距上次匹配 42462s = 11.8h」，奇遇铃 9 个人一次没处理）。
+        #   用户口径是「消息必回」优先、匹配只是带来新会话，不能拿它换掉回复。
+        #   本轮已经跑过 sweep、且**真的发出话**（replied_any）→ 回复通道健康、
+        #   红点已处理一轮，剩下的是这期间新到的，交给下一轮；本轮放行匹配。
+        dot_blocks = bool(left != 0 and (ndots > 0 or entered > 0) and not replied_any)
         if left != 0 and not dot_blocks:
             log.info("角标=%s 但屏上无行内红点、也没进到人 → 判为虚高，不挡后续流程", left)
             try:

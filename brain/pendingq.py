@@ -1601,7 +1601,7 @@ def _scroll_top(actor, rounds=4):
     return True
 
 
-def find_row(actor, txt, kw=None, min_len=4, pages=None):
+def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None):
     """在**会话列表**里找这条消息所属的行（首屏 → 逐屏下翻）。
 
     用户 2026-11-02/03 反复强调：「明明这个人就在屏幕上 红点也有 为什么还要走搜索」
@@ -1648,7 +1648,27 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None):
         return False
 
     def _scan(sn):
-        """在**这一屏**里按 ①~④ 找，返回 (row, 日志文案) 或 (None, '')。"""
+        """在**这一屏**里找，返回 (row, 日志文案) 或 (None, '')。
+
+        🔴🔴 2026-11-10（必回 P0：短消息结构性命中率为 0）：
+          原实现只靠 `_hit()` 匹配行 blob，而它要求 `len(c) >= mlen`
+          （红点行 2 字 / 全列表 4 字）。末条是 '好' / '嗯' / '啥' / '[表情]'
+          这类时**任何一层都不可能匹配**，于是：
+            处理 '486483065'（末条 '好'，0h 前）→ 翻完 3 屏仍未命中 → 转搜索
+          —— 她 3 分钟前刚发、就在列表第一屏的人，照样定位不到，白烧 40s 搜索。
+          昵称是列表上**唯一稳定、不受消息内容影响**的信号，所以提到最前：
+          屏上昵称唯一 → 直接用；有歧义（'。'这种撞名）→ 退回文本匹配。
+          身份真伪仍由 `_session_matches()` fail-closed 兜底，不会串台。
+        """
+        ni = _norm(nick) if nick else ""
+        if len(ni) >= 2:
+            _cand = []
+            for r in rows(sn):
+                rn = _norm(r.nickname)
+                if rn and (rn == ni or ni in rn or rn in ni):
+                    _cand.append(r)
+            if len(_cand) == 1:
+                return _cand[0], "列表昵称命中 %r" % _cand[0].nickname
         all_rows = rows(sn)
         dotted = [r for r in all_rows if r.has_dot]
         for r in dotted:
@@ -1672,6 +1692,29 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None):
 
     pages = FIND_PAGES if pages is None else int(pages)
     moved_total = 0
+
+    # 🔴🔴 2026-11-10（必回 P0：方向性错误）：
+    #   `_swipe_list(up=True)` 是把列表往**更老**的方向翻。而 handle_pending 处理完
+    #   上一个候选后，列表已经停在中下部 —— 下一个候选如果比她更新，目标就在
+    #   **上面**，继续向下翻等于朝反方向找，翻 3 屏必然落空。
+    #   日志实证：22:53 清红点进「霜鸢Icy」时她的行在 y=469/622（屏幕中部），
+    #   而 22:56 pendingq 找同一个人 → 翻完 3 屏未命中 → 白烧 43s 搜索。
+    #   修法：先向上探一屏（只在确实能滚动时才做，避免已在顶部白烧 4s）。
+    _up_sig = _list_sig(snap)
+    try:
+        if _swipe_list(actor, up=False):
+            _s_up = actor.snap()
+            if detect(_s_up) == "chatlist":
+                _up_sig2 = _list_sig(_s_up)
+                if _up_sig2 and _up_sig2 != _up_sig:
+                    r, why = _scan(_s_up)
+                    if r is not None:
+                        log.info("%s（向上 1 屏）%r", why, r.nickname)
+                        return r
+                    snap = _s_up
+    except Exception as _e_up:
+        log.debug("向上探屏失败（继续向下翻）: %r", _e_up)
+
     for attempt in (0, 1):
         prev_sig = _list_sig(snap)
         moved = 0
@@ -1906,7 +1949,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             continue          # ← 注意：continue 不是 break，只跳过这个人
         _NOT_CHATLIST_STREAK[0] = 0    # 成功回到 chatlist → 页面恢复了，清零
 
-        row = find_row(actor, txt, kw=kw)
+        # 🔴 2026-11-10（必回 P0）：把昵称一起交给 find_row —— 她的末条是单字/表情时，
+        #   文本匹配结构性失效，昵称才是唯一稳定的定位信号。
+        try:
+            _nick_try = nick_of(db, sid, to_uid)
+        except Exception as _e_nk:
+            log.debug("取昵称失败（退回纯文本定位）: %r", _e_nk)
+            _nick_try = None
+        row = find_row(actor, txt, kw=kw, nick=_nick_try)
         if row is None and age_h * 60.0 <= 30.0:
             # 🔴 2026-11-08（P0 修「身份校验失败 261 次」的放大器）：
             #   改前：无条件走 first_dot_row —— 它是**设计上的「先点进去再验身份」**
@@ -1953,7 +2003,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             for _try in range(2, 4):
                 if pg2 == "chat":
                     break
-                row2 = find_row(actor, txt, kw=kw)
+                row2 = find_row(actor, txt, kw=kw, nick=_nick_try)
                 if row2 is None:
                     log.info("列表里已找不到 %r（可能被顶下去）→ 改走搜索", txt[:12])
                     break
@@ -1974,7 +2024,18 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 #   末条「听不懂」，至今 0 回复）。
                 #   现在 find_row 已翻 3 屏，命中率大幅提高；仍落空才走搜索，
                 #   搜索用 kw（她的历史长句）而非短文本，notfound 按 notfound 冷却。
-                log.info("末条 %r 短消息/纯表情，翻屏也没命中 → 仍尝试搜索一次", txt[:12])
+                _n2 = _norm(_nick_try or "")
+                if len(_n2) < 2:
+                    # 🔴 2026-11-10（速度）：原来这里无条件「仍尝试搜索一次」，
+                    #   而没有昵称可搜时 open_search 要 40~50s 找入口，再用单字
+                    #   去搜必然 notfound —— 纯白烧。日志实证 22:57~22:58 连续两人
+                    #   这样烧掉 90s，一条没回成。现在直接短冷却，留给下一轮。
+                    log.info("末条 %r 短消息且无可用昵称 → 放弃本轮（省 40s 搜索）uid=%s",
+                             txt[:12], to_uid)
+                    mark_skip(sid, txt, "short_nocue", hours=SHORT_RETRY_H)
+                    out["skipped"] += 1
+                    continue
+                log.info("末条 %r 短消息，昵称 %r 可用 → 走昵称搜索", txt[:12], (_nick_try or "")[:10])
             # 🔴 2026-11-04（吞吐）：单个人已经耗掉 45s（翻屏 21s + 双击 + dump），
             #   再走搜索（6~30s）就把整轮吃光。记 6 分钟冷却，下一轮再来。
             if time.monotonic() - _t_cand > 45.0:
@@ -2005,8 +2066,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                         _used_nick = _word
                         remember_nick(sid, _word)
                     break
-                # 熔断是全局通道问题：换关键词也没用，别把第二个词也白烧掉
-                if getattr(S, "LAST_REASON", "") == "breaker":
+                # 熔断/超时都是**通道**问题，跟关键词无关 → 换第二个词也救不回来。
+                # 🔴 2026-11-10（速度）：原来只挡 breaker，timeout 还要再烧一个词
+                #   （实测 22:56:17 搜索[昵称] 超时 30s → 22:56:49 又搜内容 7s = 43s/人）。
+                if getattr(S, "LAST_REASON", "") in ("breaker", "timeout"):
                     break
             if not _got:
                 # 🔴🔴 2026-11-08 13:1x（`breaker` 必须单独一支，否则比原 bug 更糟）

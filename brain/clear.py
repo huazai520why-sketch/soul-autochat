@@ -623,6 +623,17 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
             log.debug("官方号预判失败（继续原逻辑）: %r", _e)
 
         log.info("进会话 %r 红点=%s", r.nickname, r.badge)
+        # 🔴 2026-11-10（昵称缓存的主要来源）：
+        #   清红点这条路**定位最可靠**（库定 sid + 屏上行，100% 能进），
+        #   而且进之前屏幕上有真实昵称。原来只有 pendingq 成功后才 remember_nick，
+        #   而 pendingq 恰恰是最缺昵称的那条路 —— 形成「越缺越补不上」的死循环。
+        #   这里每进一个人就落盘一个 sid→昵称，pendingq 下一轮就能用昵称直接定位。
+        try:
+            from brain.pendingq import remember_nick as _RN
+            if _sid:
+                _RN(_sid, r.nickname)
+        except Exception as _e_rn:
+            log.debug("记昵称失败（不影响进会话）: %r", _e_rn)
         # 🔴 2026-11-03 修复 P0（空烧根因）：进会话那一下 App 会**标已读并写库**。
         #    这里不先声明「这段写入是我自己造成的」，循环末尾的 _W.urgent() 会
         #    把自己打断 → 统计成「进 1 人 / 回 0 条」→ 兜底再判「假红点」。
