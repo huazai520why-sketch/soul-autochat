@@ -10,6 +10,7 @@
 
 旧架构对应：`eyes/soul_clear_unread.py` + daemon 的 `do_reply`。
 """
+import os
 import re
 import time
 import threading
@@ -45,6 +46,14 @@ MAX_DOUBLE = 5                        # 双击上限（用户 2026-11-02：5 次
 #    说明它们不是真人会话。官方营销号另有号段闸 SKIP_UID_PREFIX(2042683)
 #    + Session.is_official（文案命中≥2 个营销词）。
 NOT_CHAT_NICKS = ("瞬间", "Soul通知", "Soul空间站")
+
+# 🔴 2026-11-12（§118 工单 P1）：「奇遇铃-稍后再聊」列表行是**功能入口**，
+#    不是真人会话。点进去是 LoveBellChatListActivity（稍后再聊列表页），
+#    不是 ConversationActivity → 通用「进会话」路径 100% 校验失败白烧
+#    （实测 brain.flow.log 全天 24 次「进入后不是 chat 页: unknown」）。
+#    只在「奇遇铃-稍后再聊」入口行点击前识别跳过，交给 bell 专用路径处理。
+#    `nick` 形如「奇遇铃-稍后再聊」或「奇遇铃 稍后再聊」等。
+_BELL_ROW_RE = re.compile(r"奇遇铃.{0,4}稍后")
 
 
 def dots(snap):
@@ -621,6 +630,17 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                 continue
         except Exception as _e:
             log.debug("官方号预判失败（继续原逻辑）: %r", _e)
+
+        # 🔴 2026-11-12（§118 工单 P1）：「奇遇铃-稍后再聊」列表行是**功能入口**，
+        #    不是真人会话。点进去是 LoveBellChatListActivity（稍后再聊列表页），
+        #    不是 ConversationActivity → 通用「进会话」路径 100% 校验失败白烧。
+        #    点击前识别跳过（reuse_snap=True：没做任何 UI 动作，列表没变），
+        #    只允许 bell 专用路径进。默认开；设 SOUL_SKIP_BELL_ROW=0 可关。
+        if os.environ.get("SOUL_SKIP_BELL_ROW", "1") == "1" and \
+                _BELL_ROW_RE.search(str(r.nickname or "")):
+            log.info("跳过「奇遇铃-稍后再聊」行：它是入口不是会话，只允许 bell 专用路径进")
+            reuse_snap = True
+            continue
 
         log.info("进会话 %r 红点=%s", r.nickname, r.badge)
         # 🔴 2026-11-10（昵称缓存的主要来源）：

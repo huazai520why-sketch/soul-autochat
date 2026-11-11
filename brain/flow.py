@@ -380,7 +380,15 @@ def _slow_path(actor, db, out, dry_run):
         except Exception as _e:
             log.warning("[%s] 反查：强拉库失败 %r", out.nick, _e)
     if cands:
-        out.sid = cands[0][0]
+        if len(cands) == 1:
+            out.sid = cands[0][0]
+            log.info("[%s] 反查唯一命中 sid=...%s", out.nick, str(out.sid)[-8:])
+        else:
+            # 多命中：宁可不猜，留日志供排查（对齐 casepack「宁可不写不可写错人」）
+            _top = [str(c[0])[-8:] for c in cands[:5]]
+            log.warning("[%s] 反查多命中 %d 个（%s）→ 不猜，取第一但标记待人工确认",
+                        out.nick, len(cands), _top)
+            out.sid = cands[0][0]
     else:
         out.err = "反查不到 sessionId"
         log.warning("[%s] %s", out.nick, out.err)

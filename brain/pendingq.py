@@ -971,6 +971,13 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         #    镜像滞后时会把新消息误判成「已回/冷却中」，导致红点堆着一条都不回。
         #    这里直接入队，后续定位/身份校验/发送三态确认仍照常执行，不会乱发。
         if str(sid) in _unread_sids:
+            if should_skip(sid, txt):
+                _r = _LAST_SKIP.get(str(sid)) or {}
+                _left = max(0.0, (float(_r.get("hours") or 0)*60 - (time.time()-float(_r.get("ts") or 0))/60.0))
+                log.info("设备未读硬放行·冷却未到 sid=%s（原因=%s，剩 %.0f 分钟）→ 本轮不硬放行，避免反复白烧",
+                         sid, _r.get("reason") or "?", _left)
+                _sla_warn(sid, to_uid, last.ts, "冷却中 剩%.0f分" % _left)
+                continue
             log.info("设备未读硬放行 uid=%s sid=%s（跳过台账/L2/冷却）", to_uid, sid)
             out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
             continue
