@@ -114,7 +114,10 @@ def dismiss_popups(actor, tries=3):
         try:
             actor.hand.tap_node(n, settle=1.5)
         except Exception as e:
-            log.warning("[popup] 点关闭异常: %r", e)
+            # 🔴 2026-11-11（WARN 噪声）：点关闭失败只让**本次关弹窗**放弃，
+            #   调用方 open_search 会继续（下一次进搜索页前会再扫弹窗），
+            #   且弹窗本身可能已被点击关掉/自己消失。已兜住，降为 INFO。
+            log.info("[popup] 点关闭异常: %r", e)
             break
         closed += 1
         time.sleep(0.8)
@@ -258,7 +261,10 @@ def open_search(actor):
         dismiss_popups(actor)
         snap = actor.snap(force=True)
     except Exception as e:
-        log.warning("关弹窗异常（继续尝试搜索）: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：关弹窗/快照异常**不会让搜索失败**——
+        #   下面继续正常找入口；弹窗若真挡住，后续找不到入口自然走兜底，
+        #   这条只是记录了"弹窗处理本身抖了一下"，不是故障。降为 INFO。
+        log.info("关弹窗异常（继续尝试搜索）: %r", e)
     if in_search_page(snap):
         return True
     n = _find_search_entry(snap)
@@ -271,7 +277,10 @@ def open_search(actor):
         try:
             snap, _pg = nav.to_chatlist(actor)
         except Exception as e:
-            log.warning("回聊天列表异常: %r", e)
+            # 🔴 2026-11-11（WARN 噪声）：回列表异常后**不中断**——下面会用
+            #   `actor.snap(force=True)` 兜底再找一次入口；这是已兜住的降级路径，
+            #   不是搜索本身的故障（真正的"找不到入口"由后续分支另行记录）。降为 INFO。
+            log.info("回聊天列表异常: %r", e)
             snap = actor.snap(force=True)
             _pg = None
         # 🔴 2026-11-08（P0 修「找不到搜索入口 125 次」真正原因）：
@@ -284,7 +293,11 @@ def open_search(actor):
         #   → 00:20:17 nav unknown → 00:20:20「回列表后仍没入口」→ 00:20:34 失败，共 20s。
         #   现在：nav 没真的回到 chatlist 就立刻认栽返回，不再空滑空等。
         if _pg is not None and _pg != "chatlist":
-            log.warning("open_search: 回列表失败（pg=%s，不是 chatlist）→ 不再空滑空等", _pg)
+            # 🔴 2026-11-11（WARN 噪声）：这里报的其实是 **nav 没回到 chatlist**
+            #   （被弹窗/慢帧/页面顶走），不是搜索模块自身的故障；代码已认栽
+            #   提前返回（省 ~16s 空滑空等）。这条只是终端信号的**原因说明**，
+            #   真正的「找不到搜索入口」由下一行承载（action_audit 计数），不降级。
+            log.info("open_search: 回列表失败（pg=%s，不是 chatlist）→ 不再空滑空等", _pg)
             log.warning("找不到搜索入口")
             return False
         n = _find_search_entry(snap)
@@ -389,9 +402,10 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0):
     try:
         dev.u2().clear_text()
     except Exception as e:
-        # 🔴 2026-11-03 修复 P1：清空失败还继续灌字 → 关键词粘成「kwkw」，
-        #    必然搜不到；更糟的是会被上层当成"搜不到"记 12h 台账。
-        log.warning("clear_text 异常: %r → 重置 u2 重试", e)
+        # 🔴 2026-11-11（WARN 噪声）：clear_text 失败走**重置 u2 再试**（下方立即
+        #   重试）——这是重试链的**中间态**，大概率一次就成功；最终放弃由
+        #   "clear_text 重试仍失败" 那条记录。降为 INFO。
+        log.info("clear_text 异常: %r → 重置 u2 重试", e)
         try:
             dev.reset_u2()
             time.sleep(0.8)
@@ -448,7 +462,11 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0):
         time.sleep(1.2)
 
     LAST_REASON = "timeout"
-    log.warning("搜索 %r -> 等满 %.0fs 仍无结果（超时，不等于未找到）", kw, max_wait)
+    # 🔴 2026-11-11（WARN 噪声）：**单次**搜索等满窗口是「设备慢/接口慢」的**常态**
+    #   （正常命中都要 11~14.7s），调用方 pendingq 只罚 10 分钟短冷却，绝不拉黑。
+    #   真正值得 WARN 的是**连续 3 次超时触发熔断**（下方 `_BREAKER["fails"] >=
+    #   BREAKER_N` 分支）——那才是「通道坏了」。这里降为 INFO，熔断那条保留 WARN。
+    log.info("搜索 %r -> 等满 %.0fs 仍无结果（超时，不等于未找到）", kw, max_wait)
     _BREAKER["fails"] += 1
     if _BREAKER["fails"] >= BREAKER_N:
         _BREAKER["until"] = time.time() + BREAKER_MIN * 60.0
