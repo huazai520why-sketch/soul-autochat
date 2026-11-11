@@ -496,7 +496,13 @@ def _sid_by_unread_clear(actor, sid, tries=3, wait=0.7):
     if str(sid) in cleared:
         log.info("身份校验通过（未读清零差分 = 精确 sid %s）", sid)
         return True
-    log.warning("身份校验失败（进的是别的会话：清零 %r，期望 %s）", list(cleared)[:3], sid)
+    # 🔴 2026-11-11（FAIL 噪声）：这条是「未读清零差分没对上的**中间结论**」，不是最终故障。
+    #   · 差分可能没清到目标（她这条本来就没有未读 → 无证据），调用方 `_session_matches`
+    #     继续走昵称 / session 摘要 / 气泡反查，**fail-closed 不发**才是防串台的真正屏障；
+    #   · P0 实测（见上方 481-495 注释）证明这 84% 是快照污染造成的**假否决**，不是进错人。
+    #   真正值得 WARN 的是下方 handle_pending 的「连续 N 次失败 → 长冷却」熔断那条。
+    #   降为 INFO，行为不变（仍 fail-closed 不发 + 2min 冷却下轮重试）。
+    log.info("身份校验失败（进的是别的会话：清零 %r，期望 %s）", list(cleared)[:3], sid)
     return False
 
 
@@ -604,7 +610,9 @@ def _save_skip(d):
         SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
         SKIP_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
     except Exception as e:
-        log.warning("保存失败台账异常: %r", e)
+        # 🔴 2026-11-11（FAIL 噪声）：写失败台账异常不影响主流程 —— 冷却只是优化，
+        #   写不进去最多下轮多试一次，绝不因此漏回（必回铁律在上层）。降为 INFO。
+        log.info("保存失败台账异常: %r", e)
 
 
 _LAST_SKIP = {}
@@ -671,8 +679,10 @@ def _sla_warn(sid, to_uid, her_ts_ms, why):
     if now - _SLA_WARNED.get(str(sid), 0) < 600:
         return
     _SLA_WARNED[str(sid)] = now
-    log.warning("⏰ 超 %.0f 分钟未回 uid=%s sid=%s（%s）→ 标红，留队列按等待时长重排",
-                age_min, to_uid, sid, why)
+    # 🔴 2026-11-11（FAIL 噪声）：SLA 超时标红是**只记录不改行为**的指标（10 分钟内
+    #   只报一次，防刷屏），不插手操作，属设计内度量，不是故障。降为 INFO。
+    log.info("⏰ 超 %.0f 分钟未回 uid=%s sid=%s（%s）→ 标红，留队列按等待时长重排",
+             age_min, to_uid, sid, why)
 
 
 def cooldown_waiting(max_min=30.0):
@@ -750,7 +760,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             "ORDER BY timestamp DESC LIMIT ?",
             (cutoff, SCAN_SESSIONS)).fetchall()
     except Exception as e:
-        log.warning("查会话失败: %r", e)
+        # 🔴 2026-11-11（FAIL 噪声）：查会话失败 → 返回 []，调用方当「无候选」处理，
+        #   已兜住（宁可本轮空跑，不因一次 SQL 异常把整轮待回掐掉）。降为 INFO。
+        log.info("查会话失败: %r", e)
         return []
 
     # 🔴🔴🔴 2026-11-08 12:56（**本轮最重要的一条**：本地镜像里的「死人」）
@@ -779,7 +791,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     try:
         _live_uids = _device_live_uids(db)
     except Exception as _e:
-        log.warning("设备存活校验取不到（本轮不过滤，按旧行为走）: %r", _e)
+        # 🔴 2026-11-11（FAIL 噪声）：设备读不到（adb 抖动/无 root）→ 返回 None →
+        #   不过滤、按旧行为走，这是**显式降级**（宁可白烧也不能把整轮待回掐掉），
+        #   不是故障。降为 INFO。
+        log.info("设备存活校验取不到（本轮不过滤，按旧行为走）: %r", _e)
     if _live_uids is not None:
         _before = len(rows)
         rows = [(s, u) for (s, u) in rows if str(u) in _live_uids]
@@ -920,8 +935,11 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                          sid, int(V.duration(last)), vhow, vtxt[:40])
                 txt = vtxt
             else:
-                log.warning("语音转写失败 sid=%s（%ds）→ 用占位串照常回复",
-                            sid, int(V.duration(last)))
+                # 🔴 2026-11-11（FAIL 噪声）：转写失败 → 用占位串**照样进队列**（必回铁律，
+                #   宁可回一句「没听清，你再说一遍」也不让语音石沉大海），设计内兜底，不是故障。
+                #   降为 INFO。
+                log.info("语音转写失败 sid=%s（%ds）→ 用占位串照常回复",
+                         sid, int(V.duration(last)))
                 txt = V.PLACEHOLDER
             # 标记这个 sid 是语音：搜索时必须跳过「用转写文字搜」，
             # 因为 Soul 列表预览显示的是「[语音]」，转写文字搜不到（见 kw_of）。
@@ -1040,9 +1058,12 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             if _t in SYS_TEXTS:
                 log.info("设备未读对账：sid=%s 末条是系统文本 %r → 不补", _s, _t[:16])
                 continue
-            log.warning("设备未读对账：sid=%s uid=%s 设备说未读却没进队列 "
-                        "（被上游过滤漏掉）→ 强制补入，末条=%r",
-                        _s, _uid2, _t[:24])
+            # 🔴 2026-11-11（FAIL 噪声）：设备说未读但上游各过滤（镜像滞后/冷却/末条是我）
+            #   全漏掉了 —— 这里**无条件强制补入**，是设计内的最后一道保证，不是故障。
+            #   降为 INFO。
+            log.info("设备未读对账：sid=%s uid=%s 设备说未读却没进队列 "
+                     "（被上游过滤漏掉）→ 强制补入，末条=%r",
+                     _s, _uid2, _t[:24])
             out.append((_s, _uid2, _t, _ts2, _burst_n(db, _s, db.uid)))
             _added += 1
         if _missing:
@@ -1050,7 +1071,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             _lv("设备未读对账：设备未读 %d 个，其中 %d 个不在队列（已补 %d 个）",
                 len(_unread_sids), len(_missing), _added)
     except Exception as _e:
-        log.warning("设备未读对账异常（不影响已有候选）: %r", _e)
+        # 🔴 2026-11-11（FAIL 噪声）：对账异常**不影响已有候选**（已有 out 照常返回），
+        #   已兜住，不是故障。降为 INFO。
+        log.info("设备未读对账异常（不影响已有候选）: %r", _e)
 
     # 🔴 2026-11-03 用户口径：**最老待回优先**（先灭火，再聊新的）。
     #    原来按 session.timestamp 倒序 + 凑够 limit 就 break = 最新优先，
@@ -1180,7 +1203,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                      "队列剩 %d 个", _dropped, STALE_GIVEUP_H, len(_keep))
         merged = _keep
     except Exception as _e:
-        log.warning("过期淘汰异常（忽略，按原队列走）: %r", _e)
+        # 🔴 2026-11-11（FAIL 噪声）：过期淘汰异常 → **忽略并按原队列走**（显式降级，
+        #   不因一次计算失败把整个候选表作废），已兜住。降为 INFO。
+        log.info("过期淘汰异常（忽略，按原队列走）: %r", _e)
     # 🔴 2026-11-08 12:5x：截断移到这里（**过滤之后**）。见上方顺序颠倒的注释。
     merged = merged[:limit]
     return [x[:4] for x in merged]
@@ -1265,7 +1290,9 @@ def kw_of(db, sid, txt, min_len=3, skip_text=False):
                     continue
                 return t[:20]
     except Exception as e:
-        log.warning("取备选关键词异常: %r", e)
+        # 🔴 2026-11-11（FAIL 噪声）：取备选关键词异常 → 退回默认 cand（下方 return cand[:20]），
+        #   已兜住，只是关键词质量下降，不是故障。降为 INFO。
+        log.info("取备选关键词异常: %r", e)
     return cand[:20]
 
 
@@ -1334,7 +1361,9 @@ def _swipe_once(actor, x1, y1, x2, y2, budget=8.0):
     try:
         d = actor.dev.u2()
     except Exception as e:
-        log.warning("手势取 u2 失败: %r", e)
+        # 🔴 2026-11-11（FAIL 噪声）：取 u2 失败 → 返回 False，调用方放弃本次手势（已兜住），
+        #   与 clear._pull_down 同性质。降为 INFO。
+        log.info("手势取 u2 失败: %r", e)
         return False
     # 🔴 2026-11-04（duration 单位事故）：
     #   u2 的 duration 是**秒**（源码 steps = int(duration * 200)，每 step 约 5ms）。
@@ -1369,10 +1398,13 @@ def _swipe_once(actor, x1, y1, x2, y2, budget=8.0):
     t.start()
     t.join(budget)
     if t.is_alive():
-        log.warning("列表手势超时（>%.0fs），放弃本次", budget)
+        # 🔴 2026-11-11（FAIL 噪声）：超时 → 返回 False，调用方放弃本次（防卡死设计），
+        #   与 clear._pull_down 同性质。降为 INFO。
+        log.info("列表手势超时（>%.0fs），放弃本次", budget)
         return False
     if not box["ok"]:
-        log.warning("列表手势失败: %r", box["err"])
+        # 🔴 2026-11-11（FAIL 噪声）：手势失败 → 返回 False，调用方放弃本次（已兜住）。
+        log.info("列表手势失败: %r", box["err"])
         return False
     time.sleep(0.7)
     return True
@@ -1402,7 +1434,9 @@ def first_dot_row(actor):
             if r.has_dot:
                 return r
     except Exception as e:
-        log.warning("取红点行失败: %r", e)
+        # 🔴 2026-11-11（FAIL 噪声）：取红点行失败 → 返回 None，调用方改走搜索（已兜住）。
+        #   降为 INFO。
+        log.info("取红点行失败: %r", e)
     return None
 
 
@@ -1517,7 +1551,9 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None):
             try:
                 snap = actor.snap()
             except Exception as e:
-                log.warning("翻屏取屏失败: %r", e)
+                # 🔴 2026-11-11（FAIL 噪声）：翻屏取屏失败 → 置 hit_bottom 并 break，
+                #   调用方转搜索兜底（已兜住）。降为 INFO。
+                log.info("翻屏取屏失败: %r", e)
                 hit_bottom = True
                 break
             if detect(snap) != "chatlist":
@@ -1596,8 +1632,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         # 🔴 2026-11-03 二次修：候选已改为**最老待回优先**（见 candidates），
         #    这本身就是最公平的排队方式 —— 处理完一个台账就跳过它，自然往后走。
         #    原来的 _ROT 轮转会把「最老优先」打乱，已去掉。
-        log.warning("已读未回积压 %d 个 → 降级：单轮最多 %d 条、预算 %.0fs（搜索保留，最老优先）",
-                    backlog, max_n, budget_s)
+        # 🔴 2026-11-11（FAIL 噪声）：积压降级是**设计内吞吐策略**（多取候选、放宽预算、
+        #   保留搜索），不是故障。降为 INFO。
+        log.info("已读未回积压 %d 个 → 降级：单轮最多 %d 条、预算 %.0fs（搜索保留，最老优先）",
+                 backlog, max_n, budget_s)
     # 🔴 2026-11-03：不再把候选先截到 max_n —— 「重新开场」要按轮控名额。
     #   先切片的话，队首全是老会话时这一轮就只做老会话，刚发来消息的活人继续等。
     #   现在扫完整候选表，靠 restarts_done 计数放行（见循环内）。
@@ -1615,13 +1653,17 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             if _p0 == "chatlist":
                 _scroll_top(actor, rounds=6)
         except Exception as _e:
-            log.warning("轮首回列表顶部失败（继续）: %r", _e)
+            # 🔴 2026-11-11（FAIL 噪声）：回顶失败 → **继续**（不中断本轮），已兜住。
+            #   降为 INFO。
+            log.info("轮首回列表顶部失败（继续）: %r", _e)
 
     log.info("已读未回：%d 个候选", len(cands))
     try:
         from brain import ratelimit as _RL
         if not _RL.can_send():
-            log.warning("本小时发送已达上限 → 本轮不做已读未回")
+            # 🔴 2026-11-11（FAIL 噪声）：本小时发送达上限 → 本轮不做（预期节流，
+            #   避免封号，设计内）。降为 INFO。
+            log.info("本小时发送已达上限 → 本轮不做已读未回")
             return out
     except Exception:
         pass
@@ -1720,14 +1762,17 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         if pg != "chatlist":
             # nav 的 unknown 恢复梯子常爬不上去（nav.py 内 stuck 会被各分支清零），
             # 这里给一次「am start 首页 + 再取树」的硬复位，仍不行才计入连续失败。
-            log.warning("回不到列表（pg=%s）→ am start 首页硬复位后重试一次", pg)
+            # 🔴 2026-11-11（FAIL 噪声）：这是**恢复尝试的中间态**（am start 硬复位后
+            #   重试一次），成功即恢复；真正失败由下方「硬复位后仍回不到列表」分支
+            #   记录。降为 INFO。
+            log.info("回不到列表（pg=%s）→ am start 首页硬复位后重试一次", pg)
             nav.goto_main(dev)
             snap, pg = nav.to_chatlist(actor)
         if pg != "chatlist":
             # 设备级故障熔断：连续多次复位无效 → 整轮收工，别再逐个排队撞墙。
             _NOT_CHATLIST_STREAK[0] += 1
-            log.warning("硬复位后仍回不到列表（pg=%s），连续第 %d 次",
-                        pg, _NOT_CHATLIST_STREAK[0])
+            log.info("硬复位后仍回不到列表（pg=%s），连续第 %d 次",
+                     pg, _NOT_CHATLIST_STREAK[0])
             if _NOT_CHATLIST_STREAK[0] >= NOT_CHATLIST_MAX:
                 log.warning("连续 %d 次回不到 chatlist → 判定设备级故障，本轮提前收工",
                             _NOT_CHATLIST_STREAK[0])
@@ -1772,7 +1817,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     # 不是列表顶部；再翻 3 屏等于把 24s 白烧一遍（09:13 实测翻了两轮）。
                     row = find_row(actor, txt, kw=kw, pages=0)
             except Exception as _e:
-                log.warning("双击找行异常: %r", _e)
+                # 🔴 2026-11-11（FAIL 噪声）：双击找行异常 → 下方转搜索兜底（已兜住），
+                #   不是故障。降为 INFO。
+                log.info("双击找行异常: %r", _e)
         if row is not None:
             log.info("直接点列表行 %r（不走搜索）", row.nickname)
             mark_before_enter(actor)      # 未读快照（进会话后用它做 sid 差分校验）
@@ -1900,9 +1947,12 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 # 否则 skip 会一直停在第 4、5 条，永远试不到正确的那条。
                 _idfail_clear(sid, txt)
             else:
-                log.warning("身份校验失败（第 %d 次，消息 %r）→ 不发送，防串台"
-                            "（fail-closed），下次试第 %d 条搜索结果",
-                            _n, txt[:12], _n + 1)
+                # 🔴 2026-11-11（FAIL 噪声）：这是**逐条尝试的中间态**（fail-closed 不发 +
+                #   下次试第 N+1 条搜索结果），不是最终故障 —— 真正熔断结论由上方
+                #   「连续 N 次失败 → 长冷却」那条 WARN 承载。降为 INFO，行为不变。
+                log.info("身份校验失败（第 %d 次，消息 %r）→ 不发送，防串台"
+                         "（fail-closed），下次试第 %d 条搜索结果",
+                         _n, txt[:12], _n + 1)
                 # 2min 冷却：每次重试都要重搜 11s + 进会话，太短白烧；太长她等太久。
                 mark_skip(sid, txt, "id_mismatch", hours=0.034)
             actor.hand.back(settle=1.5)
@@ -2016,7 +2066,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 except Exception:
                     pass
                 if not _ok:
-                    log.warning("第%d条发送确认读不到输入框（按已发出记账，不再重发）", i + 1)
+                    # 🔴 2026-11-11（FAIL 噪声）：发送确认读不到输入框（unknown）→ **按已发出
+                    #   记账，不再重发**（防重复发送，同 flow.py 已兜住路径）。降为 INFO。
+                    log.info("第%d条发送确认读不到输入框（按已发出记账，不再重发）", i + 1)
                 log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
 
             if sent_n:
@@ -2025,7 +2077,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     from brain import sendgate as _SG6
                     _SG6.note_sent(str(sid), sent_n)
                 except Exception as _e_ns:
-                    log.warning("跟进台账记账失败 sid=%s: %r", sid, _e_ns)
+                    # 🔴 2026-11-11（FAIL 噪声）：跟进台账记账失败不影响已发出的消息
+                    #   （只是防重复的补充记账丢了），降为 INFO。
+                    log.info("跟进台账记账失败 sid=%s: %r", sid, _e_ns)
                 out["sent"] += 1
                 if restart:
                     restarts_done += 1
