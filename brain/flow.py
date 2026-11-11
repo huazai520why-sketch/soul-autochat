@@ -219,7 +219,9 @@ def sid_from_row(db, row):
             #    短文本只在「有红点」的会话里认（红点=她刚发，候选少、不易撞车）。
             hits = db.sessions_for_texts(short, min_len=2, unread_only=True)
     except Exception as e:
-        log.warning("行文本反查异常: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：行文本反查是**可选快路径**，失败只是退回
+        #   慢路径 OCR，不是故障。降为 DEBUG。
+        log.debug("行文本反查异常: %r", e)
         return None
     if not hits:
         return None
@@ -248,7 +250,10 @@ def _enter(actor, row, timeout=8.0, retries=2):
         if pg == "chat":
             return snap, pg
         if i + 1 < retries:
-            log.warning("第 %d 次进会话失败（%s），重新取树重试", i + 1, pg)
+            # 🔴 2026-11-11（WARN 噪声）：这是**重试中间态**，不是最终失败 ——
+            #   失败会在这里重试并大概率成功；真正失败（重试耗尽）由
+            #   handle_one 的「进入后不是 chat 页」另行 WARN。降为 INFO。
+            log.info("第 %d 次进会话失败（%s），重新取树重试", i + 1, pg)
             time.sleep(1.0)
             s2 = actor.snap(force=True)
             located = False
@@ -263,7 +268,9 @@ def _enter(actor, row, timeout=8.0, retries=2):
                         row = cand[0]
                         located = True
             except Exception as e:
-                log.warning("重新定位行异常: %r", e)
+                # 🔴 2026-11-11（WARN 噪声）：可选重定位的**内部异常**，已由
+                #   located=False 处理，下一行「重新定位不到」才是结论。降为 DEBUG。
+                log.debug("重新定位行异常: %r", e)
             if not located:
                 # 🔴 2026-11-08 22:42 生产实证（误触 ¥198 订阅页的**直接原因**）：
                 #   旧代码不管重定位成功与否，下一轮都继续 `tap_node(row.node)` ——
@@ -273,8 +280,11 @@ def _enter(actor, row, timeout=8.0, retries=2):
                 #   直接打开 H5Activity「我的超级星人铭牌 / 限时6.6折 ¥198」付费页，
                 #   该页吞返回键、底栏消失，整轮报废只能重启 App。
                 #   ⇒ 重定位不到就**不要再点**，把 page 原样交还上层去导航。
-                log.warning("重新定位不到 '%.10s' 的行（当前页 %s）→ 不再用旧坐标乱点",
-                            (row.nickname or ""), pg)
+                # 🔴 2026-11-11（WARN 噪声）：这是重试链的**中间结论** —— 真正的
+                #   失败（进入后不是 chat 页）由 handle_one 紧接着另行 WARN，
+                #   这里再记一条只会重复计数。降为 INFO。
+                log.info("重新定位不到 '%.10s' 的行（当前页 %s）→ 不再用旧坐标乱点",
+                         (row.nickname or ""), pg)
                 break
     return snap, pg
 
@@ -378,7 +388,9 @@ def _slow_path(actor, db, out, dry_run):
             if cands:
                 log.info("[%s] 反查：强拉库后命中 sid=...%s", out.nick, str(cands[0][0])[-8:])
         except Exception as _e:
-            log.warning("[%s] 反查：强拉库失败 %r", out.nick, _e)
+            # 🔴 2026-11-11（WARN 噪声）：镜像强拉失败（adb 抖动）后仍会继续走
+            #   下面「仅凭 OCR」兜底（L458 那条）——失败本身已被兜住。降为 INFO。
+            log.info("[%s] 反查：强拉库失败 %r", out.nick, _e)
     if cands:
         out.sid = cands[0][0]
     else:
@@ -391,8 +403,11 @@ def _slow_path(actor, db, out, dry_run):
         db_side = "me" if str(db_last.sender) == str(db.uid) else "her"
         if db_side != out.side and out.side != "?":
             mode = os.environ.get("SOUL_OCR_CONFLICT", "her")
-            log.warning("[%s] OCR 与库不一致：OCR=%s 库=%s（处置=%s）",
-                        out.nick, out.side, db_side, mode)
+            # 🔴 2026-11-11（WARN 噪声）：镜像滞后（REFRESH 300s）是**常态**，
+            #   不是故障 —— 本块下面就是完整的冲突裁决（强拉库 + 设备库仲裁），
+            #   日志只是记录处置路径。降为 INFO，保留原始证据不丢。
+            log.info("[%s] OCR 与库不一致：OCR=%s 库=%s（处置=%s）",
+                     out.nick, out.side, db_side, mode)
             # 🔴 2026-11-03（用户放行）：库是 pull 缓存（REFRESH 300s），可能滞后于
             #    她刚发的那条。先强制重拉一次库再判；仍冲突则按「她发了」处理
             #    （必回优先），但只在 OCR 确实读到她那句文本时才这么做。
@@ -406,7 +421,9 @@ def _slow_path(actor, db, out, dry_run):
                         db_side = "me" if str(db_last.sender) == str(db.uid) else "her"
                         log.info("[%s] 冲突重拉库后末条 side=%s", out.nick, db_side)
                 except Exception as _e:
-                    log.warning("[%s] 冲突重拉库失败: %r", out.nick, _e)
+                    # 🔴 2026-11-11（WARN 噪声）：冲突后重拉库失败（adb 抖动）不是
+                    #   终点 —— 下面还有设备库仲裁兜底。降为 INFO。
+                    log.info("[%s] 冲突重拉库失败: %r", out.nick, _e)
                 if db_side != out.side and (out.last_text or "").strip():
                     # 🔴 2026-11-08 21:2x：冲突最终裁决交给**设备库**（真值）。
                     #   设备库说「我发的」→ 不重复回复；说「她发的」→ 必回；
@@ -419,12 +436,16 @@ def _slow_path(actor, db, out, dry_run):
                     elif _dside == "her":
                         db_side = "her"
                         forced_her = True
-                        log.warning("[%s] 冲突裁决（设备库）：末条是她 %r → 必回",
-                                    out.nick, (_dtxt or "")[:20])
+                        # 🔴 2026-11-11（WARN 噪声）：设备库仲裁**成功且结论明确**
+                        #   （末条是她 → 必回），这是正确决策不是异常。降为 INFO。
+                        log.info("[%s] 冲突裁决（设备库）：末条是她 %r → 必回",
+                                 out.nick, (_dtxt or "")[:20])
                     else:
                         forced_her = True
-                        log.warning("[%s] 重拉后仍冲突且设备库不可用 → 按「她发了」处理（必回优先）",
-                                    out.nick)
+                        # 🔴 2026-11-11（WARN 噪声）：设备库**查不到**（adb 抖动）才
+                        #   退回「必回优先」兜底 —— 这是**已处理**的降级分支，不是故障。
+                        log.info("[%s] 重拉后仍冲突且设备库不可用 → 按「她发了」处理（必回优先）",
+                                 out.nick)
         out.side = "her" if forced_her else db_side
         if forced_her:
             her_msg, how = (out.last_text or ""), "text"
@@ -455,7 +476,9 @@ def _slow_path(actor, db, out, dry_run):
             out.side = "?"
     else:
         her_msg = out.last_text
-        log.warning("[%s] 无库数据，仅凭 OCR 判定 side=%s", out.nick, out.side)
+        # 🔴 2026-11-11（WARN 噪声）：库无此会话数据（镜像滞后/被清）时**仅凭 OCR**
+        #   判定并继续出话 —— 这是已兜住的降级，不是故障。降为 INFO。
+        log.info("[%s] 无库数据，仅凭 OCR 判定 side=%s", out.nick, out.side)
 
     if out.side == "me":
         log.info("[%s] 最后一条是我发的 -> 无需回复", out.nick)
@@ -596,8 +619,11 @@ def _send_lines(actor, lines, nick, page_checked=False, sid=""):
                     inp.clear()
                     return sent, "第%d条确认未发出（输入框仍有内容）" % (i + 1)
                 if not _ok:
-                    log.warning("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
-                                nick, i + 1)
+                    # 🔴 2026-11-11（WARN 噪声）：unknown（转场帧读不到输入框）大概率
+                    #   已发出 → 按已发记账防重复，这是**预期中的不确定**，不是异常。
+                    #   只有 residual（框里还有字=明确没发）才留在上层当错误处理。
+                    log.info("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
+                             nick, i + 1)
             except Exception as e:
                 log.warning("[%s] 第%d条发送异常: %r", nick, i + 1, e)
                 try:
@@ -647,7 +673,9 @@ def _describe_image(db, out):
             return ""
         url = V.image_url(db_last)
         if not url:
-            log.warning("[%s] 图片消息无 URL，无法识图", out.nick)
+            # 🔴 2026-11-11（WARN 噪声）：无 URL → 返回 "" → 走 MEDIA_REPLIES 固定
+            #   话术（必回铁律），属于已兜住的降级。降为 INFO。
+            log.info("[%s] 图片消息无 URL，无法识图", out.nick)
             return ""
         b = R.engine()
         if b is None:
@@ -662,7 +690,9 @@ def _describe_image(db, out):
             log.info("[%s] 识图返回空", out.nick)
         return desc
     except Exception as e:
-        log.warning("[%s] 识图异常: %r", out.nick, e)
+        # 🔴 2026-11-11（WARN 噪声）：识图失败**必须回退固定话术**（必回铁律），
+        #   不会导致不回 —— 这是已兜住的路径。降为 INFO。
+        log.info("[%s] 识图异常: %r", out.nick, e)
         return ""
 
 
@@ -751,7 +781,9 @@ def _reply_and_send(actor, db, out, dry_run):
         if _pic_sent:
             log.info("[%s] 已按她要的发了照片", out.nick)
     except Exception as _e:
-        log.warning("发图判断异常（继续发文字）: %r", _e)
+        # 🔴 2026-11-11（WARN 噪声）：发图是**可选增强**（用户要照片才发），失败
+        #   只是继续发文字，主流程不受影响。降为 INFO。
+        log.info("发图判断异常（继续发文字）: %r", _e)
 
     # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
     # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
