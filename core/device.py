@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .log import get_logger
+from .log import get_logger, warn_limited
 from .paths import ADB_CANDIDATES
 
 log = get_logger("core.device")
@@ -110,7 +110,11 @@ class Device:
             p = subprocess.run(cmd, capture_output=True, timeout=timeout)
             rc, out, err = p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
-            log.warning("adb 超时 %.1fs: %s", time.time() - t0, " ".join(args[:3]))
+            # 🔴 2026-11-11（WARN 噪声）：设备抖动/自愈循环时 adb 超时会**每轮都打**，
+            #   一天几百行把真异常全淹了。按「adb 命令前缀」限频：1 小时内同命令
+            #   只 WARN 一次，其余降 DEBUG；命令恢复后 key 过期，下次再超时会重新 WARN。
+            warn_limited(log, "adb-timeout:" + " ".join(args[:2]),
+                         "adb 超时 %.1fs: %s", time.time() - t0, " ".join(args[:3]))
             return 124, b"", b"timeout"
         return rc, out, err
 
@@ -153,7 +157,10 @@ class Device:
             try:
                 subprocess.run([adb, "connect", prefer], capture_output=True, timeout=20)
             except Exception as e:
-                log.warning("adb connect %s 失败: %r", prefer, e)
+                # 🔴 2026-11-11（WARN 噪声）：connect 失败后还会重查一次，多半能恢复；
+                #   且 SSH 会话退出后每次进脚本都重连一次。按 serial 限频，避免刷屏。
+                warn_limited(log, "adb-connect:" + str(prefer),
+                             "adb connect %s 失败: %r", prefer, e)
             time.sleep(1.2)
             cands, raw = Device._list_devices(adb)
 
@@ -180,7 +187,11 @@ class Device:
         """
         if self.root_ok():
             return True
-        log.warning("adbd 不是 root（%s）→ adb root", self.text("id")[:40])
+        # 🔴 2026-11-11（WARN 噪声）：模拟器重启后 adbd 退回 shell 是**持久状态**，
+        #   device_ready 每轮都查，在 `adb root` 生效前会**每轮都打**。按 serial 限频，
+        #   首次进入 WARN（人看得到），之后降 DEBUG 直到状态消失再重现。
+        warn_limited(log, "adbd-not-root:" + str(self.serial),
+                     "adbd 不是 root（%s）→ adb root", self.text("id")[:40])
         self.run(["root"], timeout=30)
         t0 = time.time()
         while time.time() - t0 < wait:
@@ -189,7 +200,8 @@ class Device:
             if self.root_ok():
                 log.info("已切到 root（用时 %.1fs）", time.time() - t0)
                 return True
-        log.warning("adb root 失败，仍是：%s", self.text("id")[:40])
+        warn_limited(log, "adb-root-fail:" + str(self.serial),
+                     "adb root 失败，仍是：%s", self.text("id")[:40])
         return False
 
     def wm_size(self):
@@ -218,7 +230,10 @@ class Device:
             # Windows adb 偶发 CRLF 污染（\n -> \r\n），保守修复后复检
             fixed = raw.replace(b"\r\r\n", b"\n").replace(b"\r\n", b"\n")
             if fixed.startswith(PNG_MAGIC):
-                log.warning("截图疑似 CRLF 污染，已修复 (%d -> %d bytes)", len(raw), len(fixed))
+                # 🔴 2026-11-11（WARN 噪声）：CRLF 污染是 Windows adb 的**偶发怪癖**，
+                #   修复后图是好的，无需每次 WARN。限频保留首次告警，其余降 DEBUG。
+                warn_limited(log, "screencap-crlf", "截图疑似 CRLF 污染，已修复 (%d -> %d bytes)",
+                             len(raw), len(fixed))
                 raw = fixed
             else:
                 raise RuntimeError("截图不是 PNG，前 16 字节=%r" % raw[:16])
@@ -270,6 +285,11 @@ class Device:
         u2 的 device 端 server 会莫名退出，表现为
         `http.client.RemoteDisconnected: Remote end closed connection`，
         之后所有 dump 都失败。adbd 本身还是好的，重连即可恢复。
+
+        🔴 2026-11-11（WARN 噪声）：本条只说明「连接被丢弃」，真正的原因
+        （dump 失败/动作失败/clear_text 异常）已由**调用方**在重置前打了 WARN。
+        这里再 WARN 一次属于重复计数 —— 一天几百行，全无独立信息。
+        降为 INFO：保留「发生过重置」这个事实，不掩盖异常（异常本体仍由调用方记）。
         """
         old = self._u2
         self._u2 = None
@@ -278,7 +298,7 @@ class Device:
                 old._server = None      # 让 u2 丢掉内部 http 连接
         except Exception:
             pass
-        log.warning("u2 连接已重置")
+        log.info("u2 连接已重置")
 
     def __repr__(self):
         return "<Device %s adb=%s>" % (self.serial, self.adb)
