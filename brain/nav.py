@@ -21,6 +21,27 @@ MAIN = ("chatlist", "me", "square", "planet")
 # 上次真正重启 App 的时间（restart_app 节流用）
 _LAST_RESTART = {"t": 0.0}
 
+# 🔴 2026-11-11（brain.nav.log WARN 一天 1192 次 · 日志噪声根因）：
+#   一次「卡死→恢复」故障里，restart_app() 在 240s 节流窗口内被反复调用时，
+#   每次都打**完全相同**的「重启过于频繁（…）→ 改为仅回首页」。这是纯噪声：
+#   不携带任何新信息（就是"被节流了"），却在每次调用时重复 —— 一天上百次
+#   故障 × 每次几十条 = 把 WARN 计数顶爆（阈值 500）。
+#   恢复**动作**不变（照旧 goto_main 回首页），只是同类节流告警在窗口内
+#   只打一次（窗口由 SOUL_NAV_RESTART_LOG_S 控制，默认与节流窗口一致）。
+#   真正的事件告警（「强制重启 Soul」/「连续 N 次回不到」等）**不降级**，
+#   tools/action_audit.py 靠它们量化恢复动作，绝不能动。
+_RESTART_LOG = {"t": 0.0}
+_RESTART_LOG_S = float(os.environ.get("SOUL_NAV_RESTART_LOG_S", "240") or 240)
+
+
+def _throttle_warn(fmt, *args):
+    """restart_app 节流告警：同窗口内只打一次（动作照常执行）。"""
+    now = time.time()
+    if now - _RESTART_LOG["t"] < _RESTART_LOG_S:
+        return
+    _RESTART_LOG["t"] = now
+    log.warning(fmt, *args)
+
 
 def in_soul(device):
     pkg, _act = device.current_app()
@@ -137,8 +158,8 @@ def restart_app(device, wait=25):
     """
     gap = float(os.environ.get("SOUL_RESTART_MIN_GAP", "240") or 240)
     if time.time() - _LAST_RESTART["t"] < gap:
-        log.warning("重启过于频繁（%.0fs 内已重启过）→ 改为仅回首页",
-                    time.time() - _LAST_RESTART["t"])
+        _throttle_warn("重启过于频繁（%.0fs 内已重启过）→ 改为仅回首页",
+                       time.time() - _LAST_RESTART["t"])
         goto_main(device)
         return False
     _LAST_RESTART["t"] = time.time()
@@ -341,7 +362,15 @@ def to_tab(actor, name="聊天", tries=8):
             if "MainActivity" in (_act or ""):
                 # 一次 to_tab 里最多「1 次 clear-top + 1 次重启」：
                 # 实测这个分支若每轮都发 am start，单次导航会连发 6 次（≈60s 白等）。
-                if stuck == 0:
+                # 🔴🔴 2026-11-11（brain.nav.log WARN 1192 次/日 · 死代码根因）：
+                #   上方 `stuck += 1` 在**进入本分支之前**执行，所以这里永远
+                #   stuck >= 1，`stuck == 0` 是**永不命中的死分支** —— 主框架内
+                #   unknown 第一次就跳到 else 重启 App，从不先试便宜的 clear-top。
+                #   实测后果：restart_app 被调用得过密 → 节流告警「重启过于频繁」
+                #   刷屏 → brain.nav.log 一天 1192 条 WARN，且每次重启 20~40s 纯停机。
+                #   修法：改成 `stuck == 1`（stuck 已自增过），让第一次 unknown 走
+                #   clear-top，第二次才重启，与注释的「1 clear-top + 1 重启」一致。
+                if stuck == 1:
                     log.warning("[nav] unknown 但 Activity 仍在 MainActivity（主框架内）"
                                 "→ 不 back，改 am start clear-top")
                     goto_main(dev)
