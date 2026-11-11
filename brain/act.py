@@ -91,8 +91,15 @@ class Actor(object):
         snap = self.snap(force=True)          # 关键：强制重新取树
         after_page = detect(snap)
         if expect and after_page != expect:
-            log.warning("%s: 期望 %s 实际 %s | %s", action, expect, after_page,
-                        self.digest(snap))
+            # 🔴 2026-11-11（WARN 噪声）：动作后页面与期望不符是**设计内恢复的中间态**：
+            #   现网唯一传 expect 的调用方是 clear.sweep / pendingq 的
+            #   `double_tap_tab("聊天", expect="chatlist")`，两者对失配都有显式兜底
+            #   （clear：stall 计数 → 熔断收工；pendingq：落回搜索路径）。
+            #   真正的故障由调用方自己的 WARN 承担（如 clear「恢复后仍无底栏」、
+            #   flow res.err「进入后不是 chat 页」），这里只记录动作结果供
+            #   action_audit 量化（其正则按行文本匹配，与级别无关）。降为 INFO。
+            log.info("%s: 期望 %s 实际 %s | %s", action, expect, after_page,
+                     self.digest(snap))
         else:
             log.info("%s: %s -> %s", action, before_page, after_page)
         p = P.detect(snap)
@@ -124,7 +131,10 @@ class Actor(object):
         before = detect(snap)
         n = snap.hit(text=text)
         if n is None:
-            log.warning("tap_text %r 未命中", text)
+            # 🔴 2026-11-11（WARN 噪声）：文本未命中 → 返回 (None, before)，调用方
+            #   走自己的兜底/放弃路径，属设计内。当前无生产调用方（只有 docstring 示例），
+            #   降为 INFO 保持与 tap_tab/double_tap_tab 同级。
+            log.info("tap_text %r 未命中", text)
             return None, before
         self.hand.tap_node(n, settle=self.settle if settle is None else settle)
         snap, pg = self._after(before, expect, "tap_text(%s)" % text)
@@ -132,7 +142,9 @@ class Actor(object):
         if expect and pg != expect and snap is not None:
             n2 = snap.hit(text=text)
             if n2 is not None:
-                log.warning("tap_text(%s) 点后仍是 %s → 重新定位再点一次", text, pg)
+                # 🔴 2026-11-11（WARN 噪声）：点后重定位再点是**设计内的一次重试**
+                #   （tap_tab 同款），与 `_after` 的失配告警同源，调用方兜底。降为 INFO。
+                log.info("tap_text(%s) 点后仍是 %s → 重新定位再点一次", text, pg)
                 self.hand.tap_node(n2, settle=self.settle if settle is None else settle)
                 snap, pg = self._after(pg, expect, "tap_text(%s) retry" % text)
         return snap, pg
@@ -143,7 +155,11 @@ class Actor(object):
         before = detect(snap)
         n = snap.tab(name)
         if n is None:
-            log.warning("tap_tab %r 未命中（不在主框架？page=%s）", name, before)
+            # 🔴 2026-11-11（WARN 噪声）：底栏 tab 未命中 → 返回 (None, before)，
+            #   所有调用方都有显式兜底（nav 走 unknown 恢复梯子、clear 走 clear-top
+            #   自愈/放弃本轮、pendingq 落回搜索路径），属设计内中间态。降为 INFO，
+            #   真正的自愈失败由调用方自己的 WARN（如 clear「恢复后仍无底栏」）承担。
+            log.info("tap_tab %r 未命中（不在主框架？page=%s）", name, before)
             return None, before
         self.hand.tap_node(n, settle=self.settle if settle is None else settle)
         snap, pg = self._after(before, expect, "tap_tab(%s)" % name)
@@ -155,7 +171,10 @@ class Actor(object):
         if expect and pg != expect:
             n2 = snap.tab(name) if snap is not None else None
             if n2 is not None:
-                log.warning("tap_tab(%s) 点后仍是 %s → 重新定位再点一次", name, pg)
+                # 🔴 2026-11-11（WARN 噪声）：点后重定位再点是**设计内的一次重试**
+                #   （用户 2026-11-08 口径「操作层乱点」的硬化），与 `_after` 失配
+                #   告警同源。现网 tap_tab 从不传 expect，纯重试中间态。降为 INFO。
+                log.info("tap_tab(%s) 点后仍是 %s → 重新定位再点一次", name, pg)
                 self.hand.tap_node(n2, settle=self.settle if settle is None else settle)
                 snap, pg = self._after(pg, expect, "tap_tab(%s) retry" % name)
         return snap, pg
@@ -179,10 +198,13 @@ class Actor(object):
             #   因为只有走 _after() 才打摘要，而这里提前 return 了）。
             #   真因是「页面不在 chatlist 时底栏整个不渲染」——实测 20 次连续 dump
             #   有 13 次 main_tab_msg/recycler_view/c_ct_chat_fragment_search 全缺失。
-            #   这里照抄同文件 tap_tab（act.py:111）的写法，把 page 和 digest 一起打出来，
-            #   以后再出现未命中，日志能直接看出是页面问题还是坐标问题。
-            log.warning("double_tap_tab %r 未命中（page=%s）| %s",
-                        name, before, self.digest(snap))
+            #   这里照抄同文件 tap_tab（act.py:111）的写法，把 page 和 digest 一起打出来。
+            # 🔴 2026-11-11（WARN 噪声）：「未命中」返回 (None, before)，调用方都有显式
+            #   兜底（clear.sweep 的 `if snap is None: break`、pendingq 落回搜索路径），
+            #   属设计内中间态。可诊断性靠的是**行文本**（page=… | digest 的 sig），
+            #   与日志级别无关；真正的页面故障由调用方 WARN 承担。降为 INFO。
+            log.info("double_tap_tab %r 未命中（page=%s）| %s",
+                     name, before, self.digest(snap))
             return None, before
         x, y = n.center
         self.hand.double_click(x, y, interval=0.12,
