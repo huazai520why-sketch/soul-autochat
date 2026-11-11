@@ -52,6 +52,17 @@ LOG_DIR = ROOT / "logs"
 #        配合轮内心跳后，真正卡死（进程挂住、无任何 touch）仍会被抓到。
 HANG_S = float(os.environ.get("SOUL_WATCHDOG_HANG_S", "900") or 900)
 
+# 🔴🔴 2026-11-11（watchdog_restart 一天 243 次 · 看门狗侧防线）
+#   daemon 被拉起后**短时间内再次死亡** = 崩溃循环（配置/模型/设备硬故障）。
+#   此时无条件再拉起只会变成风暴。规则：5 分钟内第 3 次拉起就停手，
+#   改等冷却后再说，期间只告警。真正的病根由 daemon._init_account 的
+#   自愈重试 + 落 pid 前移解决；这里只是防「看门狗自己加码」的最后闸。
+RESTART_WINDOW_S = float(os.environ.get("SOUL_WATCHDOG_RESTART_WINDOW_S", "300") or 300)
+RESTART_MAX_N = int(os.environ.get("SOUL_WATCHDOG_RESTART_MAX", "3") or 3)
+RESTART_COOLDOWN_S = float(os.environ.get("SOUL_WATCHDOG_RESTART_COOLDOWN_S", "600") or 600)
+_restarts = []          # 最近 N 次拉起时间戳（进程内）
+_cooldown_until = 0.0
+
 
 def read_pid():
     try:
@@ -82,6 +93,34 @@ def heartbeat_age():
     if not d:
         return None
     return time.time() - float(d.get("ts") or 0)
+
+
+def _restart_ok():
+    """是否允许现在拉起（防看门狗自身加码成风暴）。
+
+    🔴🔴 2026-11-11（watchdog_restart 一天 243 次 · 看门狗侧防线）：
+      病根在 daemon 启动即崩（无 pid / 设备故障），上面 _init_account 已根治；
+      这里再给看门狗自己上一道闸：5 分钟内拉起 >= RESTART_MAX_N 次就停手，
+      冷却 RESTART_COOLDOWN_S 秒，期间只告警不拉 —— 避免「拉起→再崩→再拉」
+      由每 60s 一次的检查频率本身放大成刷屏风暴。
+    """
+    global _cooldown_until
+    now = time.time()
+    if now < _cooldown_until:
+        return False, "冷却中（剩 %.0fs）" % (_cooldown_until - now)
+    # 只保留窗口内的时间戳
+    while _restarts and (now - _restarts[0]) > RESTART_WINDOW_S:
+        _restarts.pop(0)
+    if len(_restarts) >= RESTART_MAX_N:
+        _cooldown_until = now + RESTART_COOLDOWN_S
+        _restarts.clear()
+        return False, "5 分钟内拉起已达 %d 次 → 冷却 %.0fs" % (
+            RESTART_MAX_N, RESTART_COOLDOWN_S)
+    return True, "ok"
+
+
+def _record_restart():
+    _restarts.append(time.time())
 
 
 def start_daemon():
@@ -139,10 +178,18 @@ def check():
         return True, why
 
     log.warning("daemon 不在（%s）→ 拉起", why)
+    # 🔴 2026-11-11：拉起频率闸。daemon 反复「拉起→秒崩」时不要再火上浇油，
+    #    否则 watchdog 自己的频率就是风暴源（一天 243 次）。
+    ok_r, why_r = _restart_ok()
+    if not ok_r:
+        log.warning("拉起被限流：%s（daemon 可能持续崩溃，待冷却后重试）", why_r)
+        return False, "拉起被限流（%s）" % why_r
     # 先清死锁，否则新进程会一直等
     msg = lock.clear_stale()
     log.info("清锁：%s", msg)
     pid = start_daemon()
+    if pid is not None:
+        _record_restart()
     return (pid is not None), ("已拉起 pid=%s" % pid if pid else "拉起失败")
 
 

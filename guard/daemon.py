@@ -68,6 +68,11 @@ MATCH_EVERY = 8.0         # 两次匹配之间（一轮内连打也保留小间�
 WAKE_EVERY = 60.0         # 两次唤醒之间
 IDLE_SLEEP = 30.0         # 无事可做时的空转间隔
 DEV_RETRY = 180.0         # 设备不可用后等多久再试
+# 🔴🔴 2026-11-11（watchdog_restart 风暴·根治）：启动初始化（设备探测+root+开库）
+#   失败时**不退出**，每隔这么久重试一次，让 daemon 等设备/库恢复而不是秒崩。
+#   稳态主循环本就有 device_ready()+DEV_RETRY 兜底，但启动路径原来没有——
+#   这就是「watchdog 拉起→再崩→再拉」风暴（243 次/日）的根因。
+STARTUP_RETRY_S = float(os.environ.get("SOUL_STARTUP_RETRY_S", "30") or 30)
 # 连续匹配的参数（用户 2026-11-08：把额度花光）
 MATCH_STREAK_N = int(os.environ.get("SOUL_MATCH_STREAK_N", "12") or 12)   # 一轮最多连打几个
 MATCH_STREAK_BUDGET = float(os.environ.get("SOUL_MATCH_STREAK_BUDGET", "420") or 420)  # 连打总预算(s)
@@ -1177,15 +1182,71 @@ def do_wake(a, dev, db, st, dry_run=False):
 
 
 # ---------------- 主循环 ----------------
+def _init_account(dev, max_retries=None):
+    """启动初始化：确保 root + 打开账号库。失败则带自愈重试，**不退出进程**。
+
+    🔴🔴 2026-11-11（watchdog_restart 一天 243 次专项 · 根因）：
+      原实现把 `Device.get()` + `dev.ensure_root()` + `open_account(dev)` 直接
+      写在 run() 里：
+        · `Device.get()` 在 lock.acquire **之前**，设备不在时 probe_serial 抛
+          RuntimeError → 进程连 pid 都没写就退出；
+        · `ensure_root()` / `open_account()` 在**没有 except 的 try** 里，
+          异常会穿过 finally 直接终结进程（watchdog 看到 pid 死 → 拉起 → 再崩）。
+      两者都形成「watchdog 拉起→再崩→再拉」风暴（guard.watchdog.log 一天
+      243 次「拉起 daemon」，即 nightly_collect 报的 watchdog_restart）。
+
+      现在：启动初始化失败不再退出进程，而是复用主循环的设备自愈梯度
+      （_dev_rescue）原地重试，期间持续 touch 心跳 —— watchdog 不会误判
+      卡死；等设备/账号恢复后正常进入主循环。
+
+    max_retries=None（daemon 常驻）：无限重试，进程必须活着等设备恢复。
+    max_retries=N（once 演练）：最多试 N 次就抛异常，别让单轮命令挂死。
+    """
+    fails = 0
+    while True:
+        try:
+            if dev is None:
+                dev = Device.get()
+            if not dev.ensure_root():
+                raise RuntimeError("ensure_root 返回 False（adbd 非 root）")
+            db = open_account(dev)
+            log.info("当前账号 uid=%s sessions=%d", db.uid, db.stats().get("sessions", 0))
+            return dev, db
+        except Exception as e:
+            fails += 1
+            if max_retries is not None and fails > max_retries:
+                raise
+            log.warning("启动初始化第 %d 次失败: %r → 设备自愈 + %.0fs 后重试",
+                        fails, e, STARTUP_RETRY_S)
+            if dev is not None:
+                try:
+                    _dev_rescue(dev, fails)
+                except Exception as _e2:
+                    log.debug("启动自愈异常: %r", _e2)
+            try:
+                lock.touch("init-retry")
+            except Exception:
+                pass
+            time.sleep(STARTUP_RETRY_S)
+
+
 def run(once=False, dry_run=False):
     st = load_state()
-    dev = Device.get()
-    a = Actor(dev)
 
     ok, why = lock.acquire("daemon")
     if not ok:
         log.error("拿不到锁：%s（另一个实例在跑？）", why)
         return 3
+
+    # 🔴🔴 2026-11-11（watchdog_restart 异常 · 崩溃循环根治）：
+    #   落 pid 必须**在设备探测/开库之前**。原代码 `Device.get()` 在 lock.acquire
+    #   之前跑，设备不在时 probe_serial 抛 RuntimeError → 进程还没写 pid 就退出
+    #   → watchdog 读到的还是上一个死 pid → 判死 → 反复拉起 → 崩溃循环（实测 243 次/日）。
+    #   现在：确认持锁后立刻写 pid，让 watchdog 全程看到「本进程活着」。
+    try:
+        (STATE / "daemon.pid").write_text(str(os.getpid()), "utf-8")
+    except Exception as e:
+        log.warning("写 pid 失败: %r", e)
 
     log.info("=== soul1.0 daemon 启动 pid=%s ===", os.getpid())
     # 空闲计时从启动算起（acct 的兜底切号要用；不初始化会一直是 0 → 永不切）
@@ -1210,20 +1271,19 @@ def run(once=False, dry_run=False):
                  os.environ.get("SOUL_FC_MEMO", "900"),
                  os.environ.get("SOUL_FC_LEAN", "600"))
     log.info("节奏：匹配 %.0fs / 唤醒 %.0fs / 空闲 %.0fs", MATCH_EVERY, WAKE_EVERY, IDLE_SLEEP)
-    # 落 pid：看门狗靠它判断存活（旧架构用 daemon.0.pid）
-    try:
-        (STATE / "daemon.pid").write_text(str(os.getpid()), "utf-8")
-    except Exception as e:
-        log.warning("写 pid 失败: %r", e)
 
+    rounds = 0
     try:
-        # 🔴 2026-11-03 修（启动即确保 root）：MuMu 重启后 adbd 退回 uid=2000(shell)，
-        #    open_account 直读 /data/data/<pkg>/databases 会报「设备上没有 IM-SDK 库」→
-        #    崩溃 → watchdog 反复拉起 → 崩溃循环（19:40 事故根因）。device_ready 里的
-        #    ensure_root 在 while 循环内、启动崩溃时根本走不到，必须在这里先做一次。
-        dev.ensure_root()
-        db = open_account(dev)
-        log.info("当前账号 uid=%s sessions=%d", db.uid, db.stats().get("sessions", 0))
+        # 🔴 2026-11-11：启动初始化带自愈重试（见 _init_account docstring）。
+        #    避免 ensure_root/open_account 抛异常 → NameError → daemon 崩溃 →
+        #    watchdog 无限拉起（watchdog_restart 一天 243 次）。
+        #    Device.get() 也在重试循环内：设备不在时 probe_serial 抛异常，
+        #    原代码因此连 pid 都没写就退出 → watchdog 判死反复拉起。
+        #    once 模式（单轮演练）不无限重试：跑 3 次仍起不来就报错退出，
+        #    否则 `run.py once` 在设备挂死时也会被拖进长循环。
+        dev = None
+        dev, db = _init_account(dev, max_retries=(2 if once else None))
+        a = Actor(dev)
         # 把库句柄交给出话层：它要用它数「当前会话聊了多少轮」来判断关系阶段
         try:
             R.set_db(db)
@@ -1236,7 +1296,6 @@ def run(once=False, dry_run=False):
         except Exception as e:
             log.warning("数据库监控挂载失败（降级为轮首查库）: %r", e)
 
-        rounds = 0
         while True:
             rounds += 1
             t0 = time.time()
