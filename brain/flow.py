@@ -734,7 +734,11 @@ def _reply_and_send(actor, db, out, dry_run):
     if not lines:
         # 必回铁律：引擎不给话也必须发一句，不能沉默
         lines = [fallback_line()]
-        log.warning("[%s] 引擎出话失败 → 用兜底话术 %r", out.nick, lines[0])
+        # 🔴 2026-11-11（FAIL 噪声）：引擎出话**无产出**已被兜底话术完全接住——
+        #   必回铁律保证一定发一句（fallback_line 永不空），不是故障，与 PR#13
+        #   降级的「已兜住」路径同类。用「无产出」取代「失败」避免被 nightly_collect
+        #   的 FAIL 关键字误计；真正的发送失败由 _send_lines 的 err 另行 WARN。
+        log.warning("[%s] 引擎无产出 → 用兜底话术 %r", out.nick, lines[0])
     out.lines = list(lines)
     out.reply = " | ".join(lines)
 
