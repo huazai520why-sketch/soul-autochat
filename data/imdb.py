@@ -42,6 +42,32 @@ _OFFICIAL_HINTS = (
     "邀你", "快来看看", "即将登场",
 )
 
+# 🔴 2026-11-11（nightly_collect 巡检：data.imdb.log WARN 一天 2066 次）：
+#   「设备库缩水 → 保留本地镜像继续跑」是 Soul 清空账号后的**持久状态**，不是一次性
+#   故障。而 sync() 每 5 分钟（REFRESH_S）或每次库变化都重跑一次，于是这条降级分支
+#   每次进都打 WARN —— 一天几百上千行，把真异常（库体检失败、pull 失败、合并失败）
+#   全淹了，巡检阈值(500)也随之爆表。
+#   修法：**按 key 限频**。同一降级状态（同一库名 + 同一文案）1 小时内只 WARN 一次，
+#   其余时间降 DEBUG；状态消失后 key 自动过期，下次再缩水会重新 WARN。
+#   这样既保留「进降级状态」这一真正需要人看的告警，又不至于每 5 分钟刷屏。
+_WARN_LIMIT = {}          # key -> last WARN ts
+_WARN_EVERY = 3600.0      # 同一 key 两次 WARN 的最短间隔（秒）
+
+
+def _warn_limited(key, msg, *args, every=_WARN_EVERY):
+    """限频版 log.warning：同一 key 每 `every` 秒最多 WARN 一次，其余降 DEBUG。
+
+    用于「进入某降级/持久状态」的日志：首次进入要 WARN（有人看得到），
+    之后在状态持续期间只 DEBUG，避免刷屏；状态恢复后 key 过期，下次再进重新 WARN。
+    """
+    now = time.time()
+    last = _WARN_LIMIT.get(key, 0.0)
+    if now - last >= every:
+        _WARN_LIMIT[key] = now
+        log.warning(msg, *args)
+    else:
+        log.debug(msg, *args)
+
 
 def _ms(v):
     """毫秒时间戳 -> 本地时间字符串。"""
@@ -721,7 +747,13 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
                 log.warning("已把本地镜像另存为 %s", keep.name)
         except Exception as _e:
             log.debug("存 .keep 失败: %r", _e)
-        log.warning(
+        # 🔴 2026-11-11（nightly_collect：WARN 一天 2066 次）：
+        #   「设备库被清空」是 Soul 登出账号后的**持久状态**，sync() 每 5 分钟
+        #   （或每次库变化）都重跑一遍，于是这 3 行 WARN 每轮都打 —— 一天上千行，
+        #   把真异常全淹了。按库名限频：同一库 1 小时内只 WARN 一次，其余降 DEBUG。
+        #   状态恢复后 key 过期，下次再缩水会重新 WARN，人不会漏掉「首次进入」。
+        _warn_limited(
+            "shrink:" + name,
             "设备库 %s 只剩 %.0fKB（本地镜像 %.1fMB）—— 疑似 Soul 已清空该账号记录，"
             "**保留本地镜像、本轮用它继续跑**（不覆盖、不报错）",
             name[:28], _dev_sz / 1024.0, _loc_sz / 1048576.0)
@@ -730,10 +762,14 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
         #   把新增行并进镜像即可：历史保留 + 新消息可见，两个目标同时满足。
         _mg = _merge_device_into_mirror(device, name, local, dest_dir)
         if _mg is not None:
-            log.warning("设备库缩水 → 已增量合并进镜像：新增消息 %d 条 / 更新会话 %d 个"
-                        "（历史行全部保留）", _mg[0], _mg[1])
+            _warn_limited(
+                "shrink-merge:" + name,
+                "设备库缩水 → 已增量合并进镜像：新增消息 %d 条 / 更新会话 %d 个"
+                "（历史行全部保留）", _mg[0], _mg[1])
         else:
-            log.warning("设备库缩水 → 增量合并失败，本轮继续用本地镜像（可能看不到最新消息）")
+            _warn_limited(
+                "shrink-merge-fail:" + name,
+                "设备库缩水 → 增量合并失败，本轮继续用本地镜像（可能看不到最新消息）")
         return local
 
     def _pull_all():
