@@ -1217,8 +1217,12 @@ def kw_of(db, sid, txt, min_len=3, skip_text=False):
     #
     #   所以把「够不够长」的闸从 min_len(默认3) 提到 5，并显式禁掉纯数字串。
     #   长度够的候选仍然优先；不够就往下走「历史长句兜底」，而不是硬搜一个必败的词。
+    # 🔴 2026-11-12（修 TIMEOUT 175 次）：上面的正则 `[0-9０-９]+` 只匹配**纯数字**，
+    #   而实测掩码手机号（如 '159****0632'，注释里点名的例子）带 4 个 `*`，
+    #   完全绕过了这道闸 → 拿它去搜索 97% 超时（每 30s 白烧），正是本 issue 的
+    #   brain.pendingq.log TIMEOUT 主力来源。补上 `*` / 全角 `＊`，掩码号也禁。
     _KW_MIN = max(min_len, 5)
-    _is_digits = bool(cand) and re.fullmatch(r"[0-9０-９]+", cand or "") is not None
+    _is_digits = bool(cand) and re.fullmatch(r"[0-9０-９*＊]+", cand or "") is not None
     if len(cand) >= _KW_MIN and not _is_digits and not skip_text:
         out = cand[:20]
         # 截断可能把「[旺柴]」切成「[旺」—— 残留的 [ 会让搜索失败（实测）
@@ -1241,7 +1245,10 @@ def kw_of(db, sid, txt, min_len=3, skip_text=False):
                 t = re.sub(r"\[[^\]]{1,6}\]", "", t).strip()
                 # 🔴 2026-11-08：兜底句同样要过「5 字下限 + 非纯数字」——
                 #   否则末条太短时又会退回到一个必败的关键词（实测 3~4 字成功率仅 43.5%）
-                if re.fullmatch(r"[0-9０-９]+", t or ""):
+                # 🔴 2026-11-12（TIMEOUT 根治）：兜底句同样要挡**掩码手机号**
+                #   （'137****8899'）—— 它长度够、但带 `*` 会绕过旧正则被当成
+                #   关键词硬搜必超时。与上方主闸同口径：数字 + 星号一律判必败。
+                if re.fullmatch(r"[0-9０-９*＊]+", t or ""):
                     continue
                 if m.msg_type != 1 or len(t) < 6:
                     continue
