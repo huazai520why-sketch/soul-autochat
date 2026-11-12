@@ -201,6 +201,26 @@ class IMDB(object):
                         pass
             shutil.copy2(str(self.path), str(snap))
             shutil.copy2(str(wal), str(snap) + "-wal")
+            # FIX 2026-11-12 P0-1: snapshot integrity check
+            #   copy2 of actively-written WAL db can produce corrupt snapshot
+            #   ("file is not a database"), causing _guess_uid() to return
+            #   None and open_account() to fail with "uid mismatch".
+            #   Verify snapshot; on failure fall back to main db (valid uid).
+            try:
+                import sqlite3 as _sq
+                _v = _sq.connect(str(snap))
+                try:
+                    _r = _v.execute("PRAGMA integrity_check").fetchone()
+                    if not _r or str(_r[0]).lower() != "ok":
+                        raise RuntimeError("integrity_check: %r" % (_r,))
+                    _v.execute("SELECT COUNT(*) FROM session LIMIT 1").fetchone()
+                finally:
+                    _v.close()
+            except Exception as _ie:
+                log.warning(
+                    "快照 integrity 校验失败（%d KB wal）→ 回退主库：%r",
+                    int(wal.stat().st_size / 1024), _ie)
+                return self.path
             log.info("陈旧 shm 删不掉 → 用快照 %s 打开（%d KB wal）",
                      snap.name, int(wal.stat().st_size / 1024))
             return snap
