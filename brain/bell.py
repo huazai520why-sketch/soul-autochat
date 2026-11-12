@@ -21,6 +21,8 @@
 
 处理动作：点「立即私聊」→ **已在该人会话页，直接发**（旧架构栽在"先回列表找人"）→ 通用开场白 → 建档。
 """
+import os
+
 from core.log import get_logger
 from eyes import ocr
 from eyes.page import detect
@@ -60,6 +62,15 @@ def _ocr_hit(dev, keyword):
     return None
 
 
+# 🔴 2026-11-12（HY-11）：铃消失后 UI 树里还残留「同城奇遇 / 关闭弹窗」文本，
+#   若每轮都去 OCR 找「立即私聊」，一次白烧 ~2.5s（实测）。这里做**最近一次
+#   OCR 确实没找到按钮**的记忆：残留文本 + 刚 OCR 过且没按钮 → 直接判「已消失」
+#   跳过 OCR，直到过了 RESIDUAL_SKIP_S 再给一次机会（铃真弹出时按钮会回来）。
+#   只影响「省一次 OCR」，绝不改变 is_bell 的返回语义。
+RESIDUAL_SKIP_S = float(os.environ.get("SOUL_BELL_RESIDUAL_SKIP", "30") or 30)
+_RESIDUAL = {"ts": 0.0}
+
+
 def is_bell(snap=None, dev=None):
     """当前是不是弹着奇遇铃。
 
@@ -68,7 +79,11 @@ def is_bell(snap=None, dev=None):
       只按树判断会一直报「有铃」，然后 OCR 又找不到按钮 → 空转。
       所以：**给了 dev 就以 OCR 找到「立即私聊」为准**（按钮存在才是真铃）；
       没给 dev 才退回树判断（供不需要点击的场合用）。
+
+    🔴 2026-11-12（HY-11）：残留文本 + 最近一次 OCR 没找到按钮 → 直接 False，
+      不再每次花 2.5s OCR（铃消失后残留可能持续好几个动作轮）。
     """
+    import time as _t
     try:
         hinted = None
         if snap is not None:
@@ -78,7 +93,14 @@ def is_bell(snap=None, dev=None):
             if not hinted and dev is not None:
                 return False
         if dev is not None:
-            return find_button(dev) is not None
+            if hinted:
+                # 残留文本但刚 OCR 过且没按钮 → 视为已消失，跳过本次 OCR
+                if _t.time() - _RESIDUAL["ts"] < RESIDUAL_SKIP_S:
+                    return False
+            hit = find_button(dev)
+            if hit is None:
+                _RESIDUAL["ts"] = _t.time()   # 记住「这次没找到按钮」
+            return hit is not None
         return bool(hinted)
     except Exception as e:
         log.warning("铃识别异常（按无铃处理）: %r", e)

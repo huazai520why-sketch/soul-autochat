@@ -204,7 +204,10 @@ def target_n(her_lines, hist=None):
         elif L <= 13:
             n = 2
         else:
-            n = 3 if q else 2
+            # 🔴 2026-11-12（GL-07 修复）：旧写法 `n = 3 if q else 2` 是死逻辑 ——
+            #   ADAPT_CAP=2（line 47）恒钳 n<=2，`3` 永远到不了。
+            #   清理为 `n = 2`（安全：语义不变，只是去掉永不生效的分支）。
+            n = 2
 
     her_n = sum(1 for h in (hist or []) if (h or {}).get("role") == "her")
     if her_n < 2:
@@ -483,19 +486,36 @@ def _hook_fallback(key, avoid=()):
 
 
 def _post_hook(lines, hook):
-    """钩子回合的后处理：全是关门句就换兜底，否则原样返回。
+    """钩子回合的后处理：关门句逐条换兜底，正常句原样保留。
 
     只在「命中钩子」时生效，不影响正常回合。
     与 `_post_busy()` 的区别：那个处理「我连续劝她忙」，这个处理
     「她递情绪、我没接住」——两者是不同病因，不可互相替代。
+
+    🔴 2026-11-12（GL-09 修复）：旧写法 `all(_is_hook_close(x) for x in lines)`
+      要求**每一条**都是关门句才触发兜底 —— 于是 [正常句, 关门句] 这种组合
+      （not all → 直接 return lines）会把**关门句原样发出去**，钩子仍没接住。
+      修法按任务口径「逐条只替换关门的（最小侵入）」：只换关门句、正常句保留，
+      不整批丢弃（避免连带把正常句一起扔了）。
     """
     if not hook or not lines:
         return lines
-    if not all(_is_hook_close(x) for x in lines):
-        return lines
     key = hook[0]
-    log.warning("钩子「%s」命中但模型回了关门句 → 换兜底: %r", key, lines)
-    return [_hook_fallback(key, avoid=tuple(lines))]
+    new, fb = [], None
+    for x in lines:
+        if _is_hook_close(x):
+            if fb is None:
+                fb = _hook_fallback(key, avoid=tuple(lines))
+            new.append(fb)
+        else:
+            new.append(x)
+    if fb is None:
+        return lines                      # 没有关门句，原样返回
+    # 两条都关门时避免兜底句发两遍（同句重复是群发穿帮）
+    if len(new) > 1 and len(set(new)) < len(new):
+        new = list(dict.fromkeys(new))
+    log.warning("钩子「%s」命中但模型回了关门句 → 逐条换兜底: %r → %r", key, lines, new)
+    return new
 
 
 # ══════════════════ 「她忙/累」场景：连续劝退就换策略 ══════════════════
@@ -749,13 +769,28 @@ def _as_list(r):
 
 
 def _post_busy(lines, alert):
-    """换策略警报已注入、模型却还只出劝退句 → 用兜底句替换（保住必回且不推人）。"""
+    """换策略警报已注入、模型却还出劝退句 → 逐条换兜底（保住必回且不推人）。
+
+    🔴 2026-11-12（GL-09 修复）：旧写法 `all(_is_busy_line(x) for x in lines)`
+      要求**每一条**都是劝退句才换兜底 —— [正常句, 劝退句] 组合会把劝退句原样
+      发出去。与 `_post_hook` 同口径：只换劝退句、正常句保留，不整批丢弃。
+    """
     if not alert or not lines:
         return lines
-    if not all(_is_busy_line(x) for x in lines):
-        return lines
-    log.warning("警报后仍全是劝退句 → 换兜底（具体小事+钩子）: %r", lines)
-    return [_busy_fallback(avoid=tuple(lines))]
+    new, fb = [], None
+    for x in lines:
+        if _is_busy_line(x):
+            if fb is None:
+                fb = _busy_fallback(avoid=tuple(lines))
+            new.append(fb)
+        else:
+            new.append(x)
+    if fb is None:
+        return lines                      # 没有劝退句，原样返回
+    if len(new) > 1 and len(set(new)) < len(new):
+        new = list(dict.fromkeys(new))
+    log.warning("警报后仍出劝退句 → 逐条换兜底（具体小事+钩子）: %r → %r", lines, new)
+    return new
 
 
 # ══════════════════ 重新开场（她上一条已是几天前） ══════════════════

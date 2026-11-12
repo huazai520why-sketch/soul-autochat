@@ -542,6 +542,21 @@ def send(actor, dev, text, sid=""):
     return True, "已发送"
 
 
+def _has_chat_input(snap):
+    """当前屏是不是会话页（「发送」或「长按说话」出现）。
+
+    🔴 2026-11-12（HY-09）：`next_one` 换人确认原来只认 `detect()=="chat"` 或
+      `has_card(s)`。实测匹配卡刚换完、资料卡还没渲染出来的那一瞬，
+      detect 可能不是 chat、has_card 也为 False → 被误判「还没换」→ 等满 3 轮。
+      加「发送/长按说话」直接兜底：只要会话输入框在，就是已换人。
+    """
+    try:
+        txt = " ".join(snap.texts())
+        return ("发送" in txt) or ("长按说话" in txt)
+    except Exception:
+        return False
+
+
 def next_one(actor, waits=(1.0, 1.0, 1.0)):
     """点「匹配下一个」→ 等 1s → 重新识屏；还在匹配就再等 1s，**最多 3 次**。
 
@@ -560,7 +575,7 @@ def next_one(actor, waits=(1.0, 1.0, 1.0)):
         time.sleep(w)
         s = actor.snap(force=True)
         sig, pg = s.signature(), detect(s)
-        if sig != before and (pg == "chat" or has_card(s)):
+        if sig != before and (pg == "chat" or has_card(s) or _has_chat_input(s)):
             log.info("第%d次识屏确认已换人 (sig %s -> %s)", i + 1, before, sig)
             return s, "chat"
         log.info("第%d次识屏还没换（page=%s sig=%s）", i + 1, pg, sig)
@@ -571,6 +586,38 @@ def next_one(actor, waits=(1.0, 1.0, 1.0)):
 
 # 匹配额度用完的提示（实测弹层原文：「今日免费匹配机会已用完 (50/50)」）
 QUOTA_HINT = "匹配机会已用完"
+
+
+def _dismiss_quota(actor, s):
+    """关掉「额度用完」弹层。back 失败时 fallback 点「关闭」。
+
+    🔴 2026-11-12（HY-10）：额度弹层（卖次数卡）有时 back 关不掉（RN 弹层），
+      原来只 back 一次，关不掉就停在遮罩上 → 下一轮仍见 quota_out → 反复。
+      这里 back 后复查一次：还在弹层就找「关闭」按钮点，再复查，尽力关掉。
+      返回是否已不在弹层。
+    """
+    try:
+        actor.hand.back(settle=1.3)
+    except Exception:
+        pass
+    s2 = actor.snap(force=True)
+    if not quota_out(s2):
+        return True
+    # back 没关掉 → 找「关闭」按钮
+    n = None
+    for label in ("关闭", "知道了", "我知道了", "取消"):
+        n = s2.find_one(text=label)
+        if n is not None:
+            break
+    if n is not None:
+        try:
+            actor.hand.tap_node(n, settle=1.2)
+            if not quota_out(actor.snap(force=True)):
+                return True
+        except Exception:
+            pass
+    log.warning("额度弹层关闭失败（仍残留）→ 交给上层退避")
+    return False
 
 
 def quota_out(snap):
@@ -618,7 +665,7 @@ def start_match(actor, max_wait=25):
         # 额度用完：第一轮就能看出来，立刻关掉弹层别等
         if quota_out(s):
             log.warning("今日匹配额度已用完 → 关掉弹层，今天不再匹配")
-            actor.hand.back(settle=1.3)
+            _dismiss_quota(actor, s)
             return s, "no_quota"
         pg2 = detect(s)
         if pg2 == "chat":

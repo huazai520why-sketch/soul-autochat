@@ -94,7 +94,12 @@ _LOCAL_DOWN = {"until": 0.0}
 #    真正的开关只有原生 /api/chat 的 `think: false`（实测 thinking=0、content 正常）。
 #    ⇒ 分析调用默认走原生；要换云端 OpenAI 兼容端点时设 SOUL_ANALYZE_BACKEND=openai。
 ANALYZE_BACKEND = (os.environ.get("SOUL_ANALYZE_BACKEND", "ollama") or "ollama").lower()
-OLLAMA_URL = os.environ.get("SOUL_OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+# 🔴 2026-11-12（GL-05 修复）：OLLAMA_URL 默认值指向副机自己（127.0.0.1:11434），
+#   但 Ollama 实际跑在本机 192.168.10.210:11434。默认值错 → 副机连不上本地模型，
+#   分析总是回落到方舟（P0-5 防火墙未加、重启可能断）。
+#   只改默认值，**不改环境变量读取逻辑**（SOUL_OLLAMA_URL 仍可覆盖）；这是部署
+#   正确性修复，安全。
+OLLAMA_URL = os.environ.get("SOUL_OLLAMA_URL", "http://192.168.10.210:11434/api/chat")
 OLLAMA_NUM_CTX = int(os.environ.get("SOUL_OLLAMA_CTX", "16384") or 16384)
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 直连，不走系统代理

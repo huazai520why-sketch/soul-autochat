@@ -73,6 +73,24 @@ def _tab_present(snap, name):
     return name in set(snap.texts())
 
 
+def _in_search_page(snap):
+    """当前是不是搜索页（顶栏输入框 + 「取消」）。
+
+    🔴 2026-11-12（HY-05）：搜索页 / RN 浮层也会出现「取消」，而底栏常被盖住
+      → 原 detect() 把它误判成弹窗 → 上层去点「取消」= 关掉搜索页 = 瞎点。
+      这里本地复刻 brain/search.in_search_page 的判据（顶栏 EditText + 取消），
+      只用来**排除**「取消」被当成弹窗按钮，不改任何弹窗判据。
+    """
+    try:
+        box = snap.find_one(cls="EditText")
+        if box is None or box.bounds[1] > 300:
+            return False
+        return (snap.find_one(desc="取消") is not None
+                or snap.find_one(text="取消") is not None)
+    except Exception:
+        return False
+
+
 def detect(snap):
     """有弹窗返回 Popup，否则 None。
 
@@ -83,6 +101,12 @@ def detect(snap):
     texts = snap.texts()
     has_tab = all(_tab_present(snap, t) for t in ("聊天", "广场"))
     if has_tab:
+        return None
+
+    # 🔴 2026-11-12（HY-05）：搜索页/RN 浮层的「取消」不是弹窗按钮。
+    #   底栏缺失 + 搜索页特征（顶栏输入框 + 取消）→ 按「无弹窗」处理，
+    #   避免上层把搜索页的「取消」当弹窗主按钮点掉。
+    if _in_search_page(snap):
         return None
 
     buttons, primary, secondary = [], [], []

@@ -383,11 +383,21 @@ class Screen(object):
             if self._gen is not None and action_gen() != self._gen:
                 log.debug("帧复用作废：动作代数 %s -> %s", self._gen, action_gen())
             else:
-                # 🛡️ 守卫 2：Activity 变了就作废（只做「作废」，不做「没变」的推断）
-                cur = self._activity()
-                if not cur or not self._act or cur == self._act:
-                    return self._snap
-                log.info("帧复用作废：Activity %s -> %s（重取树）", self._act, cur)
+                # 🔴 2026-11-12（HY-16）：帧复用对**列表定位**加一道新鲜度守卫。
+                #    同一 Activity 内、没有动作时，列表也可能被异步刷新/新消息
+                #    顶动（动作代数与 Activity 守卫都抓不到）→ 复用的旧帧可能
+                #    把列表定位引到过期的行。这里对「已过半 TTL」的帧强制重取，
+                #    只在窗口后半段多付一次 dump，前半段（最常用的动作后定位）
+                #    仍照常复用，不影响提速收益。
+                if (now - self._snap.ts) > self.ttl * 0.5:
+                    log.debug("帧复用作废：缓存帧已过半 TTL（%.2fs > %.2fs）→ 重取",
+                              now - self._snap.ts, self.ttl * 0.5)
+                else:
+                    # 🛡️ 守卫 2：Activity 变了就作废（只做「作废」，不做「没变」的推断）
+                    cur = self._activity()
+                    if not cur or not self._act or cur == self._act:
+                        return self._snap
+                    log.info("帧复用作废：Activity %s -> %s（重取树）", self._act, cur)
         t0 = time.time()
         d = self.dev.u2()
         try:

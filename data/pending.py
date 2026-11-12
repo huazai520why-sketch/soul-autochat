@@ -163,6 +163,25 @@ def unread_sids(db, now_ms=None):
     except Exception as e:
         log.warning("查未读会话失败: %r", e)
         return []
+    # 🔴🔴 2026-11-12（HY-13 / DS-08：unread_sids 无设备存活校验）
+    #   现象：设备库缩水 962 次，清红点目标 `_lib_unread_sids` 几乎全是
+    #   「设备上已不存在的幽灵会话」→ 屏上认领不到 → 双击空转。
+    #   根因：unread_sids() 只查本地镜像 `unReadCount>0`，**无 device_live_uids
+    #   过滤**（对比 should_reply 有，见本文件 248-258）。
+    #   修法：与 should_reply 同款设备存活校验。取不到（None）不过滤，保持旧行为。
+    try:
+        from data import imdb as _IM
+        _dev = getattr(db, "dev", None)
+        if _dev is not None:
+            _live = _IM.device_live_uids(_dev, db.uid)
+            if _live is not None:
+                _before = len(rows)
+                rows = [r for r in rows if str(r["toUserId"] or "") in _live]
+                if _before != len(rows):
+                    log.debug("unread_sids：设备存活校验移出 %d 个已不存在的会话",
+                              _before - len(rows))
+    except Exception as _e:
+        log.debug("unread_sids：设备存活校验跳过（%r）", _e)
     for r in rows:
         try:
             sid = str(r["sessionId"])

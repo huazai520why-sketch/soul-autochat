@@ -266,8 +266,14 @@ def opening_line(sid="", nick="", hist=None, tags=None, common=None,
         _msgs = list(msgs)
         if _rej_note:
             _msgs = msgs + [{"role": "user", "content": _rej_note}]
-        raw = llm.ollama_chat(_msgs, timeout=40, max_tokens=120,
-                              temperature=0.78 + 0.06 * attempt)
+        # 🔴 2026-11-12（GL-04 修复）：旧代码直接调 llm.ollama_chat，不走
+        #   llm.analyze() 的方舟回落分支 → 本地 Ollama 不可用时开场白连撞/回落
+        #   固定模板（实测 68 次）。改为走 llm.analyze()：内部先试本地 Ollama，
+        #   失败且 SOUL_ANALYZE_FALLBACK_ARK=1 时自动回落到方舟出话模型，
+        #   不新增密钥、不改变调用语义。若方舟也不可用，analyze 返回 None，
+        #   与旧行为一致（continue → 兜底）。
+        raw = llm.analyze(_msgs, timeout=40, max_tokens=120,
+                          temperature=0.78 + 0.06 * attempt)
         if not raw:
             continue
         c = raw.split("\n")[0].strip().strip('"“”\'‘’')

@@ -535,11 +535,29 @@ def send_wake(actor, dev, cand, text, db=None):
         try:
             from brain import pendingq as _PQ
             if not _PQ._session_matches(actor, db, cand.sid):
-                log.warning("唤醒身份校验失败（搜索结果不是目标会话）→ 不发送 uid=%s", cand.uid)
-                actor.hand.back(settle=1.0)
-                S.leave(actor)
-                _bump_miss(cand.uid, "身份校验失败")
-                return False, "身份校验失败"
+                # 🔴 2026-11-12（HY-15）：`_session_matches` 失败先做**对话页标题昵称**
+                #   二次确认（昵称一致即放行）。`_session_matches` 第一顺位是未读清零
+                #   差分，进错人时给 False，但**目标会话没有未读**时返回 None 走文本
+                #   兜底，短消息在库里撞车也会返回 False → 误判串台 → 白烧+冷却。
+                #   昵称一致（`_nick_matches` 返回 True）说明标题就是目标人，
+                #   直接放行；否则维持 fail-closed 不发。
+                _released = False
+                try:
+                    _nn = _PQ.nick_of(db, cand.sid, cand.uid)
+                    if _nn:
+                        _nm = _PQ._nick_matches(actor, _nn)
+                        if _nm is True:
+                            log.info("唤醒身份校验失败但对话页昵称一致（%r）→ 放行 sid=%s",
+                                     _nn, cand.sid)
+                            _released = True
+                except Exception as _e:
+                    log.debug("唤醒昵称二次确认异常（按失败处理）: %r", _e)
+                if not _released:
+                    log.warning("唤醒身份校验失败（搜索结果不是目标会话）→ 不发送 uid=%s", cand.uid)
+                    actor.hand.back(settle=1.0)
+                    S.leave(actor)
+                    _bump_miss(cand.uid, "身份校验失败")
+                    return False, "身份校验失败"
         except Exception as e:
             log.debug("唤醒身份校验异常（按通过处理）: %r", e)
 
@@ -553,13 +571,28 @@ def send_wake(actor, dev, cand, text, db=None):
             if not _d.ok:
                 log.info("唤醒被跟进阶梯拦截 sid=%s state=%s（%s）",
                          cand.sid, _d.state, _d.reason)
+                # 🔴 2026-11-12（HY-08）：原来这里只 back 就 return False，
+                #   不 mark_woke(failed=True) → 24h 冷却没记 → 下一轮又选中又拦截
+                #   → 反复白烧（实测唤醒阶梯拦截 following 65 次）。现在：
+                #   ① 记失败台账（含 24h 冷却 + 放弃计数），今天不再找他；
+                #   ② 确保回到会话列表（back 一次 + nav.to_chatlist 兜底），
+                #      绝不停在会话页让下一轮从错误页面起手。
                 # 闸之前已完成导航/进会话（见上方 S.search / _enter），
-                # 直接 return 会停在会话页，下一轮从错误页面起手。
-                # 按成功路径同款 back 退一层；异常吞掉不改变返回值语义。
+                # 先按成功路径同款 back 退一层；异常吞掉不改变返回值语义。
                 try:
                     actor.hand.back(settle=1.2)
                 except Exception:
                     pass
+                try:
+                    from brain import nav as _nav
+                    _snap, _pg = _nav.to_chatlist(actor)
+                    if _pg != "chatlist":
+                        log.warning("跟进阶梯拦截后回列表失败（page=%s）→ 已尽力返回",
+                                    _pg)
+                except Exception as _e:
+                    log.debug("跟进阶梯拦截后回列表异常（已尽力）: %r", _e)
+                # 记失败台账：24h 冷却 + 放弃计数，避免每轮重复选中同一人
+                _bump_miss(cand.uid, "跟进阶梯拦截(%s)" % _d.state)
                 return False, "跟进阶梯拦截(%s)" % _d.state
     except Exception:
         pass

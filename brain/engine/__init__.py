@@ -69,11 +69,22 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
         except Exception:
             recent = []
 
+    # 🔴 2026-11-12（GL-02 修复）：批内去重 —— 旧代码对每个候选只对历史
+    #   recent 判重，候选之间互不比较 → 同批相似句重复/串台（flow 47 / pendingq 7，
+    #   共 54 次）。`_dedup_similar()`（reply.py:707）定义了但从未被调用（死代码）。
+    #   最小侵入：新增局部 pool，已通过的句子并入 pool，后续候选与 pool 用
+    #   gate.dup_hit 判重，同批内相似句只保留一条。
+    #   保证「至少留一条」：pool 从空开始，首个通过 check 的候选必然留下，
+    #   批内去重只删后续重复、绝不把第一条删掉 → 不会沉默（宁可留一条也不要空）。
     passed, dropped = [], []
+    pool = []
     for c in cands:
         ok, why = gate.check(c, recent)
+        if ok and pool and gate.dup_hit(c, pool):
+            ok, why = False, "批内重复"
         if ok:
             passed.append(c)
+            pool.append(c)
         else:
             dropped.append((c[:30], why))
     if dropped:

@@ -332,6 +332,22 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
         if page != "chat":
             out.err = "进入后不是 chat 页: %s" % page
             log.warning("[%s] %s", out.nick, out.err)
+            # 🔴🔴 2026-11-12（DS-02 / HY-06：进会话失败补 back + 短冷却）
+            #   现象：page!="chat" 时只设 err 不 back/不冷却 → UI 停在 unknown，
+            #   且下一个候选还在排队，反复进失败会话 → 白烧。
+            #   修法：退回列表 + 记短冷却（ENTER_RETRY_H=0.5h，pendingq 已有常量），
+            #   让「进不去的会话」短时间不再被选，UI 复位。
+            try:
+                actor.hand.back(settle=0.9)
+            except Exception as _b:
+                log.debug("DS-02 back 失败: %r", _b)
+            try:
+                if out.sid:
+                    from brain import pendingq as _PQ2
+                    _PQ2.mark_skip(str(out.sid), (out.last_text or ""),
+                                   "enter_fail", hours=_PQ2.ENTER_RETRY_H)
+            except Exception as _m:
+                log.debug("DS-02 记短冷却失败: %r", _m)
             return out
 
         if side == "me":
@@ -349,6 +365,19 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
     if page != "chat":
         out.err = "进入后不是 chat 页: %s" % page
         log.warning("[%s] %s", out.nick, out.err)
+        # 🔴🔴 2026-11-12（DS-02 / HY-06）：同上，进会话失败补 back + 短冷却。
+        #   慢路径此时 sid 可能还没定（out.sid 未必有），能定才记冷却。
+        try:
+            actor.hand.back(settle=0.9)
+        except Exception as _b:
+            log.debug("DS-02 back 失败: %r", _b)
+        try:
+            if out.sid:
+                from brain import pendingq as _PQ3
+                _PQ3.mark_skip(str(out.sid), (out.last_text or ""),
+                               "enter_fail", hours=_PQ3.ENTER_RETRY_H)
+        except Exception as _m:
+            log.debug("DS-02 记短冷却失败: %r", _m)
         return out
     return _slow_path(actor, db, out, dry_run)
 

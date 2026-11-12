@@ -386,7 +386,24 @@ def cycle(a, dev, db, st, dry_run=False):
             except Exception:
                 pass
     except Exception as e:
-        log.warning("刷新库失败（沿用旧对象）: %r", e)
+        # 🔴🔴 2026-11-12（DS-10：刷新失败降级 · 不再静默）
+        #   现象：刷新库失败只 warning「沿用旧对象」，不计数 —— 若连续失败
+        #   （库被锁/adb 抖动/磁盘满），daemon 一直用旧镜像跑，日志却看不出
+        #   已降级多久，排查时误以为数据是新的。
+        #   修法：加失败计数 + 阈值告警，明确降级路径（不静默、不打断本轮）。
+        _rf = int(st.get("refresh_fail_n", 0) or 0) + 1
+        st["refresh_fail_n"] = _rf
+        st["refresh_fail_t"] = time.time()
+        if _rf >= 3:
+            log.warning("刷新库连续失败 %d 次（沿用旧对象，已降级 %.0f 分钟）：%r",
+                        _rf, _rf * 5.0, e)
+        else:
+            log.warning("刷新库失败（第 %d 次，沿用旧对象）: %r", _rf, e)
+    else:
+        # 刷新成功：清掉连续失败计数，避免告警残留。
+        if st.get("refresh_fail_n"):
+            st.pop("refresh_fail_n", None)
+            st.pop("refresh_fail_t", None)
 
     # 0.5) 每 30 分钟给本地库做一次完整体检：坏了立刻重建
     #      （2026-11-02 踩过：库变成 malformed 后所有查询全崩，daemon 静默瘫痪）
@@ -833,7 +850,16 @@ def cycle(a, dev, db, st, dry_run=False):
             except Exception as _e:
                 log.debug("candidates 预取失败: %r", _e)
                 _cands_now = None
-            _np = _PD.count_pending(db, max_age_h=PQ.STALE_GIVEUP_H)
+            # 🔴🔴 2026-11-12（DS-04 / HY-03 口径统一·最核心）：
+            #   count_pending 之前用默认 real_total=True（含已回过/冷却中），
+            #   而 candidates() 把冷却/已回/归档/verdict 全滤掉 → 两边差 N 倍。
+            #   实测「待回 19 人但全是冷却中/已回的僵尸（candidates 为空）」→
+            #   空烧 50~59 轮：闸门看到 count=19 以为「有人等」→ 不匹配，
+            #   而这 19 个又全在冷却/已回台账里，candidates() 一个都拿不到 → 死锁。
+            #   修法：改传 real_total=False，与 candidates 同口径（= 本轮真能处理）。
+            #   （clear.py 的 has_dot_now 对应改动由流程层处理，此处只改这一处。）
+            _np = _PD.count_pending(db, real_total=False,
+                                    max_age_h=PQ.STALE_GIVEUP_H)
             # 🔴🔴 2026-11-08 03:26（P0 死锁·第三层：空烧降级）
             #   上面 ①②③ 仍然只是「队列里有没有人」——而现网的真问题是
             #   **队列里那 23~26 个人 100% 定位不到**（翻 3 屏未命中 633 次、
@@ -855,8 +881,11 @@ def cycle(a, dev, db, st, dry_run=False):
                     has_dot2 = True
                     _gate_why = "有 %d 个可立即处理的新待回（空烧 %d 轮）" % (_n_fresh, _zero)
             elif _np is not None and int(_np) > 0:
-                # candidates 为空但 24h 口径 count 说有 —— 说明这些人全在冷却/已回台账里。
-                # 既然 candidates 判「没人可处理」，就不该挡匹配（统一判据）。
+                # 注（2026-11-12 口径统一后）：_np 已是「本轮真能处理」口径，
+                #   与 candidates 基本同源。此处作为**兜底安全网**仍保留：
+                #   candidates 为空但 count(real_total=False) 说还有 ——
+                #   说明差在 candidates 额外的设备存活/状态机过滤，这些不可处理
+                #   就不该挡匹配（统一判据）。
                 has_dot2 = False
                 _gate_why = ("待回 %s 人但全是冷却中/已回的僵尸（candidates 为空）"
                              "→ 不挡匹配" % _np)

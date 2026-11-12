@@ -344,18 +344,63 @@ def _l2_last_is_me(sid, her_ts_ms=None):
         if " 我: " not in last_ln:
             return False          # 末行是她 → 未回
         if her_ts_ms:
-            # 她的最新消息时间 vs L2 末行时间：她更新 → 她又有新话 → 未回
+            # 🔴🔴 2026-11-12（DS-01：分钟字符串比较 → 毫秒精确）
+            #   原实现把 her_ts_ms 折成 "%m-%d %H:%M" **字符串**再和 L2 末行比，
+            #   只有分钟精度。**同一分钟**内她在我发完之后又补一句时，字符串相等
+            #   走不到 `>` 分支 → 误判「已回」→ 漏回（最差失败模式）。
+            #   修法：把 her_ts_ms 折成「分钟桶」（毫秒/60000）与 L2 行做**数值**
+            #   比较（毫秒精确到分钟桶），消除字符串比较的边界歧义。
+            #   同分钟视为**不可判定** → 按保守判「未回」（她有新话的疑点优先：
+            #   漏回比重复回更糟；重复回还有 replied.json/_recently_replied 兜底）。
             try:
-                her_stamp = time.strftime("%m-%d %H:%M", time.localtime(her_ts_ms / 1000.0))
+                her_min = int(float(her_ts_ms) / 60000.0)
+                _y = time.localtime(float(her_ts_ms) / 1000.0).tm_year
             except Exception:
-                her_stamp = ""
+                her_min = None
+                _y = time.localtime().tm_year
             m = re.match(r"^- (\d{2}-\d{2} \d{2}:\d{2}) ", last_ln)
-            if m and her_stamp and her_stamp > m.group(1):
-                return False
+            if m and her_min is not None:
+                try:
+                    l2_min = int(time.mktime(time.strptime(
+                        "%d-%s" % (_y, m.group(1)), "%Y-%m-%d %H:%M")) / 60.0)
+                except Exception:
+                    l2_min = None
+                if l2_min is not None:
+                    if her_min > l2_min:
+                        return False        # 她更新 → 未回
+                    if her_min == l2_min:
+                        return False        # 同分钟不可判定 → 保守未回
+                    # her_min < l2_min → L2 在她之后 → 已回
+                    return True
         return True
     except Exception:
         pass
     return False
+
+
+def _my_last_ts_ms(db, sid):
+    """我方在该会话的最后一条消息时间（毫秒）。取不到返回 0（=未知）。
+
+    🔴🔴 2026-11-12（DS-05：state_of 未传 my_last_ts_ms）
+       verdict.state_of 的「我方末条晚于她末条 → AWAITING」分支依赖
+       my_last_ts_ms，但 candidates() 里两处 state_of 都没传 → 恒 0 → AWAITING
+       永不触发，已回过/等她回的会话被判错状态。
+       修法：抽一个最小读取函数，按 sender==uid 找 chatmsg 里我方末条。
+       失败返回 0，与 state_of 的 0 语义一致，不会误伤。
+    """
+    try:
+        if db is None or not sid:
+            return 0
+        uid = getattr(db, "uid", "") or ""
+        if not uid:
+            return 0
+        last_my = 0
+        for m in db.messages(str(sid), limit=60):
+            if str(getattr(m, "sender", "") or "") == str(uid):
+                last_my = max(last_my, int(getattr(m, "ts", 0) or 0))
+        return last_my
+    except Exception:
+        return 0
 
 
 # 🔴 2026-11-04（用户口径）：进会话后核对身份，最硬的证据是 **sid**。
@@ -365,7 +410,14 @@ _UNREAD_BEFORE = {"set": None}
 
 # 设备存活校验的缓存（见 _device_live_uids）
 _LIVE_CACHE = {"v": None, "ts": 0.0}
-_LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
+# 🔴🔴 2026-11-12（DS-06）：TTL 与 data.imdb.DEVICE_LIVE_TTL_S 统一（默认 120s）。
+#   原来写死 120；改为引用 imdb 的共享常量，两边口径永不失联。
+try:
+    from data import imdb as _IM_TTL
+    _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", str(_IM_TTL.DEVICE_LIVE_TTL_S))
+                        or _IM_TTL.DEVICE_LIVE_TTL_S)
+except Exception:
+    _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
 _UNREAD_CACHE = {"ts": 0.0, "sids": set()}
 
@@ -436,6 +488,11 @@ def _device_live_uids(db):
 
     见 `data/imdb.device_live_uids` 的注释（P0：本地镜像里的「死人」）。
     这里只做一层缓存 + 异常兜底，真正的查询和账号隔离在那里实现。
+
+    🔴🔴 2026-11-12（DS-08 空集判断）：`device_live_uids` 已确认**保持 None 不过滤**
+    （查询成功但 0 会话与查询失败在 `_dev_sql` 层无法区分，返回空 set 会在
+    adb 抖动时误伤全部候选 → 漏回）。因此这里 `if uids:` 缓存非空集合即可，
+    None / 空集都不缓存（下次重查），保持「降级不过滤」的旧行为。
     """
     now = time.time()
     cache = _LIVE_CACHE.get("v")
@@ -991,7 +1048,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         try:
             from brain import sendgate as _SG3
             from brain import verdict as _VD
-            _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True)
+            # 🔴🔴 2026-11-12（DS-05）：补传 my_last_ts_ms —— 否则 verdict 的
+            #   「我方末条晚于她末条 → AWAITING」分支恒不触发（默认 0）。
+            _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True,
+                                my_last_ts_ms=_my_last_ts_ms(db, str(sid)))
             if _vd.state == _VD.ARCHIVED:
                 try:
                     from data import reply_state as _RSa
@@ -1035,8 +1095,19 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         _have = {str(x[0]) for x in out}
         _missing = [s for s in _unread_sids if s not in _have]
         _added = 0
+        # 🔴🔴 2026-11-12（DS-13：对账补入封顶 5 -> 8）
+        #   取舍说明：上限从 5 提到 8，**不放开到无上限** —— 因为：
+        #     · 最终 out 仍会被 `limit`（candidates 调用方传 CAND_SCAN=60）截断，
+        #       且 handle_pending 每轮实际只处理 max_n=5 个，补入 8 个不会冲爆队列；
+        #     · 补入的会话若定位/发送失败会走 mark_skip 冷却（enter_fail / notfound），
+        #       下一轮自然被 should_skip 挡掉，不会反复白烧；
+        #     · 若完全放开（不封顶），设备一旦有几十条积压未读，会全部绕过上游
+        #       过滤硬入队，单轮白烧骤增 —— 这正是「防队列冲爆」要避免的。
+        #   取 8 = 原 5 + 3 余量，兼顾「设备未读多于 5 条时不漏」与「不冲爆」。
+        #   设备未读对账本身仍**不受冷却限制**（它是「设备明说有人等」的最后保证，
+        #   冷却是本地台账，不能反过来掩盖设备真值）—— 保持原意，只调封顶。
         for _s in _missing:
-            if _added >= 5:            # 一次最多补 5 个，别把队列冲爆
+            if _added >= 8:            # 一次最多补 8 个，别把队列冲爆
                 break
             try:
                 _dig = db.session_digest(_s) or {}
@@ -1960,7 +2031,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         try:
             from brain import sendgate as _SG4
             from brain import verdict as _VD4
-            _rv = _SG4.state_of(str(sid), her_ts_ms=float(her_ts or 0), has_human=True)
+            # 🔴🔴 2026-11-12（DS-05）：补传 my_last_ts_ms（见上方注释）。
+            _rv = _SG4.state_of(str(sid), her_ts_ms=float(her_ts or 0), has_human=True,
+                                my_last_ts_ms=_my_last_ts_ms(db, str(sid)))
             restart = (_rv.state == _VD4.PENDING_RESTART)
         except Exception as _e_rv:
             log.debug("重启状态机异常（沿用 age 判据）: %r", _e_rv)

@@ -59,6 +59,11 @@ _BELL_ROW_RE = re.compile(r"奇遇铃.{0,4}稍后")
 def dots(snap):
     """当前屏带红点的会话行（过滤掉不是聊天的功能入口）。
 
+    ⚠️⚠️ 2026-11-12（HY-12）：**本函数在 Soul 6.41.0 上实测恒空，仅作兜底**。
+      目标来源已改为库（`_lib_unread_sids`），屏幕红点判据保留只为万一某天
+      res-id `unread_msg_number` 回来了也不漏。任何依赖 dots() 计数/结果的
+      逻辑都应按「恒空」来写，别把它当主判据。
+
     ⚠️⚠️ 2026-11-08 实测：**这个函数在当前 Soul 6.41.0 上恒返回空**。
       `Row.has_dot` 依赖行内 res-id `unread_msg_number`（chatlist.py:63），
       而连续 4 轮 dump 里该 id **出现 0 次**（全屏只有底栏的 me_red_point /
@@ -194,6 +199,32 @@ def _rows_for_lib(snap, db, lib_sids, handled=None, limit=0):
                 out.append((r, sid))
                 break
     return out
+
+
+def _prune_dead_lib_sids(db, lib_sids, claimed):
+    """剔除设备库里**已不存在**的未读 sid，避免每轮反复空转。
+
+    🔴 2026-11-12（HY-01）：清红点目标来自库（_lib_unread_sids），但屏上认领不到时
+      若静默落空，会反复走「双击跳锚点」分支空转（实测：库 5 个未读 / 屏红点 0 /
+      进 0 人）。这里只剔除**设备库已查不到**的 sid —— 人已删号/会话已消失，
+      它们永远不会再被认领到，留着只会每轮白烧。
+      仍存活但只是没渲染到当前屏的 sid **保留**（真实目标，列表刷新后能认领），
+      不误杀、不改变真实待回口径。
+    """
+    if not lib_sids or db is None:
+        return
+    removed = []
+    for sid in list(lib_sids):
+        if sid in claimed:
+            continue
+        try:
+            if db.session(sid) is None:
+                lib_sids.remove(sid)
+                removed.append(sid)
+        except Exception:
+            continue
+    if removed:
+        log.info("剔除设备库已不存在的未读 sid %s（避免反复空烧）", removed)
 
 
 def to_list(actor, tries=3):
@@ -546,8 +577,8 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         #   改后：先用库里的未读 sid 清单映射成屏幕行（库定目标、屏幕定坐标）；
         #        库拿不到 / 屏上认领不到，才退回原红点判据。
         #   ⚠️ MAX_DOUBLE=5 与「只双击不滑动」是用户铁律，本改动**未触碰**。
-        lib_pairs = _rows_for_lib(snap, db, [s for s in lib_sids if s not in handled_sids],
-                                  handled=handled)
+        _want = [s for s in lib_sids if s not in handled_sids]
+        lib_pairs = _rows_for_lib(snap, db, _want, handled=handled)
         if lib_pairs:
             r = lib_pairs[0][0]
             _sid_hint = lib_pairs[0][1]
@@ -555,6 +586,11 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                      _sid_hint, r.center[1], r.nickname,
                      len([s for s in lib_sids if s not in handled_sids]))
         else:
+            # 🔴 2026-11-12（HY-01）：本次「认领不到」的库目标里，设备库已查不到
+            #   的 sid 直接剔除（幽灵会话，永远不会被认领到，留着每轮白烧）；
+            #   仍存活但只是没渲染到当前屏的**保留**（列表刷新后能认领）。
+            #   handled_sids = 本轮已处理过的，不算「认领不到」，跳过不剔。
+            _prune_dead_lib_sids(db, lib_sids, handled_sids)
             r = todo[0] if todo else None
             _sid_hint = None
         if r is None:
@@ -636,8 +672,14 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         #    不是 ConversationActivity → 通用「进会话」路径 100% 校验失败白烧。
         #    点击前识别跳过（reuse_snap=True：没做任何 UI 动作，列表没变），
         #    只允许 bell 专用路径进。默认开；设 SOUL_SKIP_BELL_ROW=0 可关。
-        if os.environ.get("SOUL_SKIP_BELL_ROW", "1") == "1" and \
-                _BELL_ROW_RE.search(str(r.nickname or "")):
+        # 🔴 2026-11-12（HY-07）：判据改用整行文本 r.blob，不再只认 r.nickname。
+        #    r.nickname 在 chatlist 修昵称识别后才可靠；早期帧里该行的 name res-id
+        #    缺失时 nickname 会退化成消息预览（如「有新朋友等你和Ta开启对话」），
+        #    正则匹配不到 → 跳过失效 → 白烧。blob 含昵称+预览+标签，覆盖全部形态。
+        _bell_hit = (os.environ.get("SOUL_SKIP_BELL_ROW", "1") == "1" and (
+            _BELL_ROW_RE.search(str(r.blob or ""))
+            or _BELL_ROW_RE.search(str(r.nickname or ""))))
+        if _bell_hit:
             log.info("跳过「奇遇铃-稍后再聊」行：它是入口不是会话，只允许 bell 专用路径进")
             reuse_snap = True
             continue
@@ -744,7 +786,16 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
     # 🔴 2026-11-08（改动 4：给 daemon 一个「该回人数」指标）
     #   用户要能一眼看出「现在有 27 个人在等我回」。库判定，不依赖屏幕。
     #   放进 out 里让调用方（daemon）直接取用，同时打一行日志。
-    out["pending"] = count_pending(db)
+    # 🔴 2026-11-12（HY-04）：sweep 结束日志的 count_pending 原来**没传 max_age_h**
+    #   且用默认 real_total=True（7 天窗口 + 含已回/冷却）→ 虚高 → 假红点兜底
+    #   `_pend <= 0` 几乎不成立。改传 real_total=False + max_age_h=STALE_GIVEUP_H，
+    #   与候选队列同一口径（只数「本轮真能处理」的），兜底才能正确生效。
+    try:
+        from brain import pendingq as _PQG
+        _max_age = _PQG.STALE_GIVEUP_H
+    except Exception:
+        _max_age = None
+    out["pending"] = count_pending(db, real_total=False, max_age_h=_max_age)
     log.info("清红点结束：进 %d 人 / 回 %d 条 / 剩余角标=%s / %s",
              out["entered"], out["replied"], out["left"], pending_summary(db))
 
@@ -830,9 +881,12 @@ def has_dot_now(actor, db=None):
     except Exception:
         _max_age = None
     try:
-        n_lib = count_pending(db, max_age_h=_max_age) if db is not None else -1
+        # 🔴 2026-11-12（HY-03）：count_pending 默认 real_total=True（含已回过/冷却）
+        #   → 恒 >0 → 上层「有红点就不匹配」永远挡匹配。改 real_total=False：
+        #   只数本轮真能处理的（与候选队列同口径），僵尸积压不再挡匹配。
+        n_lib = count_pending(db, real_total=False, max_age_h=_max_age) if db is not None else -1
     except TypeError:
-        # 兼容旧签名（count_pending(db) 没有 max_age_h）
+        # 兼容旧签名（count_pending(db) 没有 max_age_h / real_total）
         n_lib = count_pending(db) if db is not None else -1
     if n_lib >= 0:
         if n_lib > 0:

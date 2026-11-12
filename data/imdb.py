@@ -754,6 +754,23 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
                         "（历史行全部保留）", _mg[0], _mg[1])
         else:
             log.warning("设备库缩水 → 增量合并失败，本轮继续用本地镜像（可能看不到最新消息）")
+        # 🔴🔴 2026-11-12（DS-07：缩水合并分支缺 wal_checkpoint(TRUNCATE)）
+        #   正常 sync 的 _pull_all 尾部（见 830 行）会在合并后做
+        #   `PRAGMA wal_checkpoint(TRUNCATE)`，但**缩水分支**直接 return local，
+        #   不经过它 —— 于是 `_merge_device_into_mirror` 写入主库后遗留的
+        #   -wal/-shm 若比主库旧，后续只读连接会按旧 shm 截断 wal 尾部，
+        #   把刚并进镜像的新消息「看没了」（与 2026-11-04 必回盲区同根因）。
+        #   修法：与 _pull_all 一致，缩水合并后也 checkpoint 一次（幂等、只读安全）。
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(str(local), timeout=5)
+            try:
+                _r = _c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                log.info("缩水合并后 wal checkpoint -> %r", _r)
+            finally:
+                _c.close()
+        except Exception as _e_cp:
+            log.warning("缩水合并后 wal checkpoint 失败（只影响读到 wal 尾部）: %r", _e_cp)
         return local
 
     def _pull_all():
@@ -972,6 +989,15 @@ def _parse_kv(txt):
     return out
 
 
+# 🔴🔴 2026-11-12（DS-06：live-uid 缓存 TTL 统一）
+#   设备存活 uid 集合的缓存时长。pendingq._device_live_uids 用它做 120s 缓存，
+#   data.pending（should_reply / unread_sids）按设计**现查**（每次新鲜，保证
+#   清红点目标准确）—— 两边共用**同一个 TTL 常量**，避免将来调时长只改一处
+#   导致两边口径漂移。pending.py 侧不缓存，仅引用此常量作为「若加缓存则用同一
+#   时长」的约定。
+DEVICE_LIVE_TTL_S = 120.0
+
+
 def device_live_uids(device, uid, timeout=15):
     """**当前账号自己的设备库**里还存在的 toUserId 集合。取不到返回 None。
 
@@ -1017,8 +1043,21 @@ def device_live_uids(device, uid, timeout=15):
         if s and s.lstrip("-").isdigit():
             out.add(s)
     if not out:
-        # 空集合有两种可能：真的一个人都没有 / 查询失败。
-        # 前者不该让整轮待回被清空，所以统一当「取不到」处理。
+        # 🔴🔴 2026-11-12（DS-08 空集判断 · 最终结论：**保持 None，不过滤**）
+        #   空集合有两种可能：真的一个人都没有 / 查询失败。
+        #   修法原本想把「查询成功但 0 会话」与「查询失败」区分开：成功返回空 set、
+        #   失败返回 None，让调用方在「设备真 0 会话」时过滤掉全部镜像僵尸。
+        #   —— 但做不到，根因在 `_dev_sql`（本文件 903）：它用 `_clean()` 把
+        #   错误标记统一洗成 ""，于是**「0 行成功」和「查询失败」都返回 ""**，
+        #   到这一层根本无法区分。
+        #   若强行返回空 set：一次 adb 抖动/查询失败（同样得到 ""）会被当成
+        #   「设备真没会话」→ 调用方过滤掉**全部**候选 → 漏回（最差失败模式）。
+        #   权衡后**宁可保持 None（旧行为=降级不过滤）**：设备缩水 962 次的主因是
+        #   「设备仍有很多会话，只是比镜像少」，device_live_uids 返回的是**非空**
+        #   集合（仅缺死人）→ 过滤依然生效；真正的「0 会话」是罕见边缘，不值得
+        #   为它冒「一次 adb 抖动就漏回全部」的风险。
+        #   HY-13 已把同一设备存活校验补到 unread_sids()（清红点目标源），
+        #   常见缩水场景已被覆盖；此处保留旧行为并留档。
         return None
     return out
 
