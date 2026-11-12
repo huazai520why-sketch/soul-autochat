@@ -520,8 +520,14 @@ def send(actor, dev, text, sid=""):
     if not inp.tap_send(actor, settle=1.6):
         inp.clear()
         return False, "找不到发送按钮"
-    if not inp.sent_ok(actor, text, timeout=6):
-        return False, "发送后输入框未清空"
+    # 🔴 2026-11-12（F-01）：sent_ok 是三态（ok/unknown/residual，见 hands/input.py）。
+    #   只有 residual（输入框还有字 = 明确没发）才算失败；unknown（转场帧读不到
+    #   输入框，大概率已发）按已发记账，避免「实际已发却被判失败」烧匹配次数。
+    _ok = inp.sent_ok(actor, text, timeout=6)
+    _why = getattr(inp, "last_reason", "") or ""
+    if (not _ok) and _why == "residual":
+        return False, "发送后输入框未清空(残留)"
+    # ok 或 unknown（大概率已发）→ 按已发记账
     # 开场白也是自己写的库变化，必须抑制（否则匹配刚发完就被自己的写入打断）
     try:
         from data import watch as _W

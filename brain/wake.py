@@ -353,6 +353,7 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
             continue            # 对方在等我 -> 交给必回，不唤醒
         # 跟进阶梯接线（§104-B1）：已归档 / 超 72h 归档态 → 不唤醒；
         #    不主动 set_archived（归档写入由 pendingq 负责），整段降级放行。
+        _her_ts = 0
         try:
             if SG is not None and SG.ON:
                 if str(sid) in _arch:
@@ -366,6 +367,21 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
                         continue
         except Exception:
             pass            # 拿不到 her_ts / 台账状态机异常 → 不拦（降级放行）
+        # 🔴 2026-11-12（F-02）：跟进阶梯里 FOLLOWING/AWAITING（她正在等我回 /
+        #    我在跟进她）→ 不唤醒。原来 candidates() 只滤 ARCHIVED，到 send_wake
+        #    的 SG.allow 才拦，然后 _bump_miss 把「额度已满/等她回」错计成「唤不醒」
+        #    → c<uid>+1 + 24h 冷却，3 次后对仍存活的真人永久放弃（实测
+        #    「唤醒被跟进阶梯拦截 following/awaiting 65 次」）。同款 try/except
+        #    降级放行：拿不到 state → 不拦。
+        try:
+            if SG is not None and SG.ON and _her_ts:
+                _st = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True)
+                _stn = getattr(_st, "state", "")
+                if _stn in (V.FOLLOWING, V.AWAITING):
+                    log.info("唤醒候选跳过 sid=%s（state=%s，不唤醒）", sid, _stn)
+                    continue
+        except Exception:
+            pass            # 台账状态机异常 → 不拦（降级放行）
         out.append(Candidate(sid, s.to_uid, n, last_ts, last.text, side,
                              kws=_kw_list(db, sid, db.uid)))
         if len(out) >= limit:
@@ -536,20 +552,39 @@ def send_wake(actor, dev, cand, text, db=None):
             from brain import pendingq as _PQ
             if not _PQ._session_matches(actor, db, cand.sid):
                 # 🔴 2026-11-12（HY-15）：`_session_matches` 失败先做**对话页标题昵称**
-                #   二次确认（昵称一致即放行）。`_session_matches` 第一顺位是未读清零
-                #   差分，进错人时给 False，但**目标会话没有未读**时返回 None 走文本
-                #   兜底，短消息在库里撞车也会返回 False → 误判串台 → 白烧+冷却。
-                #   昵称一致（`_nick_matches` 返回 True）说明标题就是目标人，
-                #   直接放行；否则维持 fail-closed 不发。
+                #   二次确认。`_session_matches` 第一顺位是未读清零差分，进错人时给
+                #   False，但**目标会话没有未读**时返回 None 走文本兜底，短消息在库里
+                #   撞车也会返回 False → 误判串台 → 白烧+冷却。
+                # 🔴 2026-11-12（F-03）：昵称一致只是**必要**条件，不能单独放行 ——
+                #   同名/近名联系人标题一致即串台。昵称放行前叠加「库内 sid 与目标
+                #   sid 一致」校验：读当前会话气泡，用 db.digest_matches 确认屏幕会话
+                #   就是 cand.sid；确认不了 sid → 维持 fail-closed 不放行。
                 _released = False
                 try:
                     _nn = _PQ.nick_of(db, cand.sid, cand.uid)
                     if _nn:
                         _nm = _PQ._nick_matches(actor, _nn)
                         if _nm is True:
-                            log.info("唤醒身份校验失败但对话页昵称一致（%r）→ 放行 sid=%s",
-                                     _nn, cand.sid)
-                            _released = True
+                            _bs = []
+                            try:
+                                from eyes import chat as _CH
+                                _png = actor.dev.screencap()
+                                _bs = [t for t, _sd, _it in _CH.bubbles(_png)
+                                       if _sd in ("her", "me") and len(t) >= 2]
+                            except Exception as _be:
+                                log.debug("F-03 读当前会话气泡失败（不放行）: %r", _be)
+                            _sid_ok = False
+                            if _bs:
+                                try:
+                                    _sid_ok = bool(db.digest_matches(cand.sid, _bs, min_len=2))
+                                except Exception as _de:
+                                    log.debug("F-03 sid 校验异常（不放行）: %r", _de)
+                            if _sid_ok:
+                                log.info("唤醒身份校验失败但昵称一致且库内 sid 确认（%r）→ 放行 sid=%s",
+                                         _nn, cand.sid)
+                                _released = True
+                            else:
+                                log.warning("唤醒昵称一致但无法确认库内 sid=%s → 不放行", cand.sid)
                 except Exception as _e:
                     log.debug("唤醒昵称二次确认异常（按失败处理）: %r", _e)
                 if not _released:
@@ -591,8 +626,12 @@ def send_wake(actor, dev, cand, text, db=None):
                                     _pg)
                 except Exception as _e:
                     log.debug("跟进阶梯拦截后回列表异常（已尽力）: %r", _e)
-                # 记失败台账：24h 冷却 + 放弃计数，避免每轮重复选中同一人
-                _bump_miss(cand.uid, "跟进阶梯拦截(%s)" % _d.state)
+                # 🔴 2026-11-12（F-02）：SG.allow 拦截 = 额度/跟进阶梯问题（follow/
+                #   awaiting），**不是「找不到人」** → 不记 _bump_miss（否则 c<uid>+1
+                #   + 24h 冷却，3 次后对仍存活的真人永久放弃）。只记日志 + back +
+                #   to_chatlist（HY-08 已保留）。候选侧已在 candidates() 提前滤掉
+                #   FOLLOWING/AWAITING，走到这里说明是轮内状态变化/边界情况，
+                #   本轮不发送，但**不递增放弃计数**，下轮候选仍会回来。
                 return False, "跟进阶梯拦截(%s)" % _d.state
     except Exception:
         pass
@@ -609,10 +648,17 @@ def send_wake(actor, dev, cand, text, db=None):
         actor.hand.back(settle=1.0)
         _bump_miss(cand.uid, "找不到发送按钮")
         return False, "找不到发送按钮"
-    if not inp.sent_ok(actor, text, timeout=6):
+    # 🔴 2026-11-12（F-01）：sent_ok 是三态（ok/unknown/residual，见 hands/input.py）。
+    #   只有 residual（输入框还有字 = 明确没发）才算失败并记 _bump_miss；
+    #   unknown（转场帧读不到输入框，大概率已发）按已发记账，避免「实际已发却
+    #   被记失败」→ 次日重复唤醒/重复发消息。
+    _ok = inp.sent_ok(actor, text, timeout=6)
+    _why = getattr(inp, "last_reason", "") or ""
+    if (not _ok) and _why == "residual":
         actor.hand.back(settle=1.0)
-        _bump_miss(cand.uid, "发送后输入框未清空")
-        return False, "发送后输入框未清空"
+        _bump_miss(cand.uid, "发送后输入框未清空(残留)")
+        return False, "发送后输入框未清空(残留)"
+    # ok 或 unknown（大概率已发）→ 按已发记账
 
     # 🔴 自己发消息也会写库 → 不抑制的话，唤醒循环里「库有变化」立刻中断，
     #    每次唤醒只能发 1 个人就退出（实测日志：唤醒 OK 后马上「检测到新消息」）。

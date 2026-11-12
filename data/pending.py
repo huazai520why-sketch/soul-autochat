@@ -278,6 +278,16 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
     except Exception as _e:
         log.debug("pending 统计：设备存活校验跳过（%r）", _e)
 
+    # 🔴 2026-11-12 夜班修复（D1）：归档集合一次性取（与 pendingq.candidates() C4 口径一致）。
+    #   改前 should_reply() 完全没有归档过滤，而 candidates() 有（879-903 行）→ 两条统计
+    #   路径口径不一致：日志「待回 N 人」虚高（实测 24h 窗口 39 次「全是冷却/已回僵尸，
+    #   但 candidates 为空、count_pending 仍 >0」）。取不到就不过滤（保持旧行为）。
+    try:
+        from data import reply_state as _RS
+        _archived = set(str(x) for x in _RS.archived_sids())
+    except Exception:
+        _archived = set()
+
     out = []
     for r in rows:
         try:
@@ -303,6 +313,24 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
         sender = str(getattr(last, "sender", "") or "")
         if db.uid and sender == str(db.uid):
             continue                        # 末条是我发的 → 等她说，不回
+        # 🔴 2026-11-12 夜班修复（D1）：归档 ≠ 拉黑 —— 与 pendingq.candidates() 879-903
+        #   同款 C4 过滤。她再发人话（ts > 台账水位线）→ 解除归档、重新计入待回；
+        #   否则跳过（不回、不唤醒、不计待回）。放在 sender 检查之后：末条是我的
+        #   本来就会 continue，归档判定只对「她发的」有意义。
+        if str(sid) in _archived:
+            try:
+                from eyes import sysmsg as _SM
+                from data import reply_state as _RS2
+                _lt = (getattr(last, "text", "") or "").strip()
+                _human_ok = (_SM.is_human(_lt, getattr(last, "msg_type", None), uid=to_uid)
+                             if _lt else
+                             int(getattr(last, "msg_type", 0) or 0) not in (27, 35))
+                _is_new_her = (str(sender) != str(db.uid) and _human_ok
+                               and int(getattr(last, "ts", 0) or 0) > _RS2.her_ts_of(str(sid)))
+                if not _is_new_her:
+                    continue
+            except Exception:
+                continue
         her_ts = int(getattr(last, "ts", 0) or 0)
         if her_ts and her_ts < cutoff:
             continue                        # 超期（她早忘了）
@@ -457,6 +485,12 @@ def summary(db, max_age_h=None):
         _b = {V.PENDING: 0, V.FOLLOWING: 0, V.AWAITING: 0,
               V.ARCHIVED: 0, V.NO_HUMAN: 0}
         for x in items:
+            # 🔴 2026-11-12 夜班修复（D7）：这里未传 my_last_ts_ms → sendgate.state_of 里
+            #   or 0.0 → AWAITING 桶恒 0（仅统计口径）。
+            #   取舍：pending.py 属 data 层，只依赖 core/data.imdb，**不能** import
+            #   brain.pendingq 的 _my_last_ts_ms（会破坏单向依赖）。本文件也无等价辅助
+            #   函数 → 按约定加注释留待后续，不大改。要补需在 data 层自建「我方末条时间」
+            #   读取（走 db.messages 按 sender==uid 取），不影响本段其余统计。
             v = SG.state_of(str(x.sid), her_ts_ms=x.her_ts, has_human=True)
             _st = getattr(v, "state", "")
             if _st == V.PENDING_RESTART:

@@ -71,7 +71,12 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
 
     # 🔴 2026-11-12（GL-02 修复）：批内去重 —— 旧代码对每个候选只对历史
     #   recent 判重，候选之间互不比较 → 同批相似句重复/串台（flow 47 / pendingq 7，
-    #   共 54 次）。`_dedup_similar()`（reply.py:707）定义了但从未被调用（死代码）。
+    #   共 54 次）。`_dedup_similar()`（reply.py:727）定义了但从未被调用（死代码）。
+    #   ⚠️ 死代码标注：`_dedup_similar`（2-gram 0.62 重叠，阈值比 gate.dup_hit 宽松）
+    #   在 reply.py:727 定义但从未被调用。若将来误接入，会误删**不同角度**的句子
+    #   （其 0.62 阈值过宽）。本文件（brain/engine/__init__.py）不引用它 ——
+    #   **请勿在 reply.py 里把 `_dedup_similar` 接回调用链**；批内去重一律走
+    #   gate.dup_hit（本文件 82-84 行）。函数保留不删（避免影响 import）。
     #   最小侵入：新增局部 pool，已通过的句子并入 pool，后续候选与 pool 用
     #   gate.dup_hit 判重，同批内相似句只保留一条。
     #   保证「至少留一条」：pool 从空开始，首个通过 check 的候选必然留下，
@@ -109,7 +114,9 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
             {"role": "user",
              "content": "换一个具体画面。不超过 12 字。可以说半句，不用完整。"
                         "如果还是想问，就问「我要不要给你点啥」这种给得起的东西，"
-                        "别问她会怎么想。"}]
+                        "别问她会怎么想。"
+                        "**注意：不要说「在呢」「刚看到」「嗯嗯，在的」这类零信息应答，"
+                        "那是灭火句，会让她觉得我在敷衍。**"}]
     raw2 = llm.ark_chat(msgs, her_msg=her_msg, sid=sid, temperature=0.8)
     if raw2:
         for c in gate.to_messages(raw2, 1):

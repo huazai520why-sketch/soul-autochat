@@ -102,11 +102,12 @@ class Input(object):
             if n is None:
                 log.warning("第%d次：找不到输入框", i + 1)
                 return False, None
-            if i == 0:
-                actor.hand.tap_node(n, settle=0.7)
-            else:
-                self.clear()
-                time.sleep(0.3)
+            # 🔴 2026-11-12（F-04）：首轮也必须先清空。原来首轮只 tap 不 clear，
+            #   若框内有残留，send_keys 会**追加**而非替换，校验用子串判定仍通过 →
+            #   发出「残留+新文本」的拼接消息。现在每轮（含首轮）都先 clear。
+            actor.hand.tap_node(n, settle=0.7)
+            self.clear()
+            time.sleep(0.3)
             self.type_text(text, settle=0.9)
             snap2 = actor.snap()
             got = self.box_text(snap2)

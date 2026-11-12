@@ -224,8 +224,11 @@ def _mark_replied(uid, sid=None, text=None):
     try:
         _REPLIED[key] = {"text": (text or "")[:120], "ts": time.time()}
         REPLIED_FILE.parent.mkdir(parents=True, exist_ok=True)
-        REPLIED_FILE.write_text(json.dumps(_REPLIED, ensure_ascii=False),
-                                encoding="utf-8")
+        # 🔴 2026-11-12 夜班修复（D6）：原子写（tmp + os.replace），与 reply_state._save
+        #   同款。改前 write_text 直接覆盖，进程崩溃留半截 JSON → 台账全丢。
+        _tmp = REPLIED_FILE.with_name(REPLIED_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(_REPLIED, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(_tmp), str(REPLIED_FILE))
     except Exception:
         pass
 
@@ -294,7 +297,11 @@ def _load_idfail():
 def _save_idfail():
     try:
         IDFAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
-        IDFAIL_FILE.write_text(json.dumps(_IDFAIL, ensure_ascii=False), encoding="utf-8")
+        # 🔴 2026-11-12 夜班修复（D6）：原子写（tmp + os.replace），与 reply_state._save
+        #   同款。改前 write_text 直接覆盖，进程崩溃留半截 JSON → 台账全丢。
+        _tmp = IDFAIL_FILE.with_name(IDFAIL_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(_IDFAIL, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(_tmp), str(IDFAIL_FILE))
     except Exception as e:
         log.debug("存 idfail 失败: %r", e)
 
@@ -666,7 +673,11 @@ def _save_skip(d):
     import json
     try:
         SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SKIP_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
+        # 🔴 2026-11-12 夜班修复（D6）：原子写（tmp + os.replace），与 reply_state._save
+        #   同款。改前 write_text 直接覆盖，进程崩溃留半截 JSON → 台账全丢。
+        _tmp = SKIP_FILE.with_name(SKIP_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
+        os.replace(str(_tmp), str(SKIP_FILE))
     except Exception as e:
         log.warning("保存失败台账异常: %r", e)
 
@@ -679,7 +690,10 @@ def should_skip(sid, txt, hours=SKIP_HOURS):
     rec = _load_skip().get(str(sid)) or {}
     if not rec:
         return False
-    if (rec.get("text") or "").strip() != (txt or "").strip():
+    # 🔴 2026-11-12 夜班修复（D3）：mark_skip 存的是 (txt or "")[:120]，这里必须同样截断
+    #   到 [:120] 才能比对。改前用完整 txt 比 → rec.text != txt 恒 True → 冷却永不命中，
+    #   末条 >120 字的会话搜索失败后每轮反复白烧（30~50s/次）。
+    if (rec.get("text") or "").strip() != (txt or "")[:120].strip():
         return False                  # 末条变了 = 她说了新话，重新试
     age = time.time() - float(rec.get("ts") or 0)
     h = float(rec.get("hours") or hours)      # 台账里记的冷却时长优先（超时只罚 10 分钟）
@@ -923,6 +937,20 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     _dig = {}
                 _d_txt = (_dig.get("text") or "").strip()
                 _d_ts = int(_dig.get("ts") or 0)
+                # 🔴 2026-11-12 夜班修复（D5）：设备未读硬放行前先过系统文本过滤。
+                #   改前该分支 out.append + continue 跳过了后面 996-1016 的 SYS_TEXTS /
+                #   is_human 系统文本过滤 → 可能把系统卡（如「互相关注后即可…」）当
+                #   「她的人话」硬入队（C5/C8 违规）。is_human 判定与主循环同款。
+                if _d_txt:
+                    try:
+                        from eyes import sysmsg as _SM2
+                        if not _SM2.is_human(_d_txt, getattr(last, "msg_type", None),
+                                             uid=to_uid):
+                            log.info("设备未读硬放行·系统文本 sid=%s uid=%s 摘要=%r → 跳过（C5/C8）",
+                                     sid, to_uid, _d_txt[:16])
+                            continue
+                    except Exception:
+                        pass
                 if _d_txt and _d_ts and not _recently_replied(
                         to_uid, sid=sid, text=_d_txt, her_ts_ms=_d_ts):
                     log.info("设备未读硬放行·镜像滞后 uid=%s sid=%s 摘要=%r"
@@ -1109,6 +1137,13 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         for _s in _missing:
             if _added >= 8:            # 一次最多补 8 个，别把队列冲爆
                 break
+            # 🔴 2026-11-12 夜班修复（D4）：归档会话不补入（C4）。
+            #   改前这段对账补入循环没有任何归档过滤 —— 归档会话若设备 unReadCount>0
+            #   会被强制补入队列，违背「归档不回、不唤醒、不计待回」（主循环 879-903 有过滤）。
+            #   _archived 是 candidates() 开头的归档集合，同一函数作用域内可直接用。
+            if str(_s) in _archived:
+                log.info("设备未读对账：sid=%s 已归档（C4）→ 不补入", _s)
+                continue
             try:
                 _dig = db.session_digest(_s) or {}
             except Exception:

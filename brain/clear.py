@@ -887,7 +887,10 @@ def has_dot_now(actor, db=None):
         n_lib = count_pending(db, real_total=False, max_age_h=_max_age) if db is not None else -1
     except TypeError:
         # 兼容旧签名（count_pending(db) 没有 max_age_h / real_total）
-        n_lib = count_pending(db) if db is not None else -1
+        # 🔴 2026-11-12（F-05）：回退分支也显式传 real_total=False + 窗口，
+        #   否则默认 real_total=True + 7 天窗口 → 虚高「恒有红点」→ 回到历史死锁。
+        n_lib = (count_pending(db, real_total=False, max_age_h=_max_age)
+                 if db is not None else -1)
     if n_lib >= 0:
         if n_lib > 0:
             # 库里有真人待回 → 一定「有红点」，不管屏幕渲染成什么样

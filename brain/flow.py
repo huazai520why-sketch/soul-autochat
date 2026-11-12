@@ -413,11 +413,18 @@ def _slow_path(actor, db, out, dry_run):
             out.sid = cands[0][0]
             log.info("[%s] 反查唯一命中 sid=...%s", out.nick, str(out.sid)[-8:])
         else:
-            # 多命中：宁可不猜，留日志供排查（对齐 casepack「宁可不写不可写错人」）
+            # 🔴 2026-11-12 夜班修复（D2）：多命中宁可不写，不可写错人（契约 v1.2 落点#3）
+            #   改前：`out.sid = cands[0][0]` —— 多命中大概率是撞车短句，取第一可能进错会话，
+            #   把甲的历史话发给乙（串台）。违反「宁可不写不可写错人」。
             _top = [str(c[0])[-8:] for c in cands[:5]]
-            log.warning("[%s] 反查多命中 %d 个（%s）→ 不猜，取第一但标记待人工确认",
+            log.warning("[%s] 反查多命中 %d 个（%s）→ 放弃，不进错会话",
                         out.nick, len(cands), _top)
-            out.sid = cands[0][0]
+            out.err = "反查多命中，放弃"
+            try:
+                actor.hand.back(settle=0.9)
+            except Exception:
+                pass
+            return out
     else:
         out.err = "反查不到 sessionId"
         log.warning("[%s] %s", out.nick, out.err)

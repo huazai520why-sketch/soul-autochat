@@ -74,7 +74,12 @@ ARK_MODEL = (os.environ.get("SOUL_ARK_MODEL_DIRECT")
 BRAIN_TIMEOUT = float(os.environ.get("SOUL_BRAIN_TIMEOUT", "40"))
 
 # 本地/云端分析模型
-LOCAL_URL = os.environ.get("SOUL_LOCAL_URL", "http://127.0.0.1:11434/v1/chat/completions")
+# 🔴 2026-11-12（GL-05 → A5 修复）：LOCAL_URL 默认仍指向 127.0.0.1:11434，但 Ollama
+#   实际跑在本机 192.168.10.210:11434（与下方 OLLAMA_URL 同主机，GL-05 已改）。
+#   LOCAL_URL 仅用于 ANALYZE_BACKEND=openai 分支（analyze() 333-335），非默认路径
+#   （默认走 ollama_chat → OLLAMA_URL）。同步默认值保证「切换到 openai 分支」时不至于
+#   又连到错误的 localhost；**保留 SOUL_LOCAL_URL 环境变量覆盖逻辑不变**（本行读取原样）。
+LOCAL_URL = os.environ.get("SOUL_LOCAL_URL", "http://192.168.10.210:11434/v1/chat/completions")
 LOCAL_MODEL = os.environ.get("SOUL_LOCAL_MODEL", "qwen3.5:9b-q4_K_M")
 LOCAL_KEY = os.environ.get("SOUL_LOCAL_KEY", "")
 LOCAL_TIMEOUT = float(os.environ.get("SOUL_LOCAL_TIMEOUT", "60"))
