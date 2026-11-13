@@ -998,7 +998,10 @@ def cycle(a, dev, db, st, dry_run=False):
                 st["last_match"] = time.time()
                 lock.touch("matched")
                 last_res = res or ""
-                if res == "fail" or res is False:
+                # 🔴 2026-11-13 修复 HY-05（P2 死代码）：do_match 早已只返回字符串
+                #   （"fail"/"matched"/…），从不返回 False —— `or res is False` 恒假，
+                #   是残留旧判断，混淆熔断语义。只保留 `res == "fail"`。
+                if res == "fail":
                     n_fail += 1
                     st["match_fail"] = int(st.get("match_fail", 0)) + 1
                     if st["match_fail"] >= 2:

@@ -65,13 +65,42 @@ def write_pid(pid):
     PID_FILE.write_text(str(pid), "utf-8")
 
 
+def _real_daemon_pids():
+    """反查当前真正存活的 `run.py daemon` 进程 pid（跨会话可靠）。
+
+    🔴 2026-11-13 修复 HY-01（daemon 反复重启循环，P0）：
+       watchdog 原来用 `daemon.pid` 文件判活，但该文件被两条启动路径
+       竞争写入 —— watchdog 的 `subprocess.Popen` 子进程（锁竞争失败会秒退）
+       与 ps1/daemon 自身的 `os.getpid()` 不是同一个进程，导致 pid 记账错配：
+       watchdog 记的 pid 是「已死的子进程」，真 daemon 持着锁却没被记。
+       改用 CIM 反查命令行含 `run.py daemon` 的进程，跨会话可见、不依赖 pid 文件。
+    """
+    try:
+        import re as _re
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+             "Where-Object { $_.CommandLine -match 'run\\.py\\s+daemon' } | "
+             "ForEach-Object { $_.ProcessId }"],
+            capture_output=True, timeout=30)
+        out = (r.stdout or b"").decode("utf-8", "replace")
+        return [int(x) for x in _re.findall(r"\d+", out)]
+    except Exception as e:
+        log.warning("反查 daemon pid 失败: %r", e)
+        return []
+
+
 def daemon_alive():
-    pid = read_pid()
-    if pid and lock._alive(pid):
-        return True, "pid=%s 活着" % pid
+    # 🔴 2026-11-13 修复 HY-01：**锁优先** —— lock 被 owner 持有 = 真 daemon 在跑，
+    #   不信 daemon.pid 文件（会被 watchdog 的临时子进程污染成死 pid）。
     busy, info = lock.status()
     if busy:
-        return True, "锁被 pid=%s 持有" % info.get("pid")
+        opid = info.get("pid")
+        return True, "锁被 pid=%s 持有" % opid
+    # 锁空时再用 pid 文件兜底（旧 pid 还在跑但锁被误清的罕见场景）
+    pid = read_pid()
+    if pid and lock._alive(pid):
+        return True, "pid=%s 活着（锁空，疑似未持锁）" % pid
     if pid:
         return False, "pid=%s 已死" % pid
     return False, "没有 pid 记录"
@@ -85,30 +114,35 @@ def heartbeat_age():
 
 
 def start_daemon():
-    """拉起 daemon（分离进程，输出落 logs/daemon.out）。
+    """拉起 daemon —— **统一走 `tools/start_daemon.ps1`**（生产唯一入口）。
 
-    🔴 2026-11-03 修复：原来直接起 `guard/daemon.py`，绕过了 `run.py` 的
-    `_load_model_env()` —— 被看门狗拉起的实例会用**默认模型**（豆包），
-    与手动重启的 deepseek 不一致，而且日志里看不出来。
-    现在统一走 `run.py daemon`，与生产入口完全一致。
+    🔴 2026-11-13 修复 HY-01（daemon 反复重启循环，P0）：
+       原来 watchdog 自己 `subprocess.Popen([py,"-u","run.py","daemon"])`，
+       并 `write_pid(p.pid)` 记**自己子进程**的 pid —— 而真正持锁的 daemon
+       是 ps1 用 `Start-Process` 拉起的另一个进程（daemon.py:1269 写 os.getpid()）。
+       两条路径并存 + pid 记账错配 → watchdog 下轮读到「已死子进程 pid」→
+       判「daemon 不在」→ 再拉起 → 循环（21:43~23:18 实测 7+ 次重启，136 个 lock.bak）。
+       修复：watchdog 不再 Popen，改调 ps1（ps1 有「已存在即跳过」判活），
+       pid 由 daemon 自身落盘，watchdog 只判 lock/进程存活，不写 pid。
     """
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    out = open(str(LOG_DIR / "daemon.out"), "ab")
-    py = sys.executable
-    cmd = [py, "-u", str(ROOT / "run.py"), "daemon"]
-    creation = 0
-    if os.name == "nt":
-        creation = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
     try:
-        p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=out,
-                             stdin=subprocess.DEVNULL, creationflags=creation,
-                             env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        ps1 = ROOT / "tools" / "start_daemon.ps1"
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+            capture_output=True, timeout=90)
+        out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+        if r.returncode != 0 and "already running" not in out:
+            log.warning("start_daemon.ps1 返回 %s: %s", r.returncode, out[:200])
+        # ps1 成功拉起后会自己写 daemon.pid（daemon.py:1269），这里不重复写。
+        pids = _real_daemon_pids()
+        if pids:
+            log.info("已拉起 daemon（ps1 路径，存活 pid=%s）", pids)
+            return pids[0]
+        log.warning("ps1 返回但未发现存活 daemon 进程")
+        return None
     except Exception as e:
         log.error("拉起 daemon 失败: %r", e)
         return None
-    write_pid(p.pid)
-    log.info("已拉起 daemon pid=%s", p.pid)
-    return p.pid
 
 
 def check():
@@ -122,7 +156,10 @@ def check():
             #    进程活着但卡死的 daemon 永远不会被重启（§79 blocked 4h52m 就是这种）。
             #    这里直接强杀 + 清锁，下一轮检查会重新拉起。
             if os.environ.get("SOUL_WATCHDOG_KILL", "1") != "0":
-                pid = read_pid()
+                # 🔴 2026-11-13 修复 HY-01：以 lock owner 为准杀，别用 daemon.pid 文件
+                #   （可能被 watchdog 临时子进程污染成死 pid）。
+                _, info = lock.status()
+                pid = info.get("pid") or read_pid()
                 if pid:
                     try:
                         subprocess.run(["taskkill", "/F", "/PID", str(pid)],

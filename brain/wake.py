@@ -594,7 +594,24 @@ def send_wake(actor, dev, cand, text, db=None):
                     _bump_miss(cand.uid, "身份校验失败")
                     return False, "身份校验失败"
         except Exception as e:
-            log.debug("唤醒身份校验异常（按通过处理）: %r", e)
+            # 🔴 2026-11-13 修复 HY-02（P1 串台）：身份校验任何异常都必须 fail-closed。
+            #   原来 `log.debug("...按通过处理")` 不中止发送 —— 搜索结果按关键词排序，
+            #   第一条不保证是目标人（547-549 注释自认），校验异常一旦放开就可能把
+            #   唤醒语发给错误的人。改：异常即 back + leave + 记失败台账，绝不放行。
+            log.warning("唤醒身份校验异常（fail-closed，不发送）uid=%s: %r", cand.uid, e)
+            try:
+                actor.hand.back(settle=1.0)
+            except Exception:
+                pass
+            try:
+                S.leave(actor)
+            except Exception:
+                pass
+            try:
+                _bump_miss(cand.uid, "身份校验异常")
+            except Exception:
+                pass
+            return False, "身份校验异常(fail-closed)"
 
     # 跟进阶梯接线（§104-B2）：真正灌字前过发送闸，发送额度统一由 sendgate 裁决。
     #    has_human=True：唤醒面向真人老友，不按系统卡口径降级；
