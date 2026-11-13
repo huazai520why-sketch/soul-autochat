@@ -350,7 +350,11 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
                 log.debug("DS-02 记短冷却失败: %r", _m)
             return out
 
-        if side == "me":
+        # 🔴 2026-11-13 修复 DS-01（P1 漏回）：tip 恢复块（314-329）已把
+        #   out.side 置 "her"，但这里原判局部变量 `side`（300 行定格 "me"）——
+        #   tip 卡片 sender 恰为本人时，`side` 仍是 "me"，她真实未接的话被吞。
+        #   改用 out.side（tip 恢复后已更新为 "her"）。
+        if out.side == "me":
             log.info("[%s] 最后一条是我发的 -> 无需回复", out.nick)
             actor.hand.back(settle=0.9)
             return out

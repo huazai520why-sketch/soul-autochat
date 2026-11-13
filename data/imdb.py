@@ -774,6 +774,22 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
         return local
 
     def _pull_all():
+        # 🔴 2026-11-13 修复 DS-03（P1 失败同步毁掉本地镜像）：**删本地前先备份**。
+        #    原来正常增量路径第一步就删本地 db/wal/shm（777-784），随后才 pull；
+        #    pull 失败（rc!=0）或 integrity 不过时，本地历史镜像（14.2MB/20900 条）
+        #    已永久删除且无备份（缩水保护只在「设备<本地 50%」分支做 .keep）。
+        #    改：删前 copy2 到 `.keep`，失败后能恢复（或至少不丢历史）。
+        _keep_files = []
+        for suffix in ("", "-wal"):
+            p = dest_dir / (name + suffix)
+            if p.exists():
+                try:
+                    kp = dest_dir / (name + suffix + ".keep")
+                    import shutil as _sh
+                    _sh.copy2(str(p), str(kp))
+                    _keep_files.append(kp)
+                except Exception as _ke:
+                    log.warning("DS-03 备份 %s 失败（继续）: %r", p.name, _ke)
         # ① 先删（旧 wal 残留会让新库被判损坏）
         for suffix in ("", "-wal", "-shm"):
             p = dest_dir / (name + suffix)
@@ -795,6 +811,13 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
             dst = str(dest_dir / (name + suffix))
             rc, out, err = device.run(["pull", src, dst], timeout=120)
             if rc != 0 and suffix == "":
+                # 🔴 DS-03：pull 失败时恢复备份，别让本地镜像裸奔（历史数据优先）。
+                for _k in _keep_files:
+                    try:
+                        import shutil as _sh2
+                        _sh2.copy2(str(_k), str(dest_dir / _k.name[:-5]))
+                    except Exception as _re:
+                        log.warning("DS-03 恢复备份 %s 失败: %r", _k.name, _re)
                 raise RuntimeError("pull 失败 %s: %r" % (src, err[:160]))
         stale_shm = dest_dir / (name + "-shm")
         if stale_shm.exists():
@@ -1304,7 +1327,14 @@ def open_account(device, name=None, uid=None, max_age=REFRESH_S, force=False):
     log.info("当前登录 uid = %s，共 %d 个库待匹配", want, len(names))
     if not want:
         p = sync(device, names[0])
-        return IMDB(p)
+        # 🔴 2026-11-13 修复 DS-02（P1 设备存活校验失效回潮）：want 为空（current_uid
+        #   读不到）的降级分支漏挂 db.dev —— 正常路径（1299/1335）都有 `db.dev=device`，
+        #   唯独此分支没有。而 pending.py 的 unread_sids/should_reply 只用
+        #   getattr(db,"dev",None)，不回退 _DEV_REF → 设备存活校验被静默跳过，
+        #   幽灵会话/待回虚高回潮（11-08 P0 根因）。
+        db = IMDB(p)
+        db.dev = device
+        return db
 
     # 🔴🔴 2026-11-08 10:36（用户硬规则：「两个账号的数据库要分开，不要用 A 的聊天记录
     #   去全 B 账号搜」）
