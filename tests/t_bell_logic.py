@@ -3,6 +3,7 @@
 import importlib
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -55,6 +56,35 @@ def test_helpers():
             pass
 
 
+def test_bootstrap_account_intervals():
+    B = _bell()
+    old_logs = B.LOGS
+    day = time.strftime("%m-%d")
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            B.LOGS = Path(td)
+            (B.LOGS / "guard.daemon.log").write_text("\n".join([
+                "%s 00:00:00 INFO 当前账号 uid=96691646" % day,
+                "%s 01:00:00 INFO 账号已变（96691646 → 402857053）" % day,
+                "%s 09:00:00 INFO 账号已变（402857053 → 96691646）" % day,
+                "%s 17:00:00 INFO 🔄 已切号：已切号 96691646 -> 402857053" % day,
+                "%s 22:00:00 INFO 账号已变（402857053 → 96691646）" % day,
+            ]), encoding="utf-8")
+            (B.LOGS / "brain.bell.log").write_text("\n".join([
+                "%s 00:10:00 INFO ✓ 稍后再聊已发 'A': 'x'" % day,
+                "%s 10:00:00 INFO ✓ 稍后再聊已发 'B': 'x'" % day,
+                "%s 18:00:00 INFO ✓ 稍后再聊已发 'C': 'x'" % day,
+                "%s 23:00:00 INFO ✓ 稍后再聊已发 'D': 'x'" % day,
+            ]), encoding="utf-8")
+            data = {"version": 2, "opened": {}, "nicks": {}}
+            B._bootstrap_nicks_from_log("96691646", data)
+            assert set(data["nicks"]) == {"A", "B", "D"}
+            assert data["bootstrap_day"] == day
+        finally:
+            B.LOGS = old_logs
+
+
 if __name__ == "__main__":
     test_helpers()
+    test_bootstrap_account_intervals()
     print("PASS t_bell_logic")
