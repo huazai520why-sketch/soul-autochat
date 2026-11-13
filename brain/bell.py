@@ -170,6 +170,7 @@ def _bootstrap_nicks_from_log(uid, data):
 
 
 def _ledger_load(uid):
+    needs_save = False
     path = _ledger_file(uid)
     try:
         with open(path, encoding="utf-8") as f:
@@ -186,12 +187,17 @@ def _ledger_load(uid):
         if not at or now - at > BELL_LIST_LEDGER_TTL_S:
             opened.pop(k, None)
     nicks = data.setdefault("nicks", {})
+    before_nicks = len(nicks)
     for k, v in list(nicks.items()):
         at = float((v or {}).get("at", 0) or 0)
         if not at or now - at > BELL_LIST_LEDGER_TTL_S:
             nicks.pop(k, None)
     _bootstrap_nicks_from_log(uid, data)
+    if len(nicks) != before_nicks:
+        needs_save = True
     data["version"] = 3
+    if needs_save:
+        _ledger_save(uid, data)
     return data
 
 
@@ -617,6 +623,8 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
     skipped = 0
     attempted = 0
     tried = set()
+    known_keys = set()
+    max_rows = 0
     scrolls = 0
     ledger = _ledger_load(uid)
 
@@ -649,10 +657,14 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
             break
 
         rows = bell_list_rows(snap)
+        max_rows = max(max_rows, len(rows))
         unseen = []
         for r in rows:
             key = _row_key(r[0], r[3], r[4])
-            if key in tried or _ledger_seen(uid, key, nick=r[0], data=ledger):
+            if key in tried:
+                continue
+            if _ledger_seen(uid, key, nick=r[0], data=ledger):
+                known_keys.add(key)
                 continue
             unseen.append((r, key))
 
@@ -749,5 +761,5 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
             actor.hand.back(settle=1.2)
         except Exception:
             pass
-    return done, "稍后再聊已发 %d 人 / 跳过 %d / 检查 %d / 滚动 %d" % (
-        done, skipped, attempted, scrolls)
+    return done, "稍后再聊已发 %d 人 / 跳过 %d / 检查 %d / 已发过 %d / 单屏最多 %d / 滚动 %d" % (
+        done, skipped, attempted, len(known_keys), max_rows, scrolls)
