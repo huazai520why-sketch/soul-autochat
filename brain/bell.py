@@ -23,11 +23,12 @@
 """
 import json
 import os
+import re
 import tempfile
 import time
 
 from core.log import get_logger
-from core.paths import STATE
+from core.paths import LOGS, STATE
 from eyes import ocr
 from eyes.page import detect
 
@@ -86,6 +87,65 @@ def _row_key(nick, tag="", ts=""):
     return "|".join(str(x or "").strip() for x in (nick, tag, ts))
 
 
+def _log_ts(line, now=None):
+    """解析日志行 `MM-DD HH:MM:SS`，返回秒级 epoch；失败返回 0。"""
+    m = re.match(r"^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", line or "")
+    if not m:
+        return 0
+    now = now or time.localtime()
+    try:
+        return time.mktime((now.tm_year, int(m.group(1)), int(m.group(2)),
+                            int(m.group(3)), int(m.group(4)), int(m.group(5)),
+                            0, 0, -1))
+    except Exception:
+        return 0
+
+
+def _bootstrap_nicks_from_log(uid, data):
+    """首次升级时从当天日志补昵称台账，避免重发今天已经开场过的人。"""
+    if _uid_key(uid) == "unknown":
+        return
+    nicks = data.setdefault("nicks", {})
+    if nicks:
+        return
+
+    # 找本账号今天最后一次进入的时间点。日志缺切换记录时退回 0 点。
+    cutoff = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    gp = LOGS / "guard.daemon.log"
+    try:
+        with open(gp, "rb") as f:
+            f.seek(max(0, gp.stat().st_size - 500000))
+            gl = f.read().decode("utf-8", "replace").splitlines()
+        for line in gl:
+            target = (("账号已变" in line or "已切号" in line)
+                      and (("→ %s" % uid) in line or ("-> %s" % uid) in line))
+            if target:
+                ts = _log_ts(line)
+                if ts > cutoff:
+                    cutoff = ts
+    except Exception as e:
+        log.debug("奇遇铃台账 bootstrap 读 guard 日志失败: %r", e)
+
+    bp = LOGS / "brain.bell.log"
+    try:
+        with open(bp, "rb") as f:
+            bl = f.read().decode("utf-8", "replace").splitlines()
+        for line in bl:
+            if "稍后再聊已发" not in line:
+                continue
+            ts = _log_ts(line)
+            if ts and ts >= cutoff:
+                m = re.search(r"稍后再聊已发 '([^']+)'", line)
+                if m:
+                    nick = m.group(1).strip()
+                    if nick:
+                        nicks[nick] = {"at": ts, "status": "sent"}
+    except Exception as e:
+        log.debug("奇遇铃台账 bootstrap 读 bell 日志失败: %r", e)
+    if nicks:
+        log.info("奇遇铃台账首次迁移：从日志补入 %d 个已发昵称（uid=%s）", len(nicks), uid)
+
+
 def _ledger_load(uid):
     path = _ledger_file(uid)
     try:
@@ -102,7 +162,13 @@ def _ledger_load(uid):
         at = float((v or {}).get("at", 0) or 0)
         if not at or now - at > BELL_LIST_LEDGER_TTL_S:
             opened.pop(k, None)
-    data["version"] = 1
+    nicks = data.setdefault("nicks", {})
+    for k, v in list(nicks.items()):
+        at = float((v or {}).get("at", 0) or 0)
+        if not at or now - at > BELL_LIST_LEDGER_TTL_S:
+            nicks.pop(k, None)
+    _bootstrap_nicks_from_log(uid, data)
+    data["version"] = 2
     return data
 
 
@@ -126,14 +192,19 @@ def _ledger_save(uid, data):
         log.warning("保存奇遇铃台账失败 uid=%s: %r", uid, e)
 
 
-def _ledger_seen(uid, key, data=None):
+def _ledger_seen(uid, key, nick="", data=None):
     data = data or _ledger_load(uid)
     v = data.get("opened", {}).get(key)
-    if not v:
-        return False
-    if v.get("status") == "failed":
-        return time.time() < float(v.get("retry_after", 0) or 0)
-    return True
+    if v:
+        if v.get("status") == "failed":
+            if time.time() < float(v.get("retry_after", 0) or 0):
+                return True
+        else:
+            return True
+    nv = data.get("nicks", {}).get((nick or "").strip())
+    if nv and nv.get("status") != "failed":
+        return True
+    return False
 
 
 def bell_daily_count(uid, day=None):
@@ -141,7 +212,7 @@ def bell_daily_count(uid, day=None):
     day = day or time.strftime("%Y-%m-%d")
     data = _ledger_load(uid)
     n = 0
-    for v in data.get("opened", {}).values():
+    for v in data.get("nicks", {}).values():
         if (v or {}).get("status") != "sent":
             continue
         at = float((v or {}).get("at", 0) or 0)
@@ -527,14 +598,21 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
     ledger = _ledger_load(uid)
 
     def _mark(key, status, nick="", tag="", row_ts="", retry_after=0):
+        at = time.time()
         ledger["opened"][key] = {
-            "at": time.time(),
+            "at": at,
             "status": status,
             "nick": nick,
             "tag": tag,
             "row_ts": row_ts,
             "retry_after": retry_after,
         }
+        if nick:
+            ledger.setdefault("nicks", {})[nick] = {
+                "at": at,
+                "status": status,
+                "retry_after": retry_after,
+            }
         _ledger_save(uid, ledger)
 
     max_loops = max(12, limit * 4 + max_scrolls)
@@ -551,7 +629,7 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
         unseen = []
         for r in rows:
             key = _row_key(r[0], r[3], r[4])
-            if key in tried or _ledger_seen(uid, key, ledger):
+            if key in tried or _ledger_seen(uid, key, nick=r[0], data=ledger):
                 continue
             unseen.append((r, key))
 

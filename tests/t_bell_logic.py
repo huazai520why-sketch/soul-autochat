@@ -24,7 +24,7 @@ def test_helpers():
     uid = "test_bell_logic"
     path = B._ledger_file(uid)
     try:
-        data = {"version": 1, "opened": {}}
+        data = {"version": 2, "opened": {}, "nicks": {}}
         key = "A|同城奇遇|10:00"
         data["opened"][key] = {
             "at": time.time(),
@@ -34,8 +34,10 @@ def test_helpers():
             "row_ts": "10:00",
             "retry_after": 0,
         }
+        data["nicks"]["A"] = {"at": time.time(), "status": "sent"}
         B._ledger_save(uid, data)
         assert B._ledger_seen(uid, key)
+        assert B._ledger_seen(uid, "changed-key", nick="A")
         assert B.bell_daily_count(uid) >= 1
 
         data = B._ledger_load(uid)
