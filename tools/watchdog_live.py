@@ -23,7 +23,16 @@ import subprocess
 import sys
 import time
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if getattr(sys.stdout, "buffer", None) is not None:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+else:
+    # 计划任务用 pythonw.exe 启动时 sys.stdout 可能是 None；直接访问 .buffer
+    # 会令进程在导入阶段退出 1。无控制台时丢弃普通 print，异常仍写 alerts.log。
+    sys.stdout = io.StringIO()
+if getattr(sys.stderr, "buffer", None) is not None:
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+else:
+    sys.stderr = io.StringIO()
 
 ROOT = r"E:\soul1.0"
 LOGDIR = os.path.join(ROOT, "logs")
