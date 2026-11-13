@@ -536,9 +536,16 @@ def _slow_path(actor, db, out, dry_run):
     return _reply_and_send(actor, db, out, dry_run)
 
 
-# 🔴 必回兜底话术：旧引擎（豆包）偶尔返回空（日志实测 2 次，都是对方只发「嗯」「是的」），
-#   按「必回」铁律绝不能因此不发 —— 用一句不会出错的话顶上。
-FALLBACK_LINES = ("嗯嗯，在的", "刚看到，你说", "在呢，你继续", "嗯，我听着")
+# 🔴 必回兜底话术：旧引擎偶尔返回空，按「必回」铁律不能沉默。
+#   2026-11-14 按 GLM 审计换掉原来的灭火句（在的/刚看到/嗯我听着）：
+#   普通场景给“承接语”，她 ≤4 字或收尾时另走短兜底，避免兜底本身把她按住。
+FALLBACK_LINES = (
+    "你继续说，我接着听",
+    "你这句我接住了",
+    "那我们把眼前这件说清楚",
+    "行，我不绕，直接说我的想法",
+)
+SHORT_FALLBACK_LINES = ("那就先好好睡", "行，你先歇着", "好，听你的")
 
 # 非文本消息的固定话术。
 # 为什么不交给引擎现生成：占位串（「她发来一张图片」）喂进去，豆包容易编造
@@ -550,8 +557,17 @@ MEDIA_REPLIES = {
 }
 
 
-def fallback_line():
+def _short_fallback(her_msg):
+    import re
+    s = re.sub(r"\s+", "", str(her_msg or ""))
+    close = ("睡了", "晚安", "困了", "不聊了", "告辞", "拜拜", "去忙了")
+    return len(s) <= 4 or any(k in s for k in close)
+
+
+def fallback_line(her_msg=""):
     import random
+    if _short_fallback(her_msg):
+        return random.choice(SHORT_FALLBACK_LINES)
     return random.choice(FALLBACK_LINES)
 
 
@@ -801,7 +817,7 @@ def _reply_and_send(actor, db, out, dry_run):
                      out.nick, n, len(lines), " | ".join(lines)[:60])
     if not lines:
         # 必回铁律：引擎不给话也必须发一句，不能沉默
-        lines = [fallback_line()]
+        lines = [fallback_line(out.last_text)]
         # 🔴 2026-11-11（FAIL 噪声）：引擎出话**无产出**已被兜底话术完全接住——
         #   必回铁律保证一定发一句（fallback_line 永不空），不是故障，与 PR#13
         #   降级的「已兜住」路径同类。用「无产出」取代「失败」避免被 nightly_collect

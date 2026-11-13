@@ -24,6 +24,20 @@ from brain.pack import store
 MAX_N = int(os.environ.get("SOUL_MAX_SEND", "2") or 2)
 
 
+def _short_her(text):
+    """她这条是否需要硬短回：≤4 字或明确收尾。"""
+    s = re.sub(r"\s+", "", str(text or ""))
+    if len(s) <= 4:
+        return True
+    return any(k in s for k in ("睡了", "晚安", "困了", "不聊了", "告辞", "拜拜", "去忙了"))
+
+
+def _short_reply_ok(text):
+    """冷/收尾硬约束：一条 ≤8 字，且不带显式问号。"""
+    t = gate.clean(str(text or ""))
+    return len(t) <= 8 and ("?" not in t and "？" not in t)
+
+
 def recent_mine(sid, n=4):
     """她这个会话里我最近发过的 n 条（防复读基线）。"""
     t = store.read_turns(sid, limit_chars=6000)
@@ -47,6 +61,9 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
     """
     max_n = max_n or MAX_N
     her_msg = (her_msg or "").strip()
+    short_her = _short_her(her_msg)
+    if short_her:
+        max_n = 1
     try:
         system, user, meta = prompt.build(her_msg, sid=sid, hist=hist,
                                           restart_h=restart_h)
@@ -85,6 +102,8 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
     pool = []
     for c in cands:
         ok, why = gate.check(c, recent)
+        if ok and short_her and not _short_reply_ok(c):
+            ok, why = False, "冷/收尾回复超过1条或8字"
         if ok and pool and gate.dup_hit(c, pool):
             ok, why = False, "批内重复"
         if ok:
@@ -108,19 +127,25 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
     #   新指令改成**正向**给一个动作：换画面、压到 12 字、允许半句。
     #   依据：offer 型问句保持热度 37.5%，单独陈述句只有 7.3% ——
     #   所以要求的不是「别问」，而是「问就问你给得起的东西」。
+    if short_her:
+        retry = ("她这条≤4字或正在收尾。只回一句，不超过8字，不提问、不追加、不挽留。"
+                 "直接接住她那句或自然收住。")
+    else:
+        retry = ("换一个具体画面。不超过 12 字。可以说半句，不用完整。"
+                 "如果还是想问，就问「我要不要给你点啥」这种给得起的东西，"
+                 "别问她会怎么想。"
+                 "**注意：不要说「在呢」「刚看到」「嗯嗯，在的」这类零信息应答，"
+                 "那是灭火句，会让她觉得我在敷衍。**")
     msgs = [{"role": "system", "content": system},
             {"role": "user", "content": user},
             {"role": "assistant", "content": raw[:200]},
-            {"role": "user",
-             "content": "换一个具体画面。不超过 12 字。可以说半句，不用完整。"
-                        "如果还是想问，就问「我要不要给你点啥」这种给得起的东西，"
-                        "别问她会怎么想。"
-                        "**注意：不要说「在呢」「刚看到」「嗯嗯，在的」这类零信息应答，"
-                        "那是灭火句，会让她觉得我在敷衍。**"}]
+            {"role": "user", "content": retry}]
     raw2 = llm.ark_chat(msgs, her_msg=her_msg, sid=sid, temperature=0.8)
     if raw2:
         for c in gate.to_messages(raw2, 1):
             ok, why = gate.check(c, recent)
+            if ok and short_her and not _short_reply_ok(c):
+                ok, why = False, "冷/收尾回复超过8字或带问号"
             if ok:
                 return [c]
     return None
