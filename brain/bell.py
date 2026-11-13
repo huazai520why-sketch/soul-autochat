@@ -350,7 +350,16 @@ def handle(actor, dev, dry_run=False, db=None):
         return False, repr(e)
 
 
-def open_list(actor):
+def _find_list_entry(snap):
+    for n in snap.nodes:
+        if not n.visible:
+            continue
+        if (n.text or "").strip() == "奇遇铃-稍后再聊":
+            return n
+    return None
+
+
+def open_list(actor, max_scrolls=4):
     """从会话列表点进「奇遇铃-稍后再聊」。返回 (ok, 说明)。
 
     实测（2026-11-08 11:24）：会话列表里有一行
@@ -365,13 +374,45 @@ def open_list(actor):
         return False, repr(e)
     if is_bell_list(snap):
         return True, "已在稍后再聊列表"
-    node = None
-    for n in snap.nodes:
-        if not n.visible:
-            continue
-        if (n.text or "").strip() == "奇遇铃-稍后再聊":
-            node = n
-            break
+    if detect(snap) != "chatlist":
+        try:
+            from brain import nav
+            snap, pg = nav.to_chatlist(actor)
+            if pg != "chatlist":
+                return False, "不在会话列表(%s)" % pg
+        except Exception as e:
+            return False, "回会话列表失败: %r" % e
+
+    node = _find_list_entry(snap)
+
+    # 2026-11-13 实测：清完红点后列表常停在中间，入口明明存在却只搜当前屏
+    # 会误报“没有入口”。先向下滑回顶部，再向上翻几屏；每次重新 dump。
+    if node is None:
+        for _ in range(max(1, max_scrolls)):
+            try:
+                actor.hand.swipe(450, 420, 450, 1340, duration=0.18, settle=0.5)
+            except Exception:
+                break
+            snap = actor.snap(force=True)
+            node = _find_list_entry(snap)
+            if node is not None:
+                break
+
+    if node is None:
+        for _ in range(max(1, max_scrolls)):
+            try:
+                actor.hand.swipe(450, 1320, 450, 520, duration=0.35, settle=0.7)
+            except Exception:
+                break
+            snap = actor.snap(force=True)
+            if is_bell_list(snap):
+                return True, "已在稍后再聊列表"
+            node = _find_list_entry(snap)
+            if node is not None:
+                break
+            if detect(snap) != "chatlist":
+                break
+
     if node is None:
         return False, "会话列表没有「奇遇铃-稍后再聊」入口"
     log.info("🔔 会话列表发现「奇遇铃-稍后再聊」→ 点进去")
