@@ -102,48 +102,71 @@ def _log_ts(line, now=None):
 
 
 def _bootstrap_nicks_from_log(uid, data):
-    """首次升级时从当天日志补昵称台账，避免重发今天已经开场过的人。"""
+    """按今天所有账号区间从日志补昵称台账，避免跨多次切号重发。"""
     if _uid_key(uid) == "unknown":
         return
-    nicks = data.setdefault("nicks", {})
-    if nicks:
+    day = time.strftime("%m-%d")
+    if data.get("bootstrap_day") == day:
         return
+    nicks = data.setdefault("nicks", {})
 
-    # 找本账号今天最后一次进入的时间点。日志缺切换记录时退回 0 点。
-    cutoff = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    current = None
+    start = midnight
+    intervals = []
     gp = LOGS / "guard.daemon.log"
     try:
         with open(gp, "rb") as f:
-            f.seek(max(0, gp.stat().st_size - 500000))
             gl = f.read().decode("utf-8", "replace").splitlines()
         for line in gl:
-            target = (("账号已变" in line or "已切号" in line)
-                      and (("→ %s" % uid) in line or ("-> %s" % uid) in line))
-            if target:
-                ts = _log_ts(line)
-                if ts > cutoff:
-                    cutoff = ts
+            if not line.startswith(day + " "):
+                continue
+            ts = _log_ts(line)
+            mcur = re.search(r"当前账号 uid=([0-9]+)", line)
+            if mcur:
+                if current is None:
+                    current = mcur.group(1)
+                continue
+            if "账号已变" in line or "已切号" in line:
+                msw = re.search(r"([0-9]{6,})\s*(?:→|->)\s*([0-9]{6,})", line)
+                if not msw:
+                    continue
+                frm, to = msw.group(1), msw.group(2)
+                if current is None:
+                    current = frm
+                if current and ts >= start:
+                    intervals.append((current, start, ts))
+                current = to
+                start = ts
+        if current:
+            intervals.append((current, start, time.time() + 1))
     except Exception as e:
         log.debug("奇遇铃台账 bootstrap 读 guard 日志失败: %r", e)
 
+    mine = [(a, b) for who, a, b in intervals if who == str(uid)]
     bp = LOGS / "brain.bell.log"
+    added = 0
     try:
         with open(bp, "rb") as f:
             bl = f.read().decode("utf-8", "replace").splitlines()
         for line in bl:
-            if "稍后再聊已发" not in line:
+            if not line.startswith(day + " ") or "稍后再聊已发" not in line:
                 continue
             ts = _log_ts(line)
-            if ts and ts >= cutoff:
-                m = re.search(r"稍后再聊已发 '([^']+)'", line)
-                if m:
-                    nick = m.group(1).strip()
-                    if nick:
-                        nicks[nick] = {"at": ts, "status": "sent"}
+            if not ts or not any(a <= ts <= b for a, b in mine):
+                continue
+            m = re.search(r"稍后再聊已发 '([^']+)'", line)
+            if m:
+                nick = m.group(1).strip()
+                if nick:
+                    nicks[nick] = {"at": ts, "status": "sent"}
+                    added += 1
     except Exception as e:
         log.debug("奇遇铃台账 bootstrap 读 bell 日志失败: %r", e)
-    if nicks:
-        log.info("奇遇铃台账首次迁移：从日志补入 %d 个已发昵称（uid=%s）", len(nicks), uid)
+    data["bootstrap_day"] = day
+    if added:
+        log.info("奇遇铃台账迁移：按今日账号区间补入 %d 条已发记录（uid=%s）",
+                 added, uid)
 
 
 def _ledger_load(uid):
@@ -168,7 +191,7 @@ def _ledger_load(uid):
         if not at or now - at > BELL_LIST_LEDGER_TTL_S:
             nicks.pop(k, None)
     _bootstrap_nicks_from_log(uid, data)
-    data["version"] = 2
+    data["version"] = 3
     return data
 
 
