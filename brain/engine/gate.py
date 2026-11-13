@@ -47,6 +47,28 @@ SOFT_BAN = (
 # 现在的分工：提示词负责「不写露骨词、只往暧昧带」，代码不再一刀切作废整句。
 EXPLICIT_WORDS = ("上床", "做爱", "开房", "睡你", "脱", "裸", "胸", "腿", "痒", "湿")
 
+# ── 人设漂移：滴酒不沾（persona.py 写死，rules.py 已同步，这里是代码硬闸）──────────
+# 2026-11-13 会诊：UID:428547277 出现「我喝一口就上脸」——persona 写死「滴酒不沾」
+# 但 gate 没拦，模型顺着「酒鬼啊/喜欢喝呗」自己编了一个。
+# 这类词会**让人设一致性崩坏**（她记着你「会喝」，以后问「你还说不喝酒」就穿帮），
+# 且与 persona 硬身份直接冲突，所以放 HARD_BAN 级别的拦截（命中即作废）。
+DRINK_PERSONA_WORDS = (
+    "喝一口就上脸", "我喝一口", "喝一口", "上脸", "会喝但不喜欢", "以前喝过",
+    "我能喝", "我喝得", "喝起来", "整一杯", "我陪你喝", "陪你喝一杯", "我喝点",
+    "我酒量", "喝两杯", "喝几杯", "来一杯",
+)
+
+def drink_persona_hit(t):
+    """命中「承认自己会喝/劝酒」的人设漂移词 → True（作废整句）。
+
+    只拦「我自己那口」，不拦「她喝」——她聊酒要接住，不能误杀。
+    """
+    s = str(t or "")
+    for w in DRINK_PERSONA_WORDS:
+        if w in s:
+            return w
+    return ""
+
 # ── 空头承诺：「等下讲/回头发你/改天带你」——她记住的是"你答应了" ──
 _PROMISE_RE = re.compile(
     r"(?:我给你|等下|回头|改天|晚点|下次)[^，。！？\s]{0,10}"
@@ -404,6 +426,10 @@ def check(text, recent=None, allow_soft=True):
     w = hard_hit(t)
     if w:
         return False, "红线词(%s)" % w
+    # 🔴 2026-11-13：人设漂移（滴酒不沾）。与 persona.py / rules.py 同步的代码硬闸。
+    dw = drink_persona_hit(t)
+    if dw:
+        return False, "人设漂移(酒:%s)" % dw
     # 🔴 2026-11-08：结构判据优先于 soft/explicit —— 动作句直接毙（封号级）
     if solicit_hit(t):
         return False, "性邀约动作句"
@@ -488,7 +514,8 @@ def to_messages(text, max_n=2):
     return out[:max_n]
 
 
-__all__ = ["HARD_BAN", "SOFT_BAN", "EXPLICIT_WORDS", "MAX_CHARS", "IDEAL_MAX",
-           "clean", "hard_hit", "soft_hit", "explicit_hit", "solicit_hit",
-           "promise_hit", "reverse_hit", "invite_hit", "commit_hit", "cold_ack_hit",
-           "dup_hit", "check", "to_messages"]
+__all__ = ["HARD_BAN", "SOFT_BAN", "EXPLICIT_WORDS", "DRINK_PERSONA_WORDS",
+           "MAX_CHARS", "IDEAL_MAX",
+           "clean", "hard_hit", "soft_hit", "explicit_hit", "drink_persona_hit",
+           "solicit_hit", "promise_hit", "reverse_hit", "invite_hit",
+           "commit_hit", "cold_ack_hit", "dup_hit", "check", "to_messages"]
