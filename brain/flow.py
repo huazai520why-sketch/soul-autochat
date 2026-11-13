@@ -408,6 +408,26 @@ def _slow_path(actor, db, out, dry_run):
                 log.info("[%s] 反查：强拉库后命中 sid=...%s", out.nick, str(cands[0][0])[-8:])
         except Exception as _e:
             log.warning("[%s] 反查：强拉库失败 %r", out.nick, _e)
+    if cands and len(cands) > 1 and (out.nick or "").strip():
+        # 2026-11-13：文本撞车时先用列表行昵称再筛一次。只接受唯一命中；
+        # 仍不唯一就继续 fail-closed，不能为了“多回几个”冒串台风险。
+        try:
+            from brain.pendingq import nick_of as _nick_of, _norm_nick as _nn
+            target = _nn(out.nick)
+            narrowed = []
+            for c in cands:
+                sid = str(c[0])
+                ses = db.session(sid)
+                to_uid = str(getattr(ses, "to_uid", "") or "")
+                nk = _nick_of(db, sid, to_uid)
+                if target and nk and _nn(nk) == target:
+                    narrowed.append(c)
+            if narrowed:
+                cands = narrowed
+                log.info("[%s] 反查多命中后用昵称收窄为 %d 个", out.nick, len(cands))
+        except Exception as e:
+            log.debug("[%s] 昵称收窄异常: %r", out.nick, e)
+
     if cands:
         if len(cands) == 1:
             out.sid = cands[0][0]

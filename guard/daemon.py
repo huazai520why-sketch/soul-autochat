@@ -426,7 +426,7 @@ def cycle(a, dev, db, st, dry_run=False):
         snap0 = a.snap(force=True)
         if BELL.is_bell(snap0, dev=dev):
             log.info("🔔 轮首发现奇遇铃")
-            ok, why = BELL.handle(a, dev, dry_run=dry_run)
+            ok, why = BELL.handle(a, dev, dry_run=dry_run, db=db)
             st["last_bell"] = time.time()
             if ok:
                 return "bell"
@@ -446,21 +446,31 @@ def cycle(a, dev, db, st, dry_run=False):
     #
     #   现在：轮首只要列表里有这个入口，就进去逐个「发开场白 + 进主页建档」。
     #   放在 ① 之后、清红点之前 —— 用户口径就是奇遇铃最高。
-    #   限 3 人/轮，避免一轮被它吃光预算（还有红点/匹配要跑）。
+    #   2026-11-13 改为小批多轮清空：每轮最多 BELL_BATCH_MAX，后续轮次继续；
+    #   每日只保留一个安全上限 BELL_DAILY_MAX（默认 40，可用环境变量调整）。
     try:
-        _bell_n = int(st.get("bell_list_n", 0) or 0)
+        try:
+            _bell_n = BELL.bell_daily_count(db.uid)
+        except Exception:
+            _bell_n = int(st.get("bell_list_n", 0) or 0)
         _psw = _post_switch_phase(st, db)
         if _psw:
             # 切号首巡期间铃列表统一由 ③-b 在**红点之后**处理（用户 2026-11-09 21:44）
             log.info("切号首巡（阶段 %s）：铃列表让位给红点，清完红点当轮再进 ③-b", _psw)
-        elif _bell_n < 3:
+        elif _bell_n < BELL.BELL_DAILY_MAX:
             ok_l, why_l = BELL.open_list(a)
             if ok_l:
                 log.info("🔔 进入奇遇铃「稍后再聊」：%s", why_l)
-                _n_ok, _msg = BELL.handle_list(a, dev, dry_run=dry_run, limit=3)
-                st["bell_list_n"] = _bell_n + _n_ok
+                _lim = min(BELL.BELL_BATCH_MAX, BELL.BELL_DAILY_MAX - _bell_n)
+                _n_ok, _msg = BELL.handle_list(
+                    a, dev, dry_run=dry_run, limit=_lim, db=db, uid=db.uid)
+                try:
+                    st["bell_list_n"] = BELL.bell_daily_count(db.uid)
+                except Exception:
+                    st["bell_list_n"] = _bell_n + _n_ok
                 st["last_bell"] = time.time()
-                log.info("🔔 稍后再聊本轮结果：%s（累计 %d 人）", _msg, st["bell_list_n"])
+                log.info("🔔 稍后再聊本轮结果：%s（今日已发 %d / 上限 %d）",
+                         _msg, st["bell_list_n"], BELL.BELL_DAILY_MAX)
                 # 处理完回会话列表，别把后续阶段丢在铃页面里
                 try:
                     nav.to_chatlist(a)
@@ -649,11 +659,14 @@ def cycle(a, dev, db, st, dry_run=False):
             st["post_switch_dot_seen"] = True
             _psw = _post_switch_phase(st, db)
         if _psw == "bell":
-            _bell_n = int(st.get("bell_list_n", 0) or 0)
-            if _bell_n >= 3:
+            try:
+                _bell_n = BELL.bell_daily_count(db.uid)
+            except Exception:
+                _bell_n = int(st.get("bell_list_n", 0) or 0)
+            if _bell_n >= BELL.BELL_DAILY_MAX:
                 # 🔴 2026-11-09 21:44 用户原话：「**点进去看看**里面有没有人等着我去聊」。
-                #   今日已聊满 3 人（bell_list_n 是**按账号累计**，切号/跨天重置）时
-                #   不再发开场白，但仍要进去看一眼，把「还有几个人在等」写进日志，
+                #   今日已达到安全上限时不再发开场白，但仍进去看一眼，
+                #   把「还有几个人在等」写进日志，
                 #   否则用户看到的就是「悄无声息地没进去」。
                 _ok_l, _why_l = BELL.open_list(a)
                 if _ok_l:
@@ -662,8 +675,8 @@ def cycle(a, dev, db, st, dry_run=False):
                     except Exception:
                         _rows = []
                     if _rows:
-                        log.info("切号首巡：稍后再聊还有 %d 人等着（今日已聊 %d 人，不超额）"
-                                 "：%s", len(_rows), _bell_n,
+                        log.info("切号首巡：稍后再聊还有 %d 人等着（今日已发 %d / 上限 %d）"
+                                 "：%s", len(_rows), _bell_n, BELL.BELL_DAILY_MAX,
                                  "、".join([r[0] for r in _rows[:5]]))
                     else:
                         log.info("切号首巡：稍后再聊没人等着")
@@ -682,12 +695,17 @@ def cycle(a, dev, db, st, dry_run=False):
                     st["post_switch_bell_done"] = True
                 else:
                     log.info("🔔 切号首巡：红点已扫过一轮 → 进入奇遇铃「稍后再聊」：%s", _why_l)
-                    _n_l, _msg_l = BELL.handle_list(a, dev, dry_run=dry_run, limit=3)
-                    st["bell_list_n"] = _bell_n + _n_l
+                    _lim = min(BELL.BELL_BATCH_MAX, BELL.BELL_DAILY_MAX - _bell_n)
+                    _n_l, _msg_l = BELL.handle_list(
+                        a, dev, dry_run=dry_run, limit=_lim, db=db, uid=db.uid)
+                    try:
+                        st["bell_list_n"] = BELL.bell_daily_count(db.uid)
+                    except Exception:
+                        st["bell_list_n"] = _bell_n + _n_l
                     st["last_bell"] = time.time()
                     st["post_switch_bell_done"] = True
-                    log.info("🔔 切号首巡：「稍后再聊」结果 %s（累计 %d 人）→ 恢复原链",
-                             _msg_l, st["bell_list_n"])
+                    log.info("🔔 切号首巡：「稍后再聊」结果 %s（今日已发 %d / 上限 %d）→ 恢复原链",
+                             _msg_l, st["bell_list_n"], BELL.BELL_DAILY_MAX)
                     # 处理完回会话列表，别把后续阶段丢在铃页面里
                     try:
                         nav.to_chatlist(a)

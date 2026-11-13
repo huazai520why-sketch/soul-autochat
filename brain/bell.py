@@ -21,9 +21,13 @@
 
 处理动作：点「立即私聊」→ **已在该人会话页，直接发**（旧架构栽在"先回列表找人"）→ 通用开场白 → 建档。
 """
+import json
 import os
+import tempfile
+import time
 
 from core.log import get_logger
+from core.paths import STATE
 from eyes import ocr
 from eyes.page import detect
 
@@ -48,6 +52,140 @@ BELL_LIST_HINTS = ("奇遇铃-稍后再聊", "更多奇遇")
 BELL_ROW_TAGS = ("同城奇遇", "同城的他，去打个招呼")
 BELL_LIST_SKIP = ("奇遇铃-稍后再聊", "更多奇遇", "头像", "关闭弹窗",
                   "仅保留最近3天你直接关闭的用户哦")
+
+# 2026-11-13 用户口径：奇遇铃里的人要尽量清空，不再卡死在 3 人/天。
+# 一轮仍只处理一小批，避免把回复/红点/匹配段整轮挤掉；后续轮次继续清。
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except Exception:
+        return int(default)
+
+
+BELL_BATCH_MAX = max(1, _env_int("SOUL_BELL_BATCH_MAX", 8))
+BELL_DAILY_MAX = max(BELL_BATCH_MAX, _env_int("SOUL_BELL_DAILY_MAX", 40))
+BELL_LIST_LEDGER_TTL_S = 4 * 24 * 3600
+BELL_FAIL_RETRY_S = 30 * 60
+
+# 主页明确写了“不撩/不约”的人不再强开，避免把已经拒绝暧昧的人拉进来。
+PROFILE_BLOCK_WORDS = ("不撩", "不约", "拒撩", "拒绝暧昧", "不网恋")
+
+
+def _uid_key(uid):
+    """只取账号 uid 的数字部分做文件名，避免空值/特殊字符。"""
+    s = "".join(ch for ch in str(uid or "") if ch.isdigit())
+    return s or "unknown"
+
+
+def _ledger_file(uid):
+    return STATE / ("bell_list_opened_%s.json" % _uid_key(uid))
+
+
+def _row_key(nick, tag="", ts=""):
+    """列表行的稳定键。昵称+标签+原始时间足以覆盖同一账号内的重复行。"""
+    return "|".join(str(x or "").strip() for x in (nick, tag, ts))
+
+
+def _ledger_load(uid):
+    path = _ledger_file(uid)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("opened"), dict):
+            raise ValueError("bad ledger")
+    except Exception:
+        data = {"version": 1, "opened": {}}
+
+    now = time.time()
+    opened = data["opened"]
+    for k, v in list(opened.items()):
+        at = float((v or {}).get("at", 0) or 0)
+        if not at or now - at > BELL_LIST_LEDGER_TTL_S:
+            opened.pop(k, None)
+    data["version"] = 1
+    return data
+
+
+def _ledger_save(uid, data):
+    path = _ledger_file(uid)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_bell_", suffix=".swp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        log.warning("保存奇遇铃台账失败 uid=%s: %r", uid, e)
+
+
+def _ledger_seen(uid, key, data=None):
+    data = data or _ledger_load(uid)
+    v = data.get("opened", {}).get(key)
+    if not v:
+        return False
+    if v.get("status") == "failed":
+        return time.time() < float(v.get("retry_after", 0) or 0)
+    return True
+
+
+def bell_daily_count(uid, day=None):
+    """按账号统计今天真实发出去的开场白数。"""
+    day = day or time.strftime("%Y-%m-%d")
+    data = _ledger_load(uid)
+    n = 0
+    for v in data.get("opened", {}).values():
+        if (v or {}).get("status") != "sent":
+            continue
+        at = float((v or {}).get("at", 0) or 0)
+        if time.strftime("%Y-%m-%d", time.localtime(at)) == day:
+            n += 1
+    return n
+
+
+def profile_block_reason(prof):
+    """主页明确拒绝暧昧/约会时返回命中的词；普通“已婚”不单独命中。"""
+    p = prof or {}
+    bits = []
+    for k in ("nick", "grav", "gravity", "soul"):
+        if p.get(k):
+            bits.append(str(p[k]))
+    for k in ("tags", "moments"):
+        v = p.get(k) or []
+        if isinstance(v, (list, tuple)):
+            bits.extend(str(x) for x in v)
+        elif v:
+            bits.append(str(v))
+    txt = " ".join(bits)
+    for w in PROFILE_BLOCK_WORDS:
+        if w in txt:
+            return w
+    return ""
+
+
+def _save_profile_after_send(actor, dev, db, prof, text, nick=""):
+    """按刚发出的文本反查唯一 sid，再把主页写进案情包。"""
+    if not db or not prof:
+        return None
+    try:
+        from brain import casepack as CP
+        sid = CP.find_sid(db, text, device=dev, tries=2)
+        if sid:
+            CP.save_profile(sid, prof)
+            log.info("🔔 主页已写入案情包 %r sid=%s", nick or prof.get("nick") or "?", sid)
+        else:
+            log.warning("🔔 主页已抓到但反查不到唯一 sid，暂不写（宁可不写不可写错人）")
+        return sid
+    except Exception as e:
+        log.warning("🔔 保存主页档案异常: %r", e)
+        return None
 
 
 def _ocr_hit(dev, keyword):
@@ -142,7 +280,7 @@ def find_nick(dev):
     return cands[0].text.strip()
 
 
-def handle(actor, dev, dry_run=False):
+def handle(actor, dev, dry_run=False, db=None):
     """处理一个奇遇铃。返回 (ok, 说明)。
 
     绝不抛异常出去 —— 铃处理失败不能拖垮主流程。
@@ -162,27 +300,44 @@ def handle(actor, dev, dry_run=False):
             log.warning("点立即私聊后没进会话（%s）", pg)
             return False, "没进会话(%s)" % pg
 
-        if dry_run:
-            log.info("[dry] 已进铃会话，不发送")
-            actor.hand.back(settle=1.0)
-            return True, "dry"
-
         from brain import match as M
-        text = M.pick_opener()
-        # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
-        ok, why = M.send(actor, dev, text)
-        if ok:
-            log.info("✓ 奇遇铃已发: %r", text)
-        else:
-            log.warning("奇遇铃发送失败: %s", why)
+        try:
+            said, bubbles = M.said_already(dev, s2)
+        except Exception as e:
+            log.warning("奇遇铃已有消息检查失败（按未发处理）: %r", e)
+            said, bubbles = False, []
+        if said:
+            log.info("🔔 奇遇铃对象已有消息（气泡 %d 条）→ 不重复发", len(bubbles))
+            actor.hand.back(settle=1.0)
+            return True, "已有消息"
 
-        # 建档（同匹配流程）
+        # 用户口径：奇遇铃也要先看主页；主页明确“不撩/不约”的直接跳过。
+        prof = None
         try:
             prof, pok = M.visit_profile(actor)
             if pok and prof:
                 log.info("🔔 铃对象主页: %r %r", prof.get("nick"), prof.get("tags"))
         except Exception as e:
-            log.warning("铃建档异常（不影响回复）: %r", e)
+            log.warning("铃对象建档异常（继续发送）: %r", e)
+        block = profile_block_reason(prof)
+        if block:
+            log.info("🔔 跳过奇遇铃对象 %r：主页明确写「%s」", nick or "?", block)
+            actor.hand.back(settle=1.0)
+            return True, "主页拒绝暧昧(%s)" % block
+
+        if dry_run:
+            log.info("[dry] 已进铃会话，不发送")
+            actor.hand.back(settle=1.0)
+            return True, "dry"
+
+        text = M.pick_opener()
+        # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
+        ok, why = M.send(actor, dev, text)
+        if ok:
+            log.info("✓ 奇遇铃已发: %r", text)
+            _save_profile_after_send(actor, dev, db, prof, text, nick)
+        else:
+            log.warning("奇遇铃发送失败: %s", why)
 
         actor.hand.back(settle=1.2)
         return ok, why
@@ -304,67 +459,153 @@ def bell_list_rows(snap):
     return out
 
 
-def handle_list(actor, dev, dry_run=False, limit=3):
+def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scrolls=8):
     """把「奇遇铃-稍后再聊」里的人逐个聊起来。返回 (n_ok, 说明)。
 
     用户 2026-11-08：「奇遇铃 稍后再聊 里面有三个人等着对话啊，优先级奇遇铃不是最高吗」
     —— 这条链路必须并入奇遇铃最高优先级，且每个都要**发开场白 + 进主页建档**。
 
-    每处理一个：点行 → 确认进会话（page=chat）→ 发开场白 → visit_profile 建档 → 返回列表。
+    2026-11-13 用户口径：这里的人要尽量清空，不再按 3 人/天硬截断。
+    一轮只做一小批（BELL_BATCH_MAX），后续轮次继续；同一人用三态去重：
+      ① 会话里已有我的气泡 → 不发；
+      ② 持久台账记录已发/已跳过；
+      ③ 发送失败冷 30 分钟再试。
+
+    每处理一个：点行 → 确认进会话 → 已有消息检查 → 先看主页 → 发开场白
+    → 反查唯一 sid 写案情包 → 返回列表。
     处理完一个后**重新 dump 列表**（行会消失/上移，不能缓存坐标）。
     """
     from brain import match as M
 
+    limit = max(1, int(limit or BELL_BATCH_MAX))
     done = 0
+    skipped = 0
+    attempted = 0
     tried = set()
-    for _ in range(max(1, limit)):
+    scrolls = 0
+    ledger = _ledger_load(uid)
+
+    def _mark(key, status, nick="", tag="", row_ts="", retry_after=0):
+        ledger["opened"][key] = {
+            "at": time.time(),
+            "status": status,
+            "nick": nick,
+            "tag": tag,
+            "row_ts": row_ts,
+            "retry_after": retry_after,
+        }
+        _ledger_save(uid, ledger)
+
+    max_loops = max(12, limit * 4 + max_scrolls)
+    for _ in range(max_loops):
+        if done >= limit:
+            break
         snap = actor.snap(force=True)
         if not is_bell_list(snap):
             if done == 0:
                 return 0, "不在稍后再聊列表(%s)" % detect(snap)
             break
-        rows = [r for r in bell_list_rows(snap) if r[0] not in tried]
-        if not rows:
-            break
-        nick, cx, cy, tag, ts = rows[0]
-        tried.add(nick)
+
+        rows = bell_list_rows(snap)
+        unseen = []
+        for r in rows:
+            key = _row_key(r[0], r[3], r[4])
+            if key in tried or _ledger_seen(uid, key, ledger):
+                continue
+            unseen.append((r, key))
+
+        if not unseen:
+            if scrolls >= max_scrolls:
+                break
+            before = tuple(_row_key(r[0], r[3], r[4]) for r in rows)
+            try:
+                # 手指上滑 = 看列表更靠下的人。动作后强制重取，不能复用旧帧。
+                actor.hand.swipe(450, 1320, 450, 620, duration=0.35, settle=0.8)
+            except Exception as e:
+                log.warning("奇遇铃列表滚动异常: %r", e)
+                break
+            s2 = actor.snap(force=True)
+            if not is_bell_list(s2):
+                break
+            after = tuple(_row_key(r[0], r[3], r[4]) for r in bell_list_rows(s2))
+            scrolls += 1
+            if before and before == after:
+                log.info("奇遇铃列表已到底（滚动 %d 次无变化）", scrolls)
+                break
+            continue
+
+        (nick, cx, cy, tag, ts), key = unseen[0]
+        tried.add(key)
+        attempted += 1
         log.info("🔔 稍后再聊：%r（%s %s）→ 点进会话", nick, tag, ts)
         actor.hand.tap_xy(450, cy, settle=2.5)
         s2 = actor.snap(force=True)
         pg = detect(s2)
         if pg != "chat":
             log.warning("点 %r 后没进会话（page=%s）→ 跳过", nick, pg)
+            _mark(key, "failed", nick, tag, ts, time.time() + BELL_FAIL_RETRY_S)
+            skipped += 1
             try:
                 actor.hand.back(settle=1.2)
             except Exception:
                 pass
             continue
+
+        try:
+            said, bubbles = M.said_already(dev, s2)
+        except Exception as e:
+            log.warning("稍后再聊已有消息检查失败（按未发处理）: %r", e)
+            said, bubbles = False, []
+        if said:
+            log.info("🔔 稍后再聊 %r 已有我的消息（气泡 %d 条）→ 不重复发", nick, len(bubbles))
+            _mark(key, "already", nick, tag, ts)
+            skipped += 1
+            try:
+                actor.hand.back(settle=1.2)
+            except Exception:
+                pass
+            continue
+
         if dry_run:
             log.info("[dry] 已进 %r 会话，不发送", nick)
             actor.hand.back(settle=1.2)
             done += 1
             continue
+
+        prof = None
+        try:
+            prof, pok = M.visit_profile(actor)
+            if pok and prof:
+                log.info("🔔 稍后再聊主页 %r: %s", nick, prof.get("nick"))
+        except Exception as e:
+            log.warning("稍后再聊主页异常（继续发送）: %r", e)
+        block = profile_block_reason(prof)
+        if block:
+            log.info("🔔 跳过稍后再聊 %r：主页明确写「%s」", nick, block)
+            _mark(key, "blocked", nick, tag, ts)
+            skipped += 1
+            try:
+                actor.hand.back(settle=1.2)
+            except Exception:
+                pass
+            continue
+
         text = M.pick_opener()
         # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度
         ok, why = M.send(actor, dev, text)
         if ok:
             log.info("✓ 稍后再聊已发 %r: %r", nick, text)
+            _mark(key, "sent", nick, tag, ts)
+            _save_profile_after_send(actor, dev, db, prof, text, nick)
         else:
             log.warning("稍后再聊发送失败 %r: %s", nick, why)
-        # 🔴 用户 2026-11-08：「怎么不进入她的主页建档呢」——
-        #   发完必须进主页抓资料，否则后续回复没有画像依据（已婚/职场等边界）。
-        try:
-            prof, pok = M.visit_profile(actor)
-            if pok and prof:
-                log.info("🔔 稍后再聊建档 %r: %s", nick, prof.get("nick"))
-            else:
-                log.info("🔔 稍后再聊 %r 建档未成（无主页入口）", nick)
-        except Exception as e:
-            log.warning("稍后再聊建档异常（不影响回复）: %r", e)
+            _mark(key, "failed", nick, tag, ts, time.time() + BELL_FAIL_RETRY_S)
+            skipped += 1
         if ok:
             done += 1
         try:
             actor.hand.back(settle=1.2)
         except Exception:
             pass
-    return done, "稍后再聊处理 %d 人" % done
+    return done, "稍后再聊已发 %d 人 / 跳过 %d / 检查 %d / 滚动 %d" % (
+        done, skipped, attempted, scrolls)

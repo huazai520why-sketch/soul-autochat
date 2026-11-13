@@ -32,6 +32,10 @@ PYW = os.environ.get("SOUL_PYW") or sys.executable.replace("python.exe", "python
 ADB = r"D:\Program Files\Netease\MuMu\nx_main\adb.exe"
 if not os.path.exists(ADB):
     ADB = r"D:\MuMuPlayer\nx_main\adb.exe"
+MM = r"D:\MuMuPlayer\nx_main\MuMuManager.exe"
+if not os.path.exists(MM):
+    MM = r"D:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe"
+LAUNCH_STATE = os.path.join(ROOT, "data", "state", "watchdog_live_mumu_launch.ts")
 
 # 判活用的模块日志：只要其中**任意一个**在动，就说明 daemon 活着
 LIVE_LOGS = ("brain.pendingq.log", "brain.act.log", "core.device.log",
@@ -142,6 +146,40 @@ def adb_ok():
         return False
 
 
+def launch_mumu():
+    """adb 不通时拉起 MuMu 实例；10 分钟节流，避免任务每 2 分钟重复 launch。"""
+    now = time.time()
+    try:
+        with open(LAUNCH_STATE, "r", encoding="ascii") as f:
+            last = float((f.read() or "0").strip())
+    except Exception:
+        last = 0.0
+    if now - last < 600:
+        say("MuMu 实例疑似未启动，但 10 分钟内已尝试 launch → 等待下一轮")
+        return False
+    if not os.path.exists(MM):
+        say("MuMuManager 不存在，无法自动 launch: %s" % MM)
+        return False
+    try:
+        os.makedirs(os.path.dirname(LAUNCH_STATE), exist_ok=True)
+        with open(LAUNCH_STATE, "w", encoding="ascii") as f:
+            f.write(str(now))
+        r = subprocess.run([MM, "control", "-v", "0", "launch"],
+                           capture_output=True, timeout=120)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        say("adb 不通 → MuMu launch rc=%s %s" % (r.returncode, out[:120]))
+    except Exception as e:
+        say("MuMu launch 失败: %r" % (e,))
+        return False
+    # 实测 Android 需要 30~90s 才上线；本轮最多等 40s，下一轮任务继续确认。
+    for _ in range(8):
+        time.sleep(5)
+        if adb_ok():
+            say("MuMu launch 后设备已恢复")
+            return True
+    return False
+
+
 def main():
     pids = daemon_pids()
     age, which = live_age()
@@ -155,6 +193,10 @@ def main():
         except Exception:
             pass
         time.sleep(3)
+        if not adb_ok():
+            if not launch_mumu():
+                say("设备仍不可用 → 本轮不杀 daemon，等 MuMu 启动后再检查")
+                return 0
 
     if not pids:
         say("daemon 不在 → 用计划任务 SoulGuard 拉起")

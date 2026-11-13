@@ -146,6 +146,23 @@ def _skip_uid(to_uid):
     return str(to_uid or "").startswith(SKIP_UID_PREFIX)
 
 
+def _my_last_ts_ms(db, sid):
+    """我方在该会话最后一条消息的毫秒时间；查不到返回 0。
+
+    D7 修复：summary() 统计 AWAITING 时必须传这个值，否则 verdict 会把
+    「我方末条晚于她」的分支恒判成未知。只读 chatmsg，不写 App 库。
+    """
+    if db is None or not sid:
+        return 0
+    try:
+        for m in reversed(db.messages(str(sid), limit=60, skip_system=True)):
+            if str(getattr(m, "sender", "") or "") == str(getattr(db, "uid", "") or ""):
+                return int(getattr(m, "ts", 0) or 0)
+    except Exception as e:
+        log.debug("summary 取我方末条时间失败 sid=%s: %r", sid, e)
+    return 0
+
+
 def unread_sids(db, now_ms=None):
     """当前**有未读**的真人会话 sid 列表（按未读数、时间排序）。
 
@@ -485,13 +502,10 @@ def summary(db, max_age_h=None):
         _b = {V.PENDING: 0, V.FOLLOWING: 0, V.AWAITING: 0,
               V.ARCHIVED: 0, V.NO_HUMAN: 0}
         for x in items:
-            # 🔴 2026-11-12 夜班修复（D7）：这里未传 my_last_ts_ms → sendgate.state_of 里
-            #   or 0.0 → AWAITING 桶恒 0（仅统计口径）。
-            #   取舍：pending.py 属 data 层，只依赖 core/data.imdb，**不能** import
-            #   brain.pendingq 的 _my_last_ts_ms（会破坏单向依赖）。本文件也无等价辅助
-            #   函数 → 按约定加注释留待后续，不大改。要补需在 data 层自建「我方末条时间」
-            #   读取（走 db.messages 按 sender==uid 取），不影响本段其余统计。
-            v = SG.state_of(str(x.sid), her_ts_ms=x.her_ts, has_human=True)
+            # D7：data 层自己读我方末条时间，保持单向依赖，不再让 AWAITING 恒 0。
+            v = SG.state_of(str(x.sid), her_ts_ms=x.her_ts,
+                            my_last_ts_ms=_my_last_ts_ms(db, x.sid),
+                            has_human=True)
             _st = getattr(v, "state", "")
             if _st == V.PENDING_RESTART:
                 _st = V.PENDING
