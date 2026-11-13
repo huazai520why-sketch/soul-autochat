@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from brain import engine, flow
-from brain.engine import brief, gate
+from brain.engine import brief, gate, prompt
 
 
 def test_brief_contract():
@@ -14,6 +14,9 @@ def test_brief_contract():
     assert "问句不是义务" in brief.SYS
     assert "她 ≤4 字" in brief.SYS
     assert "不提问、不追加" in brief.SYS
+    cold = prompt._her_block("嗯", "")
+    assert "优先于" in cold
+    assert "不许用问句去续" in cold
 
 
 def test_short_reply_hard_contract():
