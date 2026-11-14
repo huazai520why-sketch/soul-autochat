@@ -63,7 +63,7 @@
 | 主动唤醒沉默老友 | ✅ | `brain/wake.py` |
 | 「灵魂匹配」自动开场白 | ✅ | `brain/match.py` |
 | 语音消息转文字（faster-whisper） | ✅ | `brain/asr.py`、`brain/voice.py` |
-| 方舟语音合成（TTS 生成音频） | ⚠️ | `hands/tts.py`（需 Agent Plan Key；聊天页语音发送尚未启用） |
+| 火山语音按量付费 TTS（生成音频） | ✅ | `hands/tts.py`（Speech API Key；聊天页语音发送尚未启用） |
 | 发图片 | ✅ | `hands/pic.py` |
 | 奇遇铃（弹窗抢救） | ⚠️ | `brain/bell.py`（需要 OCR，见注释） |
 | 多账号轮转（榨干/超时切号） | ⚠️ | `brain/acct.py`（逻辑完整，UI 路径需按版本校准） |
@@ -196,7 +196,8 @@ python run.py clear            # 只清一轮红点
 python run.py pending 5        # 只处理 5 个「已读未回」
 python run.py match 3          # 只跑 3 轮匹配
 python run.py bell             # 只盯奇遇铃（别和 daemon 同时开）
-python run.py voice --text "你好"  # 方舟 TTS 合成到 data/state/voice_out
+python run.py voice --text "你好"  # 火山 TTS 合成到 data/state/voice_out
+python run.py voice --text "你好" --sid 402857053500884668  # 按该会话记录自动选语气
 ```
 
 ---
@@ -255,7 +256,8 @@ soul-autochat/
 │  ├─ tap.py                  点击（统一入口，动作后使帧缓存失效）
 │  ├─ input.py                输入框灌字、发送、三态校验
 │  ├─ pic.py                  发图片
-│  └─ tts.py                  方舟 Agent Plan TTS 合成与原子落盘
+│  ├─ tts.py                  方舟按量 TTS 合成与原子落盘
+│  └─ voice.py                新版语音模式、录音层、暂停与取消
 ├─ brain/                     ── 决策层：业务规则
 │  ├─ act.py                  Actor：帧复用、动作后确认、快照缓存
 │  ├─ nav.py                  导航：回到某个 tab（带升级梯子）
@@ -307,7 +309,7 @@ soul-autochat/
 │  ├─ prepare_photos.py       照片进相册（发图前置）
 │  └─ *.ps1                   Windows 计划任务注册脚本
 ├─ scripts/repo_sync.ps1      Git 漂移检查与脱敏扫描
-├─ tests/                     ── 28 个保留验收/回放与离线脚本（t_*.py）
+├─ tests/                     ── 30 个保留验收/回放与离线脚本（t_*.py）
 └─ docs/                      ── 架构与部署文档
 ```
 

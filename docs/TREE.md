@@ -1,7 +1,7 @@
 # 目录树
 
 > 2026-11-14 副机生产目录实测。当前运行时 HEAD `47d4440`。
-> 当前约 108 个 Python 文件、24,342 行、1.22 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
+> 当前约 111 个 Python 文件、24,600 行、1.25 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ```text
 soul-autochat/
@@ -38,7 +38,8 @@ soul-autochat/
 │  ├─ tap.py                       统一点击入口，动作前作废帧缓存
 │  ├─ input.py                     灌字、发送、ok/unknown/residual 三态确认
 │  ├─ pic.py                       发图片
-│  └─ tts.py                       方舟 Agent Plan TTS 合成、终止码校验、原子保存
+│  ├─ tts.py                       方舟按量 TTS 合成、终止码校验、原子保存
+│  └─ voice.py                     新版语音输入/录音层/暂停/取消
 │
 ├─ brain/                          决策层
 │  ├─ __init__.py
@@ -55,6 +56,7 @@ soul-autochat/
 │  ├─ bell.py                      奇遇铃、稍后再聊、跨轮去重
 │  ├─ search.py                    搜索定位与熔断
 │  ├─ voice.py / asr.py            语音消息转写
+│  ├─ voice_style.py               按聊天/语音节奏生成 TTS 情绪与方言指令
 │  ├─ acct.py                      多账号轮转
 │  ├─ casepack.py                  画像/案情包
 │  ├─ ratelimit.py                 发送配额
@@ -114,7 +116,7 @@ soul-autochat/
 │  ├─ reg_ops_tasks.ps1            注册运维任务
 │  └─ reg_probe.ps1               注册消息探针
 │
-├─ tests/                          28 个保留验收/回放与离线测试
+├─ tests/                          30 个保留验收/回放与离线测试
 │  ├─ _nolog.py
 │  ├─ t_device.py / t_eyes.py / t_chatlist.py
 │  ├─ t_dbcheck.py / t_casepack.py / t_flow_dry.py
@@ -127,7 +129,8 @@ soul-autochat/
 │  ├─ t_flow_preempt.py / t_health_contract.py
 │  ├─ t_lock_health.py / t_metrics.py
 │  ├─ t_pending_ledger.py / t_pending_policy.py
-│  ├─ t_voice_contract.py / t_tts_contract.py / t_flow_preempt.py
+│  ├─ t_voice_contract.py / t_tts_contract.py / t_voice_style.py
+│  ├─ t_voice_send_ui.py / t_flow_preempt.py
 │  └─ 说明：t_match_loop.py 现仅包装生产模块 brain.match_runner
 │
 ├─ scripts/

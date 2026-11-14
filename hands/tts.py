@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""火山方舟 Agent Plan TTS 客户端。
+"""火山语音按量付费 TTS 客户端。
 
-当前方舟语音合成模型只支持 Agent Plan 个人版/企业版专属或席位 Key：
+默认走新版控制台按量付费 HTTP Chunked 接口：
 `doubao-seed-tts-2.0` -> X-Api-Resource-Id: `seed-tts-2.0`。
-Platform、Coding Plan 和普通按量 Key不能用于该接口。
+`ICL_` 开头的音色属于声音复刻 2.0，自动切换 `seed-icl-2.0`。
 
 这里只负责把文本合成为本地音频，不发聊天消息，也不改模拟器音频路由。
 """
@@ -21,9 +21,9 @@ from core.paths import BASE, STATE
 
 log = get_logger("hands.tts")
 
-DEFAULT_URL = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+DEFAULT_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DEFAULT_RESOURCE_ID = "seed-tts-2.0"
-DEFAULT_SPEAKER = "zh_male_linjiananhai_uranus_bigtts"
+DEFAULT_SPEAKER = "zh_male_liufei_uranus_bigtts"
 DEFAULT_FORMAT = "mp3"
 DEFAULT_SAMPLE_RATE = 24000
 MAX_TEXT = 2000
@@ -42,8 +42,8 @@ def _env(name, default=""):
 
 
 def api_key():
-    """读取 Agent Plan Key；正文永不写日志。"""
-    for name in ("SOUL_TTS_KEY", "SOUL_ARK_PLAN_KEY"):
+    """读取 Speech API Key；正文永不写日志。"""
+    for name in ("SOUL_TTS_KEY", "SOUL_SPEECH_KEY", "SOUL_ARK_PLAN_KEY"):
         value = _env(name)
         if value:
             return value
@@ -60,6 +60,16 @@ def api_key():
 
 def available():
     return bool(api_key())
+
+
+def resource_id_for_speaker(speaker):
+    """按音色自动选择按量资源；显式配置非 auto 时以配置为准。"""
+    explicit = _env("SOUL_TTS_RESOURCE_ID")
+    if explicit and explicit.lower() != "auto":
+        return explicit
+    if (speaker or "").startswith("ICL_"):
+        return "seed-icl-2.0"
+    return DEFAULT_RESOURCE_ID
 
 
 def _save_audio(data, output_dir=None, output_format=None):
@@ -85,12 +95,12 @@ def _save_audio(data, output_dir=None, output_format=None):
 
 
 def synthesize(text, output_dir=None, speaker=None, output_format=None,
-               sample_rate=None, timeout=None):
+               sample_rate=None, timeout=None, style=None):
     """合成一段文本并返回结果字典。
 
     结果至少包含 `path`、`audio_bytes`、`log_id`、`usage`。
     服务端错误码、空音频和网络错误都会抛出 TTSError，绝不返回半成品。
-    本函数会真实调用已计费的 TTS，调用前必须确保 Key 属于 Agent Plan。
+    本函数会真实调用已计费的 TTS。
     """
     value = (text or "").strip()
     if not value:
@@ -101,12 +111,12 @@ def synthesize(text, output_dir=None, speaker=None, output_format=None,
     key = api_key()
     if not key:
         raise TTSConfigError(
-            "缺少 Agent Plan TTS Key：设置 SOUL_TTS_KEY，"
+            "缺少 Speech API Key：设置 SOUL_TTS_KEY，"
             "或写入项目根目录 .tts_key（一行）")
 
     url = _env("SOUL_TTS_URL", DEFAULT_URL)
-    resource_id = _env("SOUL_TTS_RESOURCE_ID", DEFAULT_RESOURCE_ID)
     speaker = speaker or _env("SOUL_TTS_SPEAKER", DEFAULT_SPEAKER)
+    resource_id = resource_id_for_speaker(speaker)
     output_format = output_format or _env("SOUL_TTS_FORMAT", DEFAULT_FORMAT)
     sample_rate = int(sample_rate or _env("SOUL_TTS_SAMPLE_RATE", str(DEFAULT_SAMPLE_RATE)))
     timeout = float(timeout or _env("SOUL_TTS_TIMEOUT", "30"))
@@ -123,6 +133,14 @@ def synthesize(text, output_dir=None, speaker=None, output_format=None,
             },
         },
     }
+    style = dict(style or {})
+    instruction = (style.get("instruction") or "").strip()
+    if instruction:
+        payload["req_params"]["additions"] = json.dumps(
+            {"context_texts": [instruction]}, ensure_ascii=False)
+    speech_rate = style.get("speech_rate")
+    if speech_rate not in (None, "", 0):
+        payload["req_params"]["audio_params"]["speech_rate"] = int(speech_rate)
     headers = {
         "X-Api-Key": key,
         "X-Api-Resource-Id": resource_id,
@@ -196,6 +214,12 @@ def synthesize(text, output_dir=None, speaker=None, output_format=None,
         "log_id": log_id,
         "usage": usage,
         "elapsed_s": round(time.time() - t0, 2),
+        "style": {
+            "mood": style.get("mood") or "",
+            "dialect": style.get("dialect") or "",
+            "speech_rate": int(style.get("speech_rate") or 0),
+            "instruction": instruction,
+        },
     }
     log.info(
         "TTS 完成 speaker=%s chars=%d bytes=%d %.1fs logid=%s",
@@ -204,5 +228,6 @@ def synthesize(text, output_dir=None, speaker=None, output_format=None,
 
 
 __all__ = [
-    "TTSError", "TTSConfigError", "api_key", "available", "synthesize",
+    "TTSError", "TTSConfigError", "api_key", "available",
+    "resource_id_for_speaker", "synthesize",
 ]

@@ -265,15 +265,24 @@ def cmd_pending(n=5, dry=False):
     return 0
 
 
-def cmd_voice(text, speaker=None, save_to=None):
-    """用火山方舟 Agent Plan TTS 生成音频，返回结构化结果。"""
+def cmd_voice(text, speaker=None, save_to=None, sid=None):
+    """用火山语音按量付费 TTS 生成音频，返回结构化结果。"""
     from hands import tts as T
 
+    style = None
+    if sid:
+        from brain.voice_style import infer_from_db
+        from data.imdb import open_account
+
+        db = open_account(Device.get())
+        style = infer_from_db(db, sid)
+        print("语音风格: %s" % style["reason"], file=sys.stderr)
     try:
         result = T.synthesize(
             text,
             output_dir=save_to,
             speaker=speaker,
+            style=style,
         )
     except T.TTSConfigError as e:
         print("TTS 配置错误: %s" % e, file=sys.stderr)
@@ -306,6 +315,7 @@ def main():
     ap.add_argument("--text", default="", help="voice 命令要合成的文本")
     ap.add_argument("--speaker", default="", help="voice 命令音色 ID")
     ap.add_argument("--save-to", default="", help="voice 命令音频输出目录")
+    ap.add_argument("--sid", default="", help="voice 命令按该会话记录推断语气")
     args = ap.parse_args()
 
     # 🔴 2026-11-10（日志缺陷修复）：本文件建了 `log = get_logger("run")` 却一次不用
@@ -339,7 +349,7 @@ def main():
         return cmd_bell(once=args.dry)
     if args.cmd == "voice":
         return cmd_voice(args.text, speaker=args.speaker or None,
-                         save_to=args.save_to or None)
+                         save_to=args.save_to or None, sid=args.sid or None)
     return 2
 
 

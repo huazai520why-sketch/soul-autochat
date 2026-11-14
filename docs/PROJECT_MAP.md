@@ -96,14 +96,14 @@ flowchart LR
 |---|---:|---|
 | `core/` | 6 | 设备、路径、日志、结构化指标、纯消息分类 |
 | `eyes/` | 9 | UI 树、页面、列表、气泡、主页、弹窗、OCR、系统消息、公开导出 |
-| `hands/` | 5 | 点击、输入、图片、方舟 TTS、公开导出 |
+| `hands/` | 6 | 点击、输入、图片、按量 TTS、新版语音录音动作、公开导出 |
 | `brain/` | 36 | 决策、流程、候选排序、匹配运行器、出话引擎、案情包、账号与技能 |
 | `data/` | 6 | App SQLite、待回台账、共享冷却/已回台账、回复状态、变更监听 |
 | `guard/` | 4 | 主循环、单实例锁、看门狗、公开导出 |
-| `tests/` | 28 | 保留的验收/回放与离线契约测试 |
+| `tests/` | 30 | 保留的验收/回放与离线契约测试 |
 | `tools/` | 13 | 静默启动、探针、守护、运维与注册脚本 |
 
-合计约 108 个 Python 文件、24,342 行、1.22 MB（不含回收区）。
+合计约 111 个 Python 文件、24,600 行、1.25 MB（不含回收区）。
 
 ## 5. 当前保留的测试
 
@@ -120,7 +120,7 @@ t_skills_replay.py        t_wake_plan.py
 t_flow_preempt.py         t_health_contract.py
 t_lock_health.py          t_metrics.py
 t_pending_ledger.py       t_pending_policy.py       t_voice_contract.py
-t_tts_contract.py
+t_tts_contract.py         t_voice_style.py         t_voice_send_ui.py
 ```
 
 历史 `t_probe_*`、`t_switch*`、`t_doubletap_*`、相册/截图/一次性诊断脚本已移入 `E:\_soul_trash_20261114`，可按 `manifest.csv` 和 `rollback.ps1` 恢复。
@@ -151,7 +151,8 @@ t_tts_contract.py
 - `tools/watchdog_live.py`：日志静默和锁心跳联合判断，避免长阶段被单一日志来源误杀。
 - `brain/voice.py`：先读 App 自带 `word`，为空时本地 Whisper 转写；会话摘要 `[语音]` 缺少 URL 时回查真实 type=5 `chatmsg` 行。
 - 语音转写成功后会进入正常待回排序，并优先于较老的纯文本积压；搜索计划可用昵称、语音转写文本和历史唯一句。昵称缺失时会从 flow 日志回填，较老语音候选允许检查更深列表；已经开始的单条语音定位窗口不再被普通新消息无限打断。
-- `hands/tts.py`：火山方舟 Agent Plan `doubao-seed-tts-2.0` 的 HTTP Chunked TTS 客户端，校验 `code=20000000` 后原子保存音频。Platform/Coding Plan Key 不属于可用凭证；当前账号尚无 Agent Plan 订阅，因此生成入口已接、真实调用与聊天页语音发送尚未启用。
+- `hands/tts.py`：火山语音新版控制台按量付费 HTTP Chunked TTS 客户端，校验 `code=20000000` 后原子保存音频。普通 2.0 音色使用 `seed-tts-2.0`，`ICL_` 复刻音色自动切换 `seed-icl-2.0`；当前生产 Key 与刘飞 2.0 已真实合成成功。
+- `brain/voice_style.py`：按最近聊天内容和她的语音节奏生成 `context_texts` 语音指令；情绪覆盖温柔/暧昧/严肃/轻松/疲惫，方言只在连续出现明确方言词时启用。`run.py voice --sid <sid>` 直接读取真实会话。
 
 ## 8. 清理边界
 

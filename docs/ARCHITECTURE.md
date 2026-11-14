@@ -147,13 +147,35 @@ rows()       → 双闸：行高 ≥ 6.9% 屏高 + 行内有内容
 
 ### 4.0 语音合成 `hands/tts.py`
 
-`run.py voice --text "..."` 通过火山方舟 Agent Plan HTTP Chunked TTS 生成音频。
-客户端只接受 Agent Plan 个人版/企业版 Key，逐块解析 base64 音频，并且必须收到
+`run.py voice --text "..."` 通过火山语音新版控制台按量付费 HTTP Chunked TTS 生成音频。
+客户端使用 Speech API Key，逐块解析 base64 音频，并且必须收到
 `code=20000000` 终止码才落盘；缺 Key、服务端错误、半截流都不会产生成品文件。
-默认音色为 `zh_male_linjiananhai_uranus_bigtts`（邻家男孩 2.0）。
+默认音色为 `zh_male_liufei_uranus_bigtts`（刘飞 2.0）；`ICL_` 开头的复刻音色
+自动切换 `seed-icl-2.0`，普通 2.0 音色使用 `seed-tts-2.0`。
+
+`run.py voice --sid <sid>` 会由 `brain/voice_style.py` 读取该会话最近消息：
+她难过/失眠时用轻声心疼，暧昧时声音放低，生气时克制认真，玩笑时轻松带笑；
+最近一条是语音时，用 ASR 文本和时长估计她的语速并轻微跟随。方言只在聊天里
+持续出现明确方言词时追加到 `context_texts`，避免口头禅造成口音漂移。
 
 该模块只负责“文本 → 本地音频”，不负责模拟器录音和聊天页发送。聊天页语音消息还需要
 宿主播放到虚拟声卡、MuMu 麦克风路由和录音 UI 三态确认，不能仅凭 TTS 发声就宣称已发出语音。
+
+### 4.0b 新版语音发送 UI
+
+2026-11-14 实测 Soul 当前版本与旧脚本不同：
+
+- 文本模式点 `menu_tab_voice_inner_outside` 才进入语音模式；
+- 语音模式同时有 `tv_press_to_speak`（按住说话）和新增的
+  `audio_record_view_optimize`（录音）；
+- 点“录音”后进入全屏层 `c_ct_new_normal_record_view2`；
+- 录音中 `imvStatus` 是暂停，左键 `btn_delete` 是取消；
+- 暂停预览态有 `rlVoiceContainer`（播放）、`btn_delete`（取消）和
+  `btnChangeText`（转文字）。
+
+当前可访问树没有独立“发送语音”控件，因此 `hands/voice.py` 只做模式切换、录音启动、
+暂停和取消，`send_reviewed()` 明确拒绝猜测发送。禁止用返回键或盲点预览冒充发送，
+否则可能给真人发出空录音。
 
 ### 4.1 统一入口 `hands/tap.py`
 
