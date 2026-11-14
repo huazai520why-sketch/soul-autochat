@@ -661,6 +661,12 @@ def next_one(actor, max_wait=8.0):
         last = s
         pg = detect(s)
         if quota_out(s):
+            # 🔴 2026-11-15 上午复查（D2 取证）：记录弹层原文（校准 quota_out）。
+            try:
+                log.warning("额度弹层命中（next 后）原文=%r",
+                            " | ".join(list(s.texts())[:12]))
+            except Exception:
+                pass
             _dismiss_quota(actor, s)
             return s, "no_quota", "no_quota"
         # 必须同时满足：新指纹 + 仍是会话页 + 出现匹配卡。
@@ -747,6 +753,13 @@ def start_match(actor, max_wait=25):
         return snap, pg                      # 回不到星球页，由上层记失败
 
     if quota_out(snap):
+        # 🔴 2026-11-15 上午复查（D2 取证）：昨晚弹层在卡面剩余 35-38 次时也出现过，
+        #   quota_out 子串是否被其它弹层误命中待证——命中时把弹层原文记下来校准。
+        try:
+            log.warning("额度弹层命中（planet）原文=%r",
+                        " | ".join(list(snap.texts())[:12]))
+        except Exception:
+            pass
         _dismiss_quota(actor, snap)
         return snap, "no_quota"
     n, remain = match_entry(snap)

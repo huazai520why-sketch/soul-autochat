@@ -170,7 +170,10 @@ def find_sid(db, text, device=None, tries=3):
         if device is not None and i > 0:
             try:
                 from data import imdb
-                db = imdb.open_account(device)
+                # 🔴 2026-11-15 上午复查（C09，P1）：重试原来不带 force，open_account
+                #   走 300s 缓存 → 3 次重试看到同一份旧镜像，刚发的开场白永远查不到
+                #   （凌晨实证 8/11 条反查失败丢档案）。改为每次重试强制重拉。
+                db = imdb.open_account(device, force=True)
             except Exception as e:
                 log.warning("重新拉库失败: %r", e)
         try:
