@@ -1,7 +1,7 @@
 # 目录树
 
-> 2026-11-14 副机生产目录实测。基线 HEAD `d18be4e`。
-> 当前约 94 个 Python 文件、2.33 万行、1.18 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
+> 2026-11-14 副机生产目录实测。基线 HEAD `dc03e05`。
+> 当前约 105 个 Python 文件、2.38 万行、1.20 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ```text
 soul-autochat/
@@ -18,7 +18,9 @@ soul-autochat/
 │  ├─ __init__.py
 │  ├─ device.py                    adb/root/u2、动作代数、慢设备因子、设备探测
 │  ├─ paths.py                     路径、包名、分辨率、底栏文案、MuMu 路径
-│  └─ log.py                       按模块写日志、UTF-8 stdout、轮转
+│  ├─ log.py                       按模块写日志、UTF-8 stdout、轮转
+│  ├─ metrics.py                   JSONL 结构化指标
+│  └─ message_kind.py              纯消息分类（human/system/ad）
 │
 ├─ eyes/                           感知层（只读）
 │  ├─ __init__.py
@@ -44,8 +46,10 @@ soul-autochat/
 │  ├─ flow.py                      ★ 进会话 → 判定 → 出话 → 发送
 │  ├─ clear.py                     清红点
 │  ├─ pendingq.py                  ★ 唯一待回候选判据
+│  ├─ pending_policy.py            纯候选排序/冷却策略
 │  ├─ reply.py                     出话编排、条数、兜底话术
 │  ├─ match.py                     星球匹配与开场白
+│  ├─ match_runner.py              `run.py match` 的生产运行器
 │  ├─ wake.py                      沉默老友唤醒
 │  ├─ bell.py                      奇遇铃、稍后再聊、跨轮去重
 │  ├─ search.py                    搜索定位与熔断
@@ -78,6 +82,7 @@ soul-autochat/
 │  ├─ imdb.py                      直读 App SQLite、缩水保护、镜像合并
 │  ├─ pending.py                   待回台账（当前反向依赖 brain 三个判据模块）
 │  ├─ reply_state.py               回复状态
+│  ├─ pending_ledger.py            共享冷却/已回台账
 │  └─ watch.py                     数据库变更监听
 │
 ├─ guard/                          守护层
@@ -108,7 +113,7 @@ soul-autochat/
 │  ├─ reg_ops_tasks.ps1            注册运维任务
 │  └─ reg_probe.ps1               注册消息探针
 │
-├─ tests/                          20 个保留验收/回放测试
+├─ tests/                          26 个保留验收/回放与离线测试
 │  ├─ _nolog.py
 │  ├─ t_device.py / t_eyes.py / t_chatlist.py
 │  ├─ t_dbcheck.py / t_casepack.py / t_flow_dry.py
@@ -118,7 +123,10 @@ soul-autochat/
 │  ├─ t_kw_masked_phone.py / t_followup_replay.py
 │  ├─ t_nav_ladder.py / t_skills_replay.py
 │  ├─ t_prompt_dump.py / t_wake_plan.py
-│  └─ 说明：t_match_loop.py 是 `run.py match` 的运行依赖，禁止清理
+│  ├─ t_flow_preempt.py / t_health_contract.py
+│  ├─ t_lock_health.py / t_metrics.py
+│  ├─ t_pending_ledger.py / t_pending_policy.py
+│  └─ 说明：t_match_loop.py 现仅包装生产模块 brain.match_runner
 │
 ├─ scripts/
 │  └─ repo_sync.ps1                Git 漂移检查、脱敏扫描

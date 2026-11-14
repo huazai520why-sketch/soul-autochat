@@ -44,6 +44,7 @@ from brain import wake as W  # noqa: E402
 from brain.act import Actor  # noqa: E402
 from core.device import Device  # noqa: E402
 from core.log import get_logger  # noqa: E402
+from core import metrics as MET  # noqa: E402
 from core.paths import STATE  # noqa: E402
 from data import watch as DBW  # noqa: E402  (注意：W 已被 brain.wake 占用)
 from data.imdb import open_account  # noqa: E402
@@ -252,9 +253,13 @@ def _hb(tag=""):
       现在：在长耗时段内部主动打心跳，watchdog 只在「真的没动静」时才动手。
     """
     try:
-        lock.touch(tag or "hb")
+        if lock.touch(tag or "hb"):
+            return
+        ok, why = lock.ensure("daemon")
+        if not ok:
+            raise RuntimeError("daemon 锁已丢失且无法恢复: %s" % why)
     except Exception:
-        pass
+        raise
 
 
 def _post_switch_phase(st, db):
@@ -617,6 +622,9 @@ def cycle(a, dev, db, st, dry_run=False):
         if pq.get("aborted") == "not_chatlist":
             log.warning("已读未回被设备级故障中止（连续多次回不到 chatlist）→ 本轮不再重试，"
                         "交给下一轮/watchdog")
+        if pq.get("aborted") == "preempted":
+            log.info("已读未回为新消息/奇遇铃让路 → 立即结束本轮后续阶段")
+            return "replied" if pq.get("sent") else "preempted"
         if pq["sent"]:
             replied_any = True
             log.info("已读未回补回 %d 条", pq["sent"])
@@ -1297,6 +1305,10 @@ def run(once=False, dry_run=False):
         while True:
             rounds += 1
             t0 = time.time()
+            lock_ok, lock_why = lock.ensure("daemon")
+            if not lock_ok:
+                log.error("daemon 锁校验失败：%s（为防止双实例，本进程退出）", lock_why)
+                return 3
             lock.touch("round")
             try:
                 if not device_ready(dev, a):
@@ -1322,15 +1334,26 @@ def run(once=False, dry_run=False):
                 #   **一路真发**：实测 16:34 一轮 dry 给 4 个会话发出去 9 条消息
                 #   （含给同一人连发 3 条开场白）。演练必须是演练。
                 what = cycle(a, dev, db, st, dry_run=dry_run)
+                elapsed = time.time() - t0
                 # 🔴 2026-11-08 21:3x：把「真干了活」的轮次记成活跃时间，
                 #   供 acct 的空闲兜底切号（读不到匹配次数时按空闲时长决定是否切）。
-                if what in ("replied", "matched", "waked", "switched", "bell"):
+                if what in ("replied", "preempted", "matched", "waked", "switched", "bell"):
                     try:
                         from brain import acct as _AC2
                         _AC2.mark_active()
                     except Exception:
                         pass
-                log.info("[第 %d 轮] %s  用时 %.1fs", rounds, what, time.time() - t0)
+                log.info("[第 %d 轮] %s  用时 %.1fs", rounds, what, elapsed)
+                MET.emit(
+                    "round_end",
+                    round=rounds,
+                    result=what,
+                    elapsed_s=round(elapsed, 3),
+                    pending_sent=int(st.get("pending_sent", 0) or 0),
+                    pending_zero_rounds=int(st.get("pending_zero_rounds", 0) or 0),
+                    uid=str(getattr(db, "uid", "") or ""),
+                    dry_run=bool(dry_run),
+                )
                 save_state(st)
 
                 if once:
@@ -1354,7 +1377,14 @@ def run(once=False, dry_run=False):
                 log.info("收到中断 → 退出")
                 break
             except Exception:
-                log.error("单轮异常:\n%s", traceback.format_exc())
+                tb = traceback.format_exc()
+                log.error("单轮异常:\n%s", tb)
+                MET.emit(
+                    "round_error",
+                    round=rounds,
+                    elapsed_s=round(time.time() - t0, 3),
+                    traceback=tb,
+                )
                 save_state(st)
                 time.sleep(60)
                 if rounds > 10000:

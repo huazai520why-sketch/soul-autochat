@@ -128,9 +128,11 @@ def _atomic_create(d):
 
 def status():
     """返回 (是否被别的进程持有, 锁信息)。"""
+    if not LOCK_FILE.exists():
+        return False, {}
     d = _read()
     if not d:
-        return False, {}
+        return False, {"why": "锁文件为空或损坏"}
     pid = d.get("pid")
     ts = float(d.get("ts") or 0)
     age = time.time() - ts
@@ -185,20 +187,43 @@ def acquire(owner="daemon"):
     return True, "ok"
 
 
+def ensure(owner="daemon"):
+    """Ensure this process still owns a lock.
+
+    This is a safety net for a lock file being removed or replaced while the
+    daemon is already running. If the file merely vanished, the current owner
+    atomically recreates it. If another live process owns it, this process
+    reports failure so the caller can stop instead of running a second daemon.
+    """
+    global _held
+    if not _held:
+        return acquire(owner)
+    d = _read()
+    if d.get("pid") == _pid:
+        return True, "已持有"
+
+    _held = False
+    ok, why = acquire(owner)
+    if ok:
+        log.warning("daemon 锁丢失/被替换 → 当前进程已自愈重建")
+    return ok, why
+
+
 def touch(step=""):
     """刷新心跳。只有持锁时才写。"""
     if not _held:
-        return
+        return False
     d = _read()
     if d.get("pid") != _pid:
         # 锁被别人接管了（自己的心跳不该续别人的命）
-        return
+        log.error("心跳失败：锁 owner 已变为 pid=%s（本进程 pid=%s）", d.get("pid"), _pid)
+        return False
     d["ts"] = time.time()
     if step:
         if d.get("step") != step:
             d["step"] = step
             d["step_ts"] = time.time()
-    _write(d)
+    return _write(d)
 
 
 def step_age():

@@ -21,13 +21,19 @@
 # NOTE: keep this file PURE ASCII. Chinese chars get mangled to GBK over scp
 #       and cause "string missing terminator" parser errors on the remote host.
 $ErrorActionPreference = "Continue"
-Set-Location "E:\soul1.0"
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
 
 $py = $env:SOUL_PY
-if (-not $py) { $py = 'C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\python.exe' }
-if (-not (Test-Path $py)) { $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
+$candidates = @(
+    (Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\soulocr\Scripts\python.exe'),
+    (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+)
+foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path $candidate)) { $py = $candidate; break }
+}
 if (-not $py) { throw "python.exe not found; set SOUL_PY env var to your interpreter" }
-$log = "E:\soul1.0\logs\daemon.out"
+$log = Join-Path $Root "logs\daemon.out"
 
 function Write-Log([string]$msg) {
     # daemon.out is held open by the running daemon, so a plain Out-File can
@@ -56,10 +62,13 @@ if ($existing) {
 Write-Log "=== daemon starting (detached, windowless) ==="
 
 $pyw = $py.Replace('python.exe', 'pythonw.exe')
-if (-not (Test-Path $pyw)) { $pyw = 'C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe' }
+if (-not (Test-Path $pyw)) {
+    $pyw = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe'
+}
+if (-not (Test-Path $pyw)) { $pyw = $py }
 Start-Process -FilePath $pyw `
-              -ArgumentList 'E:\soul1.0\tools\silent_launch.py', 'daemon' `
-              -WorkingDirectory 'E:\soul1.0' `
+              -ArgumentList (Join-Path $Root 'tools\silent_launch.py'), 'daemon' `
+              -WorkingDirectory $Root `
               -WindowStyle Hidden
 
 Start-Sleep -Seconds 2

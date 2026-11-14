@@ -16,12 +16,17 @@ import sys
 import subprocess
 import traceback
 
-ROOT = r"E:\soul1.0"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 LOGS = os.path.join(ROOT, "logs")
 SHIM = os.path.join(TOOLS, "_silent")
-PY = r"C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\python.exe"
-PYW = r"C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe"
+_EXE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+PY = os.path.join(_EXE_DIR, "python.exe")
+PYW = os.path.join(_EXE_DIR, "pythonw.exe")
+if not os.path.isfile(PY):
+    PY = sys.executable
+if not os.path.isfile(PYW):
+    PYW = sys.executable
 LAUNCH = os.path.join(TOOLS, "silent_launch.py")
 
 CREATE_NO_WINDOW = 0x08000000

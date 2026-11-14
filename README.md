@@ -106,8 +106,8 @@
 **依赖方向是单向的**：`guard → brain → eyes/hands → core`。
 `eyes` 不许 import `hands`，`hands` 不许 import `eyes`。这条规则让「读」和「写」永远可以单独测试。
 
-> 当前生产代码另有两个已登记的结构债：`data/pending.py` 反向导入 `brain` 三个判据模块，
-> `eyes/sysmsg.py` 直读 `data.imdb`。它们运行稳定，本轮不强拆；新增代码仍应遵守上方的正常依赖方向。
+> 当前跨层依赖违规已清零：冷却/已回台账下沉到 `data/pending_ledger.py`，
+> 消息分类下沉到 `core/message_kind.py`，`run.py match` 走 `brain/match_runner.py`。
 
 ### 一次「她发消息 → 我回复」的完整时间线
 
@@ -235,7 +235,9 @@ soul-autochat/
 ├─ core/                      ── 设备层：和手机打交道
 │  ├─ device.py               adb 封装、root、截图、动作代数、慢设备因子
 │  ├─ paths.py                路径常量、adb 候选路径、包名
-│  └─ log.py                  统一日志（UTF-8 + 行缓冲 + 按模块分文件）
+│  ├─ log.py                  统一日志（UTF-8 + 行缓冲 + 按模块分文件）
+│  ├─ metrics.py              JSONL 结构化运行指标
+│  └─ message_kind.py         纯消息分类（human/system/ad）
 ├─ eyes/                      ── 感知层：只读，不点
 │  ├─ uitree.py               dump UI 树 → Snapshot；hit()/tab() 三级定位
 │  ├─ page.py                 页面识别 detect()、底栏角标 badges()
@@ -254,8 +256,10 @@ soul-autochat/
 │  ├─ flow.py                 进会话 → 判定 → 出话 → 发送（主链路）
 │  ├─ clear.py                清红点
 │  ├─ pendingq.py             「已读未回」候选池（唯一待回判据）
+│  ├─ pending_policy.py       纯候选排序与冷却策略
 │  ├─ reply.py                出话编排（几条、怎么拆、失败兜底）
 │  ├─ match.py                匹配 + 开场白
+│  ├─ match_runner.py         `run.py match` 的生产运行器
 │  ├─ wake.py                 唤醒沉默老友
 │  ├─ search.py               搜索定位会话（列表翻不到时的兜底）
 │  ├─ bell.py                 奇遇铃
@@ -281,6 +285,7 @@ soul-autochat/
 ├─ data/                      ── 数据层
 │  ├─ imdb.py                 直读 App 明文 SQLite（**严格只读**）
 │  ├─ pending.py              待回台账
+│  ├─ pending_ledger.py       共享冷却/已回复台账
 │  └─ watch.py                数据库变更监听
 ├─ tools/                     ── 运维脚本
 │  ├─ silent_launch.py        所有 Soul 计划任务统一静默启动
@@ -296,7 +301,7 @@ soul-autochat/
 │  ├─ prepare_photos.py       照片进相册（发图前置）
 │  └─ *.ps1                   Windows 计划任务注册脚本
 ├─ scripts/repo_sync.ps1      Git 漂移检查与脱敏扫描
-├─ tests/                     ── 20 个保留验收/回放脚本（t_*.py）
+├─ tests/                     ── 26 个保留验收/回放与离线脚本（t_*.py）
 └─ docs/                      ── 架构与部署文档
 ```
 

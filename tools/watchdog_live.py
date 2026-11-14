@@ -17,6 +17,7 @@
 所有动作写 alerts.log。
 """
 import io
+import json
 import os
 import re
 import subprocess
@@ -45,6 +46,7 @@ MM = r"D:\MuMuPlayer\nx_main\MuMuManager.exe"
 if not os.path.exists(MM):
     MM = r"D:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe"
 LAUNCH_STATE = os.path.join(ROOT, "data", "state", "watchdog_live_mumu_launch.ts")
+LOCK_JSON = os.path.join(ROOT, "data", "state", "daemon.lock")
 
 # 判活用的模块日志：只要其中**任意一个**在动，就说明 daemon 活着
 LIVE_LOGS = ("brain.pendingq.log", "brain.act.log", "core.device.log",
@@ -117,6 +119,17 @@ def live_age():
         if a < best:
             best, name = a, f
     return best, name
+
+
+def lock_age():
+    """Age of the daemon's own heartbeat, or None when the lock has no timestamp."""
+    try:
+        with open(LOCK_JSON, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        raw = d.get("step_ts") or d.get("ts")
+        return max(0.0, time.time() - float(raw)) if raw else None
+    except Exception:
+        return None
 
 
 def count_restart_app(window=LOOP_WINDOW):
@@ -192,6 +205,7 @@ def launch_mumu():
 def main():
     pids = daemon_pids()
     age, which = live_age()
+    lage = lock_age()
     restarts = count_restart_app()
 
     if not adb_ok():
@@ -219,15 +233,16 @@ def main():
         start_daemon()
         return 0
 
-    if age > STALL_SEC:
+    if age > STALL_SEC and (lage is None or lage > STALL_SEC):
         say("全部模块日志静默 %.0fs（>%ds）→ 判定卡死，kill 并拉起" % (age, STALL_SEC))
         kill_daemon()
         time.sleep(2)
         start_daemon()
         return 0
 
-    print("[watchdog] %s 正常 pids=%s 最活跃日志=%s(%.0fs) 重启Soul=%d"
-          % (time.strftime("%H:%M:%S"), pids, which, age, restarts))
+    print("[watchdog] %s 正常 pids=%s 最活跃日志=%s(%.0fs) lock=%s 重启Soul=%d"
+          % (time.strftime("%H:%M:%S"), pids, which, age,
+             ("%.0fs" % lage) if lage is not None else "missing", restarts))
     return 0
 
 

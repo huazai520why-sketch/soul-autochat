@@ -12,37 +12,23 @@
   * 系统消息只跳过、不冷却、不更新 her_ts（C5/C8），由调用方据此决定。
 """
 from typing import Optional
+from core import message_kind as _MK
 
-HUMAN = "human"
-SYSTEM = "system"
-AD = "ad"
-
-# 与 brain/pendingq.py、data/pending.py 的 SYS_TEXTS 保持一致
-SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消息]")
-
-# 真人消息占位串：不能当系统消息
-HUMAN_PLACEHOLDERS = ("[语音]", "[图片]", "[表情]", "[视频]", "[位置]", "[文件]")
+HUMAN = _MK.HUMAN
+SYSTEM = _MK.SYSTEM
+AD = _MK.AD
+SYS_TEXTS = _MK.SYS_TEXTS
+HUMAN_PLACEHOLDERS = _MK.HUMAN_PLACEHOLDERS
 
 # 🔴 §106 交叉审查实证（P1-2）：旧版对 SYSTEM_HINTS 做**子串**匹配，
 #    把「通话时长挺长的」「此消息很重要」「你已成功啦」「互相关注吧」
 #    这些真人话判成系统卡 → pendingq 直接 continue，永久漏回。
 #    改成两层：无歧义固定整句（硬判据）+ 平台提示前缀且文本够长（软判据）。
-SYSTEM_HARD = (
-    "互相关注后即可", "发送一条消息即可", "对方撤回了一条消息",
-    "消息已撤回", "语音通话结束", "视频通话结束", "对方拒绝了",
-)
-SYSTEM_PREFIX = (
-    "对方设置了", "系统提示", "温馨提示", "请遵守", "社区规范",
-    "实名认证", "青少年模式", "安全提醒", "该消息已", "通话时长",
-    "你已成功", "已成为好友",
-)
+SYSTEM_HARD = _MK.SYSTEM_HARD
+SYSTEM_PREFIX = _MK.SYSTEM_PREFIX
 
 # 营销 / 广告（_OFFICIAL_HINTS 同源）
-AD_HINTS = (
-    "积分", "礼物", "周报", "兑换", "优惠", "上新", "限时", "福利",
-    "领取", "会员", "直播", "任务", "打卡", "高定", "邀你", "快来看看",
-    "即将登场", "广告", "下载APP", "点击链接", "关注公众号", "扫码",
-)
+AD_HINTS = _MK.AD_HINTS
 
 
 def classify(
@@ -63,36 +49,14 @@ def classify(
         ``"human"`` / ``"system"`` / ``"ad"``。空文本按 system 处理
         （不能拿空串当她说了话，去推进 her_ts 水位线）。
     """
-    try:
-        from data import imdb as _IM
-        sys_types = tuple(getattr(_IM, "SYS_TYPES", (27, 35)) or (27, 35))
-    except Exception:
-        sys_types = (27, 35)
+    sys_types = _MK.SYSTEM_TYPES
     try:
         if msg_type is not None and int(msg_type) in sys_types:
             return SYSTEM
     except (TypeError, ValueError):
         pass
 
-    t = (text or "").strip()
-    if not t:
-        return SYSTEM
-    # 真人占位串优先：它长得像系统文本，但语义是真人发来的
-    if any(t.startswith(p) or t == p for p in HUMAN_PLACEHOLDERS):
-        return HUMAN
-    if t in SYS_TEXTS or any(k in t for k in SYS_TEXTS):
-        return SYSTEM
-    u = str(uid or "")
-    if u.startswith("2042683") or (u.startswith("-") and u[1:].isdigit()):
-        return AD
-    if any(k in t for k in SYSTEM_HARD):
-        return SYSTEM
-    if len(t) >= 12 and any(t.startswith(p) for p in SYSTEM_PREFIX):
-        return SYSTEM
-    # 🔴 普通会话**不按营销关键词判广告**：她说「我刚领了个礼物」是真人话，
-    #    误杀成 ad = 永久漏回，比漏判一张系统卡严重得多。
-    #    AD_HINTS 只在官方号段（上面那一行）生效。
-    return HUMAN
+    return _MK.classify(text, msg_type, uid)
 
 
 def is_human(

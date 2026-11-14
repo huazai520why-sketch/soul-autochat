@@ -30,7 +30,7 @@
 分层
 ═══════════════════════════════════════════════════════════════════════
 
-本模块属于 `data/` 层，**只依赖 core 和 data.imdb**，绝不 import eyes/brain
+本模块属于 `data/` 层，**只依赖 core/data**，绝不 import eyes/brain
 （保持项目「guard → brain → eyes/hands → core」的单向依赖）。
 因此这里只做「从库里算出结论」，不含任何 UI 动作；要不要点、怎么点由 brain 决定。
 
@@ -39,13 +39,15 @@
     count_pending(db)             -> int                  # daemon 日志用的一眼指标
     unread_sids(db)               -> [sid, ...]           # 清红点的目标清单（替代屏幕红点）
 
-冷却复用 `brain.pendingq` 的失败台账（`should_skip`），但**用延迟导入**：
-data 层不能反向依赖 brain 层，且 pendingq 的 import 链很重（会拉起 flow/search）。
+冷却和已回状态使用 `data.pending_ledger`。它不含设备/UI 逻辑，data 统计与
+brain 编排读取的是同一份台账，避免 brain/data 反向依赖或两套口径漂移。
 """
 import os
 import time
 
 from core.log import get_logger
+from core import message_kind as MK
+from data import pending_ledger as PL
 
 log = get_logger("data.pending")
 
@@ -58,7 +60,7 @@ SKIP_UID_PREFIX = ("2042683",)
 # 系统类文本：不是真人说的话，回了等于对机器说话（与 pendingq.SYS_TEXTS 一致）
 # 🔴 探针实测（2026-11-08）：不过滤的话 `[互动消息]` 会被当成「该回」混进队列
 #    （sid 尾 460061497 就是这种）。这类必须排除。
-SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消息]")
+SYS_TEXTS = MK.SYS_TEXTS
 
 # 优先级常量（数值越小越优先）
 PRI_UNREAD = 0          # 有未读（= 屏幕上会有红点，她正在等）
@@ -103,17 +105,15 @@ class PendingItem(object):
 
 
 def _cooling(sid, txt):
-    """是否在失败台账冷却期内（延迟 import brain.pendingq，避免反向依赖）。
+    """Whether this exact message is still in the shared failure cooldown.
 
-    失败台账语义（见 brain/pendingq.py:457 should_skip）：
+    失败台账语义（见 data/pending_ledger.py）：
       同一 sid + **同一句末条** 才冷却；她一说新话就自动失效。
     所以冷却不会让人永久失联，只是别每轮白烧。
     """
     try:
-        from brain.pendingq import should_skip
-        return bool(should_skip(sid, txt))
+        return bool(PL.should_skip(sid, txt))
     except Exception as e:
-        # brain 层还没就绪 / 循环 import → 当作不冷却（宁可多试一次，不要漏回）
         log.debug("冷却台账不可用（按不冷却处理）: %r", e)
         return False
 
@@ -126,15 +126,14 @@ def _replied(sid, to_uid, txt, her_ts):
       —— 因为「末条是她」这个条件在她没再说话时**永远成立**。这正是
       pendingq.py:101 记录的现网事故：「uid=*** 在 09:31~09:35 被连回 5 次」，
       在真人眼里就是个复读机器人。
-      `brain.pendingq._recently_replied` 的台账语义是
+      `data.pending_ledger.recently_replied` 的台账语义是
       「同一 sid + 同一句末条 = 已回过；她说了新话（文本变了 / 时间更晚）才放行」，
       这里**完全复用**它，避免两套口径打架。
 
     返回 True 表示已回过（该跳过）。
     """
     try:
-        from brain.pendingq import _recently_replied
-        return bool(_recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=her_ts))
+        return bool(PL.recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=her_ts))
     except Exception as e:
         # 拿不到台账时**按未回过处理**：漏回比重复更糟（用户铁律「必回」优先）
         log.debug("已回台账不可用（按未回过处理）: %r", e)
@@ -336,12 +335,11 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
         #   本来就会 continue，归档判定只对「她发的」有意义。
         if str(sid) in _archived:
             try:
-                from eyes import sysmsg as _SM
                 from data import reply_state as _RS2
                 _lt = (getattr(last, "text", "") or "").strip()
-                _human_ok = (_SM.is_human(_lt, getattr(last, "msg_type", None), uid=to_uid)
+                _human_ok = (MK.is_human(_lt, getattr(last, "msg_type", None), uid=to_uid)
                              if _lt else
-                             int(getattr(last, "msg_type", 0) or 0) not in (27, 35))
+                             int(getattr(last, "msg_type", 0) or 0) not in MK.SYSTEM_TYPES)
                 _is_new_her = (str(sender) != str(db.uid) and _human_ok
                                and int(getattr(last, "ts", 0) or 0) > _RS2.her_ts_of(str(sid)))
                 if not _is_new_her:
@@ -490,40 +488,9 @@ def summary(db, max_age_h=None):
         ready24 = len(should_reply(db, **_kw24))
     except Exception:
         pass
-    # 跟进阶梯接线（§104-B3）：四桶状态分布，只读不落盘。
-    #    整体 try/except：统计失败各桶填 -1，不影响原摘要返回。
-    #    verdict 共 6 档状态，本摘要按口径输出 5 个桶（pending/following/awaiting/
-    #    archived/no_human）；PENDING_RESTART（待回且需重新开场）并入 pending 桶，
-    #    不是漏了一档 —— 它与 PENDING 同属 verdict.QUEUEABLE「待回」。
-    b_pending = b_following = b_awaiting = b_archived = b_no_human = -1
-    try:
-        from brain import sendgate as SG
-        from brain import verdict as V
-        _b = {V.PENDING: 0, V.FOLLOWING: 0, V.AWAITING: 0,
-              V.ARCHIVED: 0, V.NO_HUMAN: 0}
-        for x in items:
-            # D7：data 层自己读我方末条时间，保持单向依赖，不再让 AWAITING 恒 0。
-            v = SG.state_of(str(x.sid), her_ts_ms=x.her_ts,
-                            my_last_ts_ms=_my_last_ts_ms(db, x.sid),
-                            has_human=True)
-            _st = getattr(v, "state", "")
-            if _st == V.PENDING_RESTART:
-                _st = V.PENDING
-            if _st in _b:
-                _b[_st] += 1
-        b_pending = _b[V.PENDING]
-        b_following = _b[V.FOLLOWING]
-        b_awaiting = _b[V.AWAITING]
-        b_archived = _b[V.ARCHIVED]
-        b_no_human = _b[V.NO_HUMAN]
-    except Exception:
-        pass
-
     txt = ("待回 %d 人（未读 %d / 已读未回 %d），最老 %s 前，可立即处理 %s 人"
-           "｜ 四桶 pending=%d / following=%d / awaiting=%d / archived=%d / no_human=%d"
            % (len(items), n_unread, n_read, old_s,
-              ready if ready >= 0 else "?",
-              b_pending, b_following, b_awaiting, b_archived, b_no_human))
+              ready if ready >= 0 else "?"))
     # 内容变了才打（summary 每轮会被调多次，不能刷屏）
     try:
         if txt != _LAST_SUM["v"]:

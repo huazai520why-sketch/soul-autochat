@@ -152,7 +152,7 @@ def in_search_page(snap):
             or snap.find_one(text="取消") is not None)
 
 
-def _scroll_top(actor, rounds=5):
+def _scroll_top(actor, rounds=5, preempt=None):
     """把会话列表滚回顶部。搜索框在列表**顶部**，列表停在中间/底部时找不到入口。
 
     🔴 2026-11-04（修「找不到搜索入口」）：pendingq.find_row 翻屏未命中后
@@ -166,6 +166,8 @@ def _scroll_top(actor, rounds=5):
     except Exception:
         return False
     for _ in range(max(1, rounds)):
+        if preempt and preempt():
+            return False
         box = {"ok": False}
 
         def _job():
@@ -242,8 +244,12 @@ def _find_search_entry(snap):
     return None
 
 
-def open_search(actor):
+def open_search(actor, preempt=None):
     """从会话列表打开搜索页。返回 True/False。"""
+    global LAST_REASON
+    if preempt and preempt():
+        LAST_REASON = "preempted"
+        return False
     snap = actor.snap()
     if in_search_page(snap):
         log.info("已在搜索页（顶栏输入框 + 取消），直接复用，不找放大镜")
@@ -261,6 +267,9 @@ def open_search(actor):
         log.warning("关弹窗异常（继续尝试搜索）: %r", e)
     if in_search_page(snap):
         return True
+    if preempt and preempt():
+        LAST_REASON = "preempted"
+        return False
     n = _find_search_entry(snap)
     if n is None:
         # 🔴 2026-11-02：重启后第一轮落点常在「广场 / 会话内」，只在当前屏找必然失败
@@ -287,23 +296,38 @@ def open_search(actor):
             log.warning("open_search: 回列表失败（pg=%s，不是 chatlist）→ 不再空滑空等", _pg)
             log.warning("找不到搜索入口")
             return False
+        if preempt and preempt():
+            LAST_REASON = "preempted"
+            return False
         n = _find_search_entry(snap)
     if n is None:
         # 🔴 2026-11-04（修「找不到搜索入口」58% 失败）：见 _scroll_top 注释。
         log.info("回列表后仍没入口（列表可能停在中间）→ 滚回顶部再找")
-        if _scroll_top(actor):
+        if _scroll_top(actor, preempt=preempt):
             try:
                 snap = actor.snap(force=True)
             except Exception:
                 snap = None
             if snap is not None:
+                if preempt and preempt():
+                    LAST_REASON = "preempted"
+                    return False
                 n = _find_search_entry(snap)
+    if n is None and preempt and preempt():
+        LAST_REASON = "preempted"
+        return False
     if n is None:
         log.warning("找不到搜索入口")
         return False
     actor.hand.tap_node(n, settle=2.2)
+    if preempt and preempt():
+        LAST_REASON = "preempted"
+        return False
     # 搜索页首帧慢（实测设备卡时要 2~4s），多等两轮再判定
     for _ in range(3):
+        if preempt and preempt():
+            LAST_REASON = "preempted"
+            return False
         s = actor.snap(force=True)
         # 🔴 2026-11-03 修复 P1：判据必须排除「会话页底部输入框」。
         #    原来只判"有任意 EditText"→ 会话页也满足，关键词会灌进草稿框。
@@ -343,7 +367,17 @@ def results(actor, snap=None):
     return out
 
 
-def search(actor, dev, kw, wait=5.0, max_wait=30.0):
+def _wait_preempt(seconds, preempt):
+    """Sleep in small slices so a new-message signal can interrupt search waits."""
+    until = time.time() + max(0.0, float(seconds or 0))
+    while time.time() < until:
+        if preempt and preempt():
+            return True
+        time.sleep(min(0.25, max(0.01, until - time.time())))
+    return False
+
+
+def search(actor, dev, kw, wait=5.0, max_wait=30.0, preempt=None):
     """在搜索页灌关键词并**等结果真正出来**。返回命中的结果行数。
 
     🔴 关键（2026-11-02 实测）：灌字后页面会先显示一个**转圈的加载图标**，
@@ -426,8 +460,15 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0):
         return 0
 
     t0 = time.time()
-    time.sleep(wait)
+    if _wait_preempt(wait, preempt):
+        LAST_REASON = "preempted"
+        log.info("搜索等待中检测到新消息 → 提前结束搜索，优先新消息")
+        return -1
     while time.time() - t0 < max_wait:
+        if preempt and preempt():
+            LAST_REASON = "preempted"
+            log.info("搜索轮询中检测到新消息 → 提前结束搜索，优先新消息")
+            return -1
         # 🔴 2026-11-08（A2 帧复用的必要例外）：这里是**等异步加载**的轮询，
         #    屏幕会自己变（转圈 → 出结果），中间**没有任何动作**，
         #    所以动作代数守卫抓不到。必须 force 拿真帧，否则会一直复读
@@ -462,7 +503,10 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0):
             _BREAKER["until"] = 0.0
             log.info("搜索 %r -> %d 条结果（%.1fs）", kw, len(rs), time.time() - t0)
             return len(rs)
-        time.sleep(1.2)
+        if _wait_preempt(1.2, preempt):
+            LAST_REASON = "preempted"
+            log.info("搜索结果轮询间隔检测到新消息 → 提前结束搜索，优先新消息")
+            return -1
 
     LAST_REASON = "timeout"
     log.warning("搜索 %r -> 等满 %.0fs 仍无结果（超时，不等于未找到）", kw, max_wait)

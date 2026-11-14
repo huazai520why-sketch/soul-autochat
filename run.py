@@ -188,11 +188,8 @@ def cmd_wake(n=2):
 
 
 def cmd_match(n=3):
-    import tests.t_match_loop as L  # noqa: F401
-
-    L.ROUNDS = n
-    L.DRY = False
-    return L.main()
+    from brain import match_runner as L
+    return L.main(rounds=n, dry=False)
 
 
 def cmd_bell(every=5, once=False):

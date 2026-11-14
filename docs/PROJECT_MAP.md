@@ -1,7 +1,7 @@
 # Soul 1.0 生产架构图
 
 > 2026-11-14 副机 `E:\soul1.0` 实测整理。
-> 基线 HEAD：`d18be4e`（`chore(launch): daemon 静默启动 + 日志轮转收紧`）。  
+> 本轮稳定性基线：`dc03e05`（孤儿清理与当前架构文档化之后的 HEAD）。
 > 本文只描述当前生产结构；历史版本文件已移入可恢复回收区，不再属于运行面。
 
 ## 1. 进程与任务拓扑
@@ -51,11 +51,13 @@ flowchart LR
     SysMsg["eyes/sysmsg.py"] -. 直读数据库捷径 .-> Data
 ```
 
-正常目标依赖方向是 `入口/守护 → brain → eyes/hands/data → core`。当前有三处需要后续架构治理的耦合：
+正常目标依赖方向是 `入口/守护 → brain → eyes/hands/data → core`。本轮已消除全部跨层违规：
 
-1. `data/pending.py` 反向导入 `brain.pendingq`、`brain.sendgate`、`brain.verdict`，形成 `brain ↔ data` 环；运行稳定，本轮不贸然重构。
-2. `eyes/sysmsg.py` 直接依赖 `data.imdb`，破坏“感知层只依赖 core”的理想边界。
-3. `run.py match` 通过 `tests/t_match_loop.py` 实现独立匹配命令，因此该测试文件属于运行入口依赖，不能当普通测试清理。
+1. `data/pending.py` 的冷却/已回判定改为读取 `data/pending_ledger.py`，不再反向导入 brain。
+2. 系统消息判定抽到纯函数 `core/message_kind.py`；`eyes/sysmsg.py` 不再读 `data.imdb`。
+3. `run.py match` 改走生产模块 `brain/match_runner.py`；`tests/t_match_loop.py` 只保留兼容包装。
+
+静态依赖扫描当前仍有 4 个 brain 内部环：出话引擎内部、`clear/flow/pendingq`、`casepack/match/reply`、`nav/search`。它们不能再跨层扩散，但后续拆解需要单独回放窗口。
 
 ## 3. 主业务链路
 
@@ -75,20 +77,31 @@ flowchart LR
 奇遇铃 → 红点/新消息 → 已读未回 → 唤醒 → 匹配 → 账号轮转 → 空闲扫铃
 ```
 
+### 安全点抢占
+
+`pendingq` 在以下安全点检查 DB 变更信号：
+
+- 每个候选开始前；
+- 列表翻屏每一屏后；
+- 搜索页等待和结果轮询期间；
+- 当前候选人完成发送/放弃并回到安全页后。
+
+抢占不会发生在“正在输入”或“发送结果尚未确认”的中间态，避免重复发送和串台。检测到新消息后立即结束本轮后续匹配/唤醒阶段，下一轮从红点/新消息开始。
+
 ## 4. 当前代码规模
 
 | 目录 | Python 文件 | 当前职责 |
 |---|---:|---|
-| `core/` | 4 | 设备、路径、日志 |
+| `core/` | 6 | 设备、路径、日志、结构化指标、纯消息分类 |
 | `eyes/` | 9 | UI 树、页面、列表、气泡、主页、弹窗、OCR、系统消息、公开导出 |
 | `hands/` | 4 | 点击、输入、图片、公开导出 |
-| `brain/` | 34 | 决策、流程、出话引擎、案情包、账号与技能 |
-| `data/` | 5 | App SQLite、待回台账、回复状态、变更监听、公开导出 |
+| `brain/` | 36 | 决策、流程、候选排序、匹配运行器、出话引擎、案情包、账号与技能 |
+| `data/` | 6 | App SQLite、待回台账、共享冷却/已回台账、回复状态、变更监听 |
 | `guard/` | 4 | 主循环、单实例锁、看门狗、公开导出 |
-| `tests/` | 20 | 保留的验收/回放测试 |
+| `tests/` | 26 | 保留的验收/回放与离线契约测试 |
 | `tools/` | 13 | 静默启动、探针、守护、运维与注册脚本 |
 
-合计约 94 个 Python 文件、2.33 万行、1.18 MB（不含回收区）。
+合计约 105 个 Python 文件、2.38 万行、1.20 MB（不含回收区）。
 
 ## 5. 当前保留的测试
 
@@ -102,6 +115,9 @@ t_device.py               t_eyes.py             t_preflight.py
 t_flow_dry.py             t_flow_fail_level.py  t_prompt_dump.py
 t_followup_replay.py      t_kw_masked_phone.py  t_run_loop.py
 t_skills_replay.py        t_wake_plan.py
+t_flow_preempt.py         t_health_contract.py
+t_lock_health.py          t_metrics.py
+t_pending_ledger.py       t_pending_policy.py
 ```
 
 历史 `t_probe_*`、`t_switch*`、`t_doubletap_*`、相册/截图/一次性诊断脚本已移入 `E:\_soul_trash_20261114`，可按 `manifest.csv` 和 `rollback.ps1` 恢复。
@@ -124,7 +140,14 @@ t_skills_replay.py        t_wake_plan.py
 | `tools/action_audit.py` | 动作审计 |
 | `scripts/repo_sync.ps1` | Git 漂移检查和脱敏扫描 |
 
-## 7. 清理边界
+## 7. 生产观测
+
+- `data/state/metrics.jsonl`：每轮一条结构化 `round_end`，待回阶段一条 `pending_end`，候选扫描变化时一条 `candidates`。
+- `data/state/daemon.lock`：存活 daemon 由实际子进程持有；缺锁/被替换时 daemon 会自愈重建，若已有活 owner 则新进程退出。
+- `tools/msg_probe.py`：缺锁时步骤龄为 unknown，不再把 Unix 纪元秒误报成“步骤未推进几十年”。
+- `tools/watchdog_live.py`：日志静默和锁心跳联合判断，避免长阶段被单一日志来源误杀。
+
+## 8. 清理边界
 
 以下文件/目录禁止按“孤儿脚本”清理：
 

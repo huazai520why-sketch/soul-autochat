@@ -44,6 +44,10 @@ SKIPFILE = os.path.join(STATE, "pending_skip.json")
 PIDFILE = os.path.join(STATE, "daemon.pid")
 LOCKJSON = os.path.join(STATE, "daemon.lock")
 START_PS1 = os.path.join(ROOT, "tools", "start_daemon.ps1")
+LIVE_LOGS = (
+    "brain.pendingq.log", "brain.act.log", "core.device.log",
+    "brain.clear.log", "data.imdb.log", "brain.wake.log",
+)
 
 DBDIR = "/data/data/cn.soulapp.android/databases"
 SP_INFO = "/data/data/cn.soulapp.android/shared_prefs/sp_info_gather.xml"
@@ -270,6 +274,18 @@ def unread_sessions():
 
 
 # ---------------- daemon 体检 ----------------
+def _step_age_from_lock(lock, now=None):
+    """Return seconds since step heartbeat, or None when no timestamp exists."""
+    now = _now() if now is None else float(now)
+    raw = (lock or {}).get("step_ts") or (lock or {}).get("ts")
+    if not raw:
+        return None
+    try:
+        return max(0.0, now - float(raw))
+    except Exception:
+        return None
+
+
 def daemon_health():
     pid = 0
     try:
@@ -278,16 +294,18 @@ def daemon_health():
         pid = 0
     alive = bool(pid) and _pid_alive(pid)
     lock = load_json(LOCKJSON, {})
-    step_age = None
-    try:
-        step_age = _now() - float(lock.get("step_ts") or lock.get("ts") or 0)
-    except Exception:
-        step_age = None
+    # Missing lock is not evidence of a stuck daemon. Treating 0 as an epoch
+    # timestamp produced absurd "1794xxxxxx seconds" warnings.
+    step_age = _step_age_from_lock(lock)
     log_age = None
-    try:
-        log_age = _now() - os.path.getmtime(DAEMON_OUT)
-    except Exception:
-        log_age = None
+    ages = []
+    for name in LIVE_LOGS:
+        try:
+            ages.append(_now() - os.path.getmtime(os.path.join(LOGS, name)))
+        except Exception:
+            pass
+    if ages:
+        log_age = min(ages)
     return {"pid": pid, "alive": alive, "step_age": step_age,
             "lock_step": lock.get("step"), "log_age": log_age}
 

@@ -14,13 +14,17 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 
 from brain import casepack as CP
 from brain import reply as R
+from brain import pending_policy as PP
 from brain import voice as V
 from brain import search as S
 from core.log import get_logger
+from core import metrics as MET
 from core.paths import STATE
+from data import pending_ledger as PL
 from hands.input import Input
 
 log = get_logger("brain.pendingq")
@@ -122,6 +126,9 @@ NOTFOUND_STORM_N = int(os.environ.get("SOUL_NOTFOUND_STORM_N", "3") or 3)
 NOTFOUND_STORM_H = float(os.environ.get("SOUL_NOTFOUND_STORM_MIN", "30") or 30) / 60.0
 # R5：她最后一条超过这么多分钟没接上 → 标红（只记日志，不插手操作）
 SLA_WARN_MIN = float(os.environ.get("SOUL_SLA_WARN_MIN", "5") or 5)
+SLA_WARN_REPEAT_S = float(
+    os.environ.get("SOUL_SLA_WARN_REPEAT_MIN", "30") or 30
+) * 60.0
 # 🔴 2026-11-04（P1）：12h → 3h。原来的 12h 是在「只能靠搜索定位」的前提下定的，
 #   而现在 find_row 会翻 3 屏，很多 notfound 的会话下一轮就能在列表里点进去；
 #   12h 冷却反而让它们白等半天（实测生效 29 条、中位剩 11.1h）。
@@ -145,7 +152,7 @@ SHORT_RETRY_H = 0.5
 #   （末条文本变了 → should_skip 自动失效 → 重新给机会）。
 IDFAIL_MAX_TRIES = 4
 IDFAIL_GIVEUP_H = 2.0
-SKIP_FILE = STATE / "pending_skip.json"
+SKIP_FILE = PL.SKIP_FILE
 
 # 🔴 2026-11-08（P0「瞎操作」根因修复 · 设备级故障熔断）：
 #   改前：主循环里 `if pg != "chatlist": break` —— 回不到列表就**作废整轮**。
@@ -171,14 +178,56 @@ NOT_CHATLIST_MAX = 3
 #   所以这些 sid 走 kw_of(..., skip_text=True)，直接用她之前的历史长句当关键词。
 #   每轮开头清空（只服务本轮），不落盘。
 _VOICE_SIDS = set()
+# 同一段语音只转写一次；失败缓存 30 分钟后才重试，避免 3 个坏语音每轮刷 800+ 次。
+VOICE_FAIL_TTL_S = float(os.environ.get("SOUL_VOICE_FAIL_TTL_S", "1800") or 1800)
+VOICE_OK_TTL_S = 24 * 3600
+_VOICE_CACHE = {}
+
+
+def _voice_cache_key(sid, msg):
+    try:
+        duration = int(V.duration(msg))
+    except Exception:
+        duration = 0
+    return (
+        str(sid),
+        int(getattr(msg, "ts", 0) or 0),
+        duration,
+        str(getattr(msg, "url", "") or ""),
+    )
+
+
+def _voice_text_cached(sid, msg):
+    """返回 (文本, 来源, 是否新失败)。失败结果短期缓存，避免重复 ASR。"""
+    key = _voice_cache_key(sid, msg)
+    now = time.time()
+    rec = _VOICE_CACHE.get(key)
+    if rec:
+        age = now - rec["at"]
+        if rec["ok"] and age < VOICE_OK_TTL_S:
+            return rec["text"], "cache", False
+        if not rec["ok"] and age < VOICE_FAIL_TTL_S:
+            return None, "cached_fail", False
+    try:
+        text, how = V.voice_text(msg)
+    except Exception as e:
+        text, how = None, repr(e)
+    if text:
+        _VOICE_CACHE[key] = {"at": now, "ok": True, "text": text, "how": how}
+        return text, how, False
+    _VOICE_CACHE[key] = {"at": now, "ok": False, "text": None, "how": how}
+    if len(_VOICE_CACHE) > 500:
+        for k, v in list(_VOICE_CACHE.items()):
+            if now - float(v.get("at") or 0) > VOICE_OK_TTL_S:
+                _VOICE_CACHE.pop(k, None)
+    return None, how, True
 
 # 🔴 2026-11-03（P0 重复发送，实测：uid=*** 在 09:31~09:35 被连回 5 次）
 #   根因：候选只看库里「末条是她」—— 而库是 pull 缓存，我发出去的话要等下一次
 #   pull 才会出现。于是一段时间窗里每轮都判定「还没回」，重复灌字。
 #   ⇒ 本地记一份「刚回过谁」的台账（落盘，重启不丢），REPLIED_GAP 秒内不再碰。
 REPLIED_GAP = 300
-REPLIED_FILE = STATE / "replied.json"
-_REPLIED = {}
+REPLIED_FILE = PL.REPLIED_FILE
 # 身份校验失败计数（**落盘**，重启不清零）：{"sid|末条前40字": {"n": n, "t": ts}}。
 # 🔴 2026-11-03 实测教训：原来是内存 dict，而当天为部署改了十几次代码、重启十几次，
 #    每次清零 -> 计数永远停在「第 1 次」-> 「第 2 次降级发安全句」的分支一次都走不到，
@@ -189,25 +238,7 @@ _IDFAIL = {}
 
 def _load_replied():
     """读台账 {sid: {"text": 我回的那一句, "ts": 回复时刻}}；兼容旧的 {uid: ts}。"""
-    try:
-        d = json.loads(REPLIED_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    now = time.time()
-    out = {}
-    for k, v in (d or {}).items():
-        try:
-            if isinstance(v, dict):
-                ts = float(v.get("ts") or 0)
-                if ts and now - ts < 7 * 86400:
-                    out[str(k)] = {"text": str(v.get("text") or ""), "ts": ts}
-            else:
-                ts = float(v)
-                if now - ts < REPLIED_GAP * 4:
-                    out[str(k)] = {"text": "", "ts": ts}
-        except Exception:
-            continue
-    return out
+    return PL.load_replied()
 
 
 def _mark_replied(uid, sid=None, text=None):
@@ -220,54 +251,12 @@ def _mark_replied(uid, sid=None, text=None):
         · 末条还是同一句 → 不论过多久都不再回（这句已经回过）
         · 她发了新话（text 变）或新话时间晚于我回复时刻 → 立刻放行
     """
-    key = str(sid) if sid else str(uid)
-    try:
-        _REPLIED[key] = {"text": (text or "")[:120], "ts": time.time()}
-        REPLIED_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # 🔴 2026-11-12 夜班修复（D6）：原子写（tmp + os.replace），与 reply_state._save
-        #   同款。改前 write_text 直接覆盖，进程崩溃留半截 JSON → 台账全丢。
-        _tmp = REPLIED_FILE.with_name(REPLIED_FILE.name + ".tmp")
-        _tmp.write_text(json.dumps(_REPLIED, ensure_ascii=False), encoding="utf-8")
-        os.replace(str(_tmp), str(REPLIED_FILE))
-    except Exception:
-        pass
+    PL.mark_replied(uid, sid=sid, text=text)
 
 
 def _recently_replied(uid, sid=None, text=None, her_ts_ms=0):
     """这句是不是已经回过了。见 _mark_replied 的说明。"""
-    now = time.time()
-    rec = None
-    if sid:
-        rec = _REPLIED.get(str(sid))
-    if rec is None:
-        rec = _REPLIED.get(str(uid))
-    if not isinstance(rec, dict):
-        return False
-    try:
-        ts = float(rec.get("ts") or 0)
-    except Exception:
-        return False
-    if not ts:
-        return False
-    # 她这条消息发生在我回复**之后** → 是新话（哪怕内容一模一样），必须回
-    try:
-        if her_ts_ms and float(her_ts_ms) / 1000.0 > ts + 1.0:
-            return False
-    except Exception:
-        pass
-    old = (rec.get("text") or "").strip()
-    cur = (text or "").strip()
-    if not old or not cur:
-        # 旧格式台账（只有时间）/ 取不到她原话 → 退回时间窗语义，别当成「永远回过」。
-        # 🔴 2026-11-04：窗口从 5 分钟放宽到 30 分钟 —— 实测 08:40:45 回过一次，
-        #    08:47:28 又回了一次（第 7 分钟），在真人眼里就是机器人复读。
-        return (now - ts) < max(REPLIED_GAP, 1800)
-    # 🔴 2026-11-04 修（副机实测发现的错）：原来
-    #      return old == cur or (now - ts) < REPLIED_GAP
-    #    时间窗把「她换了新话」也判成已回 —— 验证脚本里同一句/新话都返回 True。
-    #    新话被吞掉比重复更糟（违背必回）。现在只认「她这一句我已经回过」：
-    #    文本不同 = 新话，必须回。
-    return old == cur
+    return PL.recently_replied(uid, sid=sid, text=text, her_ts_ms=her_ts_ms)
 
 
 # ══════════════ 身份校验失败计数（落盘，重启不清零） ══════════════
@@ -427,6 +416,8 @@ except Exception:
     _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
 _UNREAD_CACHE = {"ts": 0.0, "sids": set()}
+_CANDIDATE_CACHE = {"key": None, "at": 0.0, "value": []}
+CANDIDATE_CACHE_S = float(os.environ.get("SOUL_CANDIDATE_CACHE_S", "8") or 8)
 
 
 def _device_unread_sids(db):
@@ -463,6 +454,7 @@ def invalidate_live_cache():
     移出候选（实测一次移出 180 个）。新消息到达时清掉，逼它重新扫设备库。
     """
     _LIVE_CACHE.update(v=None, ts=0.0)
+    _CANDIDATE_CACHE.update(key=None, at=0.0, value=[])
     log.info("设备存活缓存已清除（库变化信号触发）")
 
 
@@ -480,6 +472,7 @@ def invalidate_unread_cache():
     让紧接着的 candidates() 重新查设备库拿到最新的未读集合。
     """
     _UNREAD_CACHE.update(ts=0.0, sids=set())
+    _CANDIDATE_CACHE.update(key=None, at=0.0, value=[])
     log.info("设备未读缓存已清除（库变化信号触发）")
 
 
@@ -488,6 +481,7 @@ def invalidate_unread_cache():
 #    实测同一秒刷 3~4 行「205 个…剩 95 个」把真日志淹了。
 #    相同结论在 TTL 内只 INFO 一次，其余降 DEBUG（要查随时能开）。
 _LIVE_LOG = {"sig": None, "ts": 0.0}
+_CAND_SCAN_LOG = {"sig": None, "ts": 0.0}
 
 
 def _device_live_uids(db):
@@ -657,29 +651,12 @@ def _session_matches(actor, db, sid, nick=None):
     return True
 
 
-_REPLIED.update(_load_replied())
-
-
-
 def _load_skip():
-    import json
-    try:
-        return json.loads(SKIP_FILE.read_text("utf-8"))
-    except Exception:
-        return {}
+    return PL.load_skip()
 
 
 def _save_skip(d):
-    import json
-    try:
-        SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # 🔴 2026-11-12 夜班修复（D6）：原子写（tmp + os.replace），与 reply_state._save
-        #   同款。改前 write_text 直接覆盖，进程崩溃留半截 JSON → 台账全丢。
-        _tmp = SKIP_FILE.with_name(SKIP_FILE.name + ".tmp")
-        _tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
-        os.replace(str(_tmp), str(SKIP_FILE))
-    except Exception as e:
-        log.warning("保存失败台账异常: %r", e)
+    PL.save_skip(d)
 
 
 _LAST_SKIP = {}
@@ -687,34 +664,12 @@ _LAST_SKIP = {}
 
 def should_skip(sid, txt, hours=SKIP_HOURS):
     """这个会话的这句话是不是刚失败过（冷却中）。"""
-    rec = _load_skip().get(str(sid)) or {}
-    if not rec:
-        return False
-    # 🔴 2026-11-12 夜班修复（D3）：mark_skip 存的是 (txt or "")[:120]，这里必须同样截断
-    #   到 [:120] 才能比对。改前用完整 txt 比 → rec.text != txt 恒 True → 冷却永不命中，
-    #   末条 >120 字的会话搜索失败后每轮反复白烧（30~50s/次）。
-    if (rec.get("text") or "").strip() != (txt or "")[:120].strip():
-        return False                  # 末条变了 = 她说了新话，重新试
-    age = time.time() - float(rec.get("ts") or 0)
-    h = float(rec.get("hours") or hours)      # 台账里记的冷却时长优先（超时只罚 10 分钟）
-    if age < h * 3600:
-        # 🔴 2026-11-04：把命中的台账挂出来，调用方日志要打**真实原因**。
-        #   原来日志写死「上次搜索失败」，实际 reason 有 short_msg/id_mismatch/timeout/
-        #   notfound 四种，排查时全被误导成"搜索失败"（实测）。
-        _LAST_SKIP[str(sid)] = rec
-        return True
-    return False
+    return PL.should_skip(sid, txt, default_hours=hours, last_out=_LAST_SKIP)
 
 
 def mark_skip(sid, txt, reason="notfound", hours=None):
     h = SKIP_HOURS if hours is None else hours
-    d = _load_skip()
-    now = time.time()
-    d[str(sid)] = {"ts": now, "text": (txt or "")[:120], "reason": reason, "hours": h}
-    # 顺手清掉 7 天前的
-    cutoff = now - 7 * 86400
-    d = {k: v for k, v in d.items() if float((v or {}).get("ts") or 0) > cutoff}
-    _save_skip(d)
+    PL.mark_skip(sid, txt, reason=reason, hours=h)
     log.info("记入失败台账 sid=%s（%s），%.2f 小时内不再试", sid, reason, h)
 
 
@@ -737,7 +692,7 @@ _SLA_WARNED = {}
 def _sla_warn(sid, to_uid, her_ts_ms, why):
     """R5：她最后一条超过 SLA_WARN_MIN 分钟还没被接上 → 标红一行（不插手操作）。
 
-    同一 sid 10 分钟内只报一次，避免每 30s 刷屏。
+    同一 sid 默认 30 分钟内只报一次，避免反复刷屏。
     """
     try:
         age_min = (time.time() - float(her_ts_ms or 0) / 1000.0) / 60.0
@@ -746,7 +701,7 @@ def _sla_warn(sid, to_uid, her_ts_ms, why):
     if age_min < SLA_WARN_MIN:
         return
     now = time.time()
-    if now - _SLA_WARNED.get(str(sid), 0) < 600:
+    if now - _SLA_WARNED.get(str(sid), 0) < SLA_WARN_REPEAT_S:
         return
     _SLA_WARNED[str(sid)] = now
     log.warning("⏰ 超 %.0f 分钟未回 uid=%s sid=%s（%s）→ 标红，留队列按等待时长重排",
@@ -812,6 +767,7 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     返回 [(sessionId, to_uid, 末条文本, 末条毫秒时间)]，按她末条时间**升序**（最老优先）。
     """
     cutoff = (time.time() - days * 86400) * 1000
+    scan_stats = Counter()
     # 🔴 2026-11-10 §104 C4：归档集合一次性取（循环里逐个读台账会白烧磁盘）。
     _archived = set()
     try:
@@ -821,6 +777,30 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         log.debug("归档集合取不到（本轮不排除）: %r", _e0)
     # 🔴 2026-11-09 P0：先取设备库真实未读集合（60s 缓存），供下面硬放行使用。
     _unread_sids = _device_unread_sids(db)
+    # Repeated calls inside one cycle used to rescan hundreds of sessions and
+    # re-log the same cooldowns. Cache only the final decision for a few seconds;
+    # every source state that can change a decision participates in the key.
+    try:
+        from data import reply_state as _RSc
+        _rs_mtime = _RSc.FILE.stat().st_mtime_ns if _RSc.FILE.exists() else 0
+    except Exception:
+        _rs_mtime = 0
+    _cache_key = (
+        str(getattr(db, "uid", "") or ""),
+        str(getattr(getattr(db, "path", None), "name", "") or ""),
+        int(limit or 0),
+        int(days or 0),
+        tuple(sorted(_archived)),
+        tuple(sorted(_unread_sids)),
+        SKIP_FILE.stat().st_mtime_ns if SKIP_FILE.exists() else 0,
+        REPLIED_FILE.stat().st_mtime_ns if REPLIED_FILE.exists() else 0,
+        _rs_mtime,
+    )
+    _cache_now = time.time()
+    if (_CANDIDATE_CACHE.get("key") == _cache_key
+            and 0 <= _cache_now - float(_CANDIDATE_CACHE.get("at") or 0) < CANDIDATE_CACHE_S):
+        log.debug("候选扫描命中 %.1fs 短缓存（不重复查库/刷日志）", CANDIDATE_CACHE_S)
+        return list(_CANDIDATE_CACHE.get("value") or [])
     try:
         rows = db.con.execute(
             "SELECT sessionId, toUserId FROM session "
@@ -830,6 +810,7 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     except Exception as e:
         log.warning("查会话失败: %r", e)
         return []
+    scan_stats["source"] = len(rows)
 
     # 🔴🔴🔴 2026-11-08 12:56（**本轮最重要的一条**：本地镜像里的「死人」）
     #
@@ -910,7 +891,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     _SGa.on_her(str(sid), int(last.ts or 0), human=True)
                     log.info("归档会话来了新的人话 sid=%s → 解除归档，重新计入待回", sid)
                 else:
-                    log.info("跳过已归档会话 sid=%s（C4：不回、不唤醒、不计待回）", sid)
+                    scan_stats["archived"] += 1
+                    log.debug("跳过已归档会话 sid=%s（C4：不回、不唤醒、不计待回）", sid)
                     continue
             except Exception as _e_ar:
                 log.debug("归档检查异常（本轮仍跳过）: %r", _e_ar)
@@ -946,8 +928,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                         from eyes import sysmsg as _SM2
                         if not _SM2.is_human(_d_txt, getattr(last, "msg_type", None),
                                              uid=to_uid):
-                            log.info("设备未读硬放行·系统文本 sid=%s uid=%s 摘要=%r → 跳过（C5/C8）",
-                                     sid, to_uid, _d_txt[:16])
+                            scan_stats["system"] += 1
+                            log.debug("设备未读硬放行·系统文本 sid=%s uid=%s 摘要=%r → 跳过（C5/C8）",
+                                      sid, to_uid, _d_txt[:16])
                             continue
                     except Exception:
                         pass
@@ -959,8 +942,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     out.append((sid, to_uid, _d_txt, _d_ts,
                                 _burst_n(db, sid, db.uid)))
                     continue
-                log.info("跳过末条是我 sid=%s uid=%s（设备说未读，但摘要也证明是我说的"
-                         "或取不到摘要：%r）", sid, to_uid, _d_txt[:20])
+                scan_stats["mine_last"] += 1
+                log.debug("跳过末条是我 sid=%s uid=%s（设备说未读，但摘要也证明是我说的"
+                          "或取不到摘要：%r）", sid, to_uid, _d_txt[:20])
             else:
                 log.debug("跳过末条是我 sid=%s uid=%s（设备未读集合里没有 → 真·无需回）",
                           sid, to_uid)
@@ -971,8 +955,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         #    改成最老优先后这类会抢到队首，把真正该回的挤到后面，所以这里按
         #    真实末条时间再卡一次 LOOKBACK_DAYS 窗口（超期的回了也怪，她早忘了）。
         if int(last.ts or 0) < cutoff:
-            log.info("跳过超期会话 sid=%s（她末条已 %.1f 天前）",
-                     sid, (time.time() * 1000 - int(last.ts or 0)) / 86400000.0)
+            scan_stats["too_old"] += 1
+            log.debug("跳过超期会话 sid=%s（她末条已 %.1f 天前）",
+                      sid, (time.time() * 1000 - int(last.ts or 0)) / 86400000.0)
             continue
         # 非文本类（语音/图片/表情/卡片）在**本队列里一律跳过**：
         #   它们的 text 恒为空 → 搜不到、列表预览也认不出是谁，
@@ -992,7 +977,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             if k == "tip":
                 continue
         if k in ("image", "emoji", "other"):
-            log.info("非文本消息（%s）sid=%s 走红点路径，这里跳过", k, sid)
+            scan_stats["nontext"] += 1
+            log.debug("非文本消息（%s）sid=%s 走红点路径，这里跳过", k, sid)
             continue
         if V.is_voice(last):
             # 🔴🔴 2026-11-08 01:45 用户明确要求：「一定要正常识别对方语音内容然后再回复」。
@@ -1006,14 +992,20 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   2~10s 语音 0.1~12s/条（模型已加载后 0.1s 命中缓存，冷启动约 5~12s）。
             #   转写失败 → 用占位串照样进队列（宁可回一句「没听清，你再说一遍」，
             #   也不能让她的语音永远石沉大海）。
-            vtxt, vhow = V.voice_text(last)
+            vtxt, vhow, _fresh_fail = _voice_text_cached(sid, last)
             if vtxt:
-                log.info("语音已转写 sid=%s（%ds, %s）: %r",
-                         sid, int(V.duration(last)), vhow, vtxt[:40])
+                if vhow != "cache":
+                    log.info("语音已转写 sid=%s（%ds, %s）: %r",
+                             sid, int(V.duration(last)), vhow, vtxt[:40])
                 txt = vtxt
             else:
-                log.warning("语音转写失败 sid=%s（%ds）→ 用占位串照常回复",
-                            sid, int(V.duration(last)))
+                if _fresh_fail:
+                    log.warning("语音转写失败 sid=%s（%ds）→ 用占位串照常回复，"
+                                "%.0f 分钟内不重复转写",
+                                sid, int(V.duration(last)), VOICE_FAIL_TTL_S / 60.0)
+                else:
+                    log.debug("语音转写沿用失败缓存 sid=%s（%ds）",
+                              sid, int(V.duration(last)))
                 txt = V.PLACEHOLDER
             # 标记这个 sid 是语音：搜索时必须跳过「用转写文字搜」，
             # 因为 Soul 列表预览显示的是「[语音]」，转写文字搜不到（见 kw_of）。
@@ -1022,8 +1014,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             txt = (last.text or "").strip()
 
         if not txt:
-            log.info("候选跳过 sid=%s uid=%s：末条无文本（kind=%s），不在此队列处理",
-                     sid, to_uid, k)
+            scan_stats["empty"] += 1
+            log.debug("候选跳过 sid=%s uid=%s：末条无文本（kind=%s），不在此队列处理",
+                      sid, to_uid, k)
             continue
         # 🔴 2026-11-10 §104 C5/C8：系统/广告消息不回、不计待回、
         #    **不更新 her_ts 水位线**、只跳过不冷却（她紧接着发人话仍要正常回）。
@@ -1040,7 +1033,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 _SG1.on_her(str(sid), int(last.ts or 0), human=False)
             except Exception:
                 pass
-            log.info("系统/广告消息（%s）sid=%s → 不回不计待回（C5/C8）", txt[:20], sid)
+            scan_stats["system"] += 1
+            log.debug("系统/广告消息（%s）sid=%s → 不回不计待回（C5/C8）", txt[:20], sid)
             continue
         # C2：她末条真人消息推进水位线（只在 ts 变新时落盘，会清掉本回合发送计数）。
         try:
@@ -1058,9 +1052,11 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         if str(sid) in _unread_sids:
             if should_skip(sid, txt):
                 _r = _LAST_SKIP.get(str(sid)) or {}
-                _left = max(0.0, (float(_r.get("hours") or 0)*60 - (time.time()-float(_r.get("ts") or 0))/60.0))
-                log.info("设备未读硬放行·冷却未到 sid=%s（原因=%s，剩 %.0f 分钟）→ 本轮不硬放行，避免反复白烧",
-                         sid, _r.get("reason") or "?", _left)
+                _left = PP.cooldown_remaining_minutes(_r)
+                scan_stats["cooldown"] += 1
+                scan_stats["cooldown:%s" % (_r.get("reason") or "?")] += 1
+                log.debug("设备未读硬放行·冷却未到 sid=%s（原因=%s，剩 %.0f 分钟）→ 本轮不硬放行，避免反复白烧",
+                          sid, _r.get("reason") or "?", _left)
                 _sla_warn(sid, to_uid, last.ts, "冷却中 剩%.0f分" % _left)
                 continue
             log.info("设备未读硬放行 uid=%s sid=%s（跳过台账/L2/冷却）", to_uid, sid)
@@ -1088,23 +1084,26 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     pass
             if _vd.state in (_VD.AWAITING, _VD.FOLLOWING,
                              _VD.ARCHIVED, _VD.NO_HUMAN):
-                log.info("状态机跳过 uid=%s sid=%s state=%s（%s）",
-                         to_uid, sid, _vd.state, _vd.reason)
+                scan_stats["state:%s" % _vd.state] += 1
+                log.debug("状态机跳过 uid=%s sid=%s state=%s（%s）",
+                          to_uid, sid, _vd.state, _vd.reason)
                 continue
         except Exception as _e_vd:
             log.debug("状态机异常 → 退回旧台账判定: %r", _e_vd)
             if _recently_replied(to_uid, sid=sid, text=txt, her_ts_ms=last.ts) \
                     or _l2_last_is_me(sid, her_ts_ms=last.ts):
-                log.info("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
+                scan_stats["replied"] += 1
+                log.debug("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
                 _sla_warn(sid, to_uid, last.ts, "被判已回")
                 continue
 
         if should_skip(sid, txt):
             _r = _LAST_SKIP.get(str(sid)) or {}
-            _left_min = (float(_r.get("hours") or 0) * 60
-                         - (time.time() - float(_r.get("ts") or 0)) / 60.0)
-            log.info("跳过冷却中的会话 sid=%s（原因=%s，剩 %.0f 分钟）",
-                     sid, _r.get("reason") or "?", max(0.0, _left_min))
+            _left_min = PP.cooldown_remaining_minutes(_r)
+            scan_stats["cooldown"] += 1
+            scan_stats["cooldown:%s" % (_r.get("reason") or "?")] += 1
+            log.debug("跳过冷却中的会话 sid=%s（原因=%s，剩 %.0f 分钟）",
+                      sid, _r.get("reason") or "?", max(0.0, _left_min))
             _sla_warn(sid, to_uid, last.ts, "冷却中 剩%.0f分" % max(0.0, _left_min))
             continue
         out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
@@ -1188,17 +1187,6 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     #   现在**新老交错**：最近 FRESH_H 小时的和老积压交替出队，
     #   每轮两边都推进（3 新 + 3 老），既不让新消息饿死，也不让老会话永远轮不到。
     now_ms = time.time() * 1000.0
-    _window = FRESH_H * 3600000.0
-    fresh = [x for x in out if now_ms - float(x[3] or 0) < _window]
-    stale = [x for x in out if now_ms - float(x[3] or 0) >= _window]
-    fresh.sort(key=lambda x: -float(x[3] or 0))    # 新的：最新的先
-    stale.sort(key=lambda x: float(x[3] or 0))     # 积压：最老的先
-    merged = []
-    while fresh or stale:
-        if fresh:
-            merged.append(fresh.pop(0))
-        if stale:
-            merged.append(stale.pop(0))
     # 🔴 2026-11-04（实时性）：上面是「新老交替」，但 fresh 的窗口是 6 小时 ——
     #   实测她 9 分钟前发的那条排在了一堆 4 小时前的后面（09:15:42 的消息 09:24 才回）。
     #   **很新（<20 分钟）的一律提到最前面**，按时间倒序；老积压从第 N 个之后开始交替。
@@ -1209,27 +1197,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     #     档 1：单条长消息（≥6 字）      ← 有内容、好接
     #     档 2：中等（3~5 字）
     #     档 3：短（<3 字，如「哦/滚/？」）← 排最后（这类搜索不唯一、易空转）
-    def _tier(x):
-        _, _, txt, _ts, bn = x
-        if bn >= 2:
-            return 0
-        n = len((txt or "").strip())
-        if n >= 6:
-            return 1
-        if n >= 3:
-            return 2
-        return 3
-
-    merged = sorted(merged, key=_tier)   # 稳定排序：tier 相同者保持原相对顺序
-    # 🔴 2026-11-04（实时性，必须在 _tier 之后！）：
-    #   上面那个 _tier 排序会把「很新」的候选重新打散 —— 09:30 实测：她 3 分钟前发的
-    #   排第 1，而 4/5 分钟前发的掉到第 16、17 位（被「短消息 tier 3」压到最后）。
-    #   用户口径是必回优先：**20 分钟内到的一律提到最前面**，tier 只用于同批内部。
-    _HOT_MS = 20 * 60 * 1000.0
-    hot = [x for x in merged if (now_ms - float(x[3] or 0)) < _HOT_MS]
-    rest = [x for x in merged if (now_ms - float(x[3] or 0)) >= _HOT_MS]
-    hot.sort(key=lambda x: -float(x[3] or 0))     # 新到的先回
-    merged = hot + rest
+    # Fresh/stale interleave → content tier → strict 20-minute hot window.
+    # The policy is pure and covered by tests/t_pending_policy.py.
+    merged = PP.rank_candidates(out, fresh_hours=FRESH_H, hot_minutes=20,
+                                now_ms=now_ms)
     # 2026-11-03：把「她末条时间」一起返回（第 4 项）——
     #   handle_pending 要用它判「是不是断太久、该走重新开场」。
     #
@@ -1296,14 +1267,49 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 continue
             _keep.append(x)
         if _dropped:
-            log.info("过期淘汰：%d 个候选超过 %.0fh 未活跃（翻屏/搜索注定失败）→ 本轮不排它们，"
-                     "队列剩 %d 个", _dropped, STALE_GIVEUP_H, len(_keep))
+            scan_stats["stale"] += _dropped
+            log.debug("过期淘汰：%d 个候选超过 %.0fh 未活跃（翻屏/搜索注定失败）→ 本轮不排它们，"
+                      "队列剩 %d 个", _dropped, STALE_GIVEUP_H, len(_keep))
         merged = _keep
     except Exception as _e:
         log.warning("过期淘汰异常（忽略，按原队列走）: %r", _e)
     # 🔴 2026-11-08 12:5x：截断移到这里（**过滤之后**）。见上方顺序颠倒的注释。
     merged = merged[:limit]
-    return [x[:4] for x in merged]
+    state_n = sum(v for k, v in scan_stats.items() if k.startswith("state:"))
+    cooldown_n = int(scan_stats.get("cooldown", 0) or 0)
+    reasons = PP.compact_reason_counts(scan_stats)
+    sig = (
+        int(scan_stats.get("source", 0) or 0),
+        len(out),
+        int(scan_stats.get("archived", 0) or 0),
+        state_n,
+        cooldown_n,
+        int(scan_stats.get("stale", 0) or 0),
+    )
+    now = time.time()
+    publish = sig != _CAND_SCAN_LOG.get("sig") or now - float(_CAND_SCAN_LOG.get("ts") or 0) >= 60
+    msg = (
+        "候选扫描汇总：源 %d → 有效 %d；归档 %d、状态机 %d、冷却 %d、过期 %d"
+        % (sig[0], sig[1], sig[2], sig[3], sig[4], sig[5])
+    )
+    (log.info if publish else log.debug)(msg)
+    if publish:
+        _CAND_SCAN_LOG.update(sig=sig, ts=now)
+        MET.emit(
+            "candidates",
+            source=sig[0],
+            actionable=sig[1],
+            archived=sig[2],
+            state_skip=sig[3],
+            cooldown=sig[4],
+            stale=sig[5],
+            cooldown_reasons=reasons,
+            returned=min(len(merged), int(limit or 0)),
+            uid=str(getattr(db, "uid", "") or ""),
+        )
+    value = [x[:4] for x in merged]
+    _CANDIDATE_CACHE.update(key=_cache_key, at=time.time(), value=list(value))
+    return value
 
 
 NICK_FILE = STATE / "nick_cache.json"
@@ -1726,7 +1732,8 @@ def _scroll_top(actor, rounds=4):
     return True
 
 
-def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid=None):
+def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid=None,
+             preempt=None):
     """在**会话列表**里找这条消息所属的行（首屏 → 逐屏下翻）。
 
     用户 2026-11-02/03 反复强调：「明明这个人就在屏幕上 红点也有 为什么还要走搜索」
@@ -1883,6 +1890,9 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
         moved = 0
         hit_bottom = False
         for i in range(max(0, pages)):
+            if preempt and preempt():
+                log.info("列表翻屏途中检测到新消息 → 停止本轮定位，优先新消息")
+                return None
             if not _swipe_list(actor, up=True):
                 break
             moved += 1
@@ -1893,6 +1903,9 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
                 log.warning("翻屏取屏失败: %r", e)
                 hit_bottom = True
                 break
+            if preempt and preempt():
+                log.info("列表翻屏拿到新帧后发现新消息 → 停止本轮定位，优先新消息")
+                return None
             if detect(snap) != "chatlist":
                 hit_bottom = True
                 break
@@ -1912,8 +1925,11 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
         #   而候选是**最老待回优先**（目标往往在列表更深处/更上面都有），
         #   直接放弃等于把这一轮废掉。到底 → 回顶再翻一遍（只重来一次）。
         log.info("翻屏到底且未命中 → 回列表顶部再翻一遍")
-        if not _scroll_top(actor, rounds=min(6, max(2, pages + 2))):
+        if not _scroll_top(actor, rounds=min(6, max(2, pages + 2)), preempt=preempt):
             break
+        if preempt and preempt():
+            log.info("回顶翻屏时检测到新消息 → 停止本轮定位，优先新消息")
+            return None
         try:
             snap = actor.snap()
         except Exception:
@@ -1931,6 +1947,7 @@ def find_row(actor, txt, kw=None, min_len=4, pages=None, nick=None, db=None, sid
 
 def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
     """处理已读未回。返回 dict(sent, tried, skipped, results, aborted)。"""
+    t_handle = time.time()
     # 🔴 2026-11-08：新增 "aborted" —— 区分「正常收工」和「设备级故障中止」。
     #   "" = 正常结束；"not_chatlist" = 连续多次回不到 chatlist（见 NOT_CHATLIST_MAX）。
     #   daemon.py 会消费它打一条 warning，方便在日志里一眼分辨这两件事。
@@ -2007,6 +2024,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         _W0.consume()
     except Exception:
         pass
+
+    def _new_msg_urgent():
+        try:
+            from data import watch as _W
+            return bool(_W.urgent())
+        except Exception:
+            return False
+
     for cand in cands:
         sid, to_uid, txt, her_ts = cand
         # ⚡ 2026-11-04（用户口径：新消息不能被积压挤住）：
@@ -2015,9 +2040,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         #   这里一有库变化信号就收工，把屏幕让给下一轮的开头（清红点 → 快路径）。
         try:
             from data import watch as _W
-            if _W.urgent():
+            if _new_msg_urgent():
                 log.info("⚡ 积压处理途中检测到新消息 → 中止本轮积压，优先回去处理新消息")
                 _W.consume()
+                out["aborted"] = "preempted"
                 break
         except Exception:
             pass
@@ -2180,7 +2206,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             _pg_n = 6
         else:
             _pg_n = None
-        row = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid, pages=_pg_n)
+        row = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid,
+                       pages=_pg_n, preempt=_new_msg_urgent)
+        if _new_msg_urgent():
+            out["aborted"] = "preempted"
+            try:
+                from data import watch as _Wp
+                _Wp.consume()
+            except Exception:
+                pass
+            break
         if row is None and age_h * 60.0 <= 30.0:
             # 🔴 2026-11-08（P0 修「身份校验失败 261 次」的放大器）：
             #   改前：无条件走 first_dot_row —— 它是**设计上的「先点进去再验身份」**
@@ -2278,13 +2313,43 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 mark_skip(sid, txt, "nocue", hours=NO_CUE_H)
                 out["skipped"] += 1
                 continue
-            if not S.open_search(actor):
+            if not S.open_search(actor, preempt=_new_msg_urgent):
+                if getattr(S, "LAST_REASON", "") == "preempted":
+                    out["aborted"] = "preempted"
+                    try:
+                        from data import watch as _Wp0
+                        _Wp0.consume()
+                    except Exception:
+                        pass
+                    try:
+                        S.leave(actor)
+                    except Exception:
+                        pass
+                    break
                 out["skipped"] += 1
                 continue
+            if _new_msg_urgent():
+                out["aborted"] = "preempted"
+                try:
+                    from data import watch as _Wp1
+                    _Wp1.consume()
+                except Exception:
+                    pass
+                S.leave(actor)
+                break
             _got = 0
             for _label, _word in _plan:
                 log.info("搜索[%s] %r", _label, _word[:16])
-                _got = S.search(actor, dev, _word)
+                _got = S.search(actor, dev, _word, preempt=_new_msg_urgent)
+                if _got < 0:
+                    out["aborted"] = "preempted"
+                    try:
+                        from data import watch as _Wp2
+                        _Wp2.consume()
+                    except Exception:
+                        pass
+                    S.leave(actor)
+                    break
                 if _got:
                     if _label == "昵称":
                         _used_nick = _word
@@ -2295,6 +2360,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 #   （实测 22:56:17 搜索[昵称] 超时 30s → 22:56:49 又搜内容 7s = 43s/人）。
                 if getattr(S, "LAST_REASON", "") in ("breaker", "timeout"):
                     break
+            if out.get("aborted") == "preempted":
+                break
             if not _got:
                 # 🔴🔴 2026-11-08 13:1x（`breaker` 必须单独一支，否则比原 bug 更糟）
                 #
@@ -2536,4 +2603,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
 
     log.info("已读未回结束：回 %d 条 / 试 %d / 跳过 %d",
              out["sent"], out["tried"], out["skipped"])
+    MET.emit(
+        "pending_end",
+        elapsed_s=round(time.time() - t_handle, 3),
+        sent=int(out["sent"]),
+        tried=int(out["tried"]),
+        skipped=int(out["skipped"]),
+        aborted=str(out.get("aborted") or ""),
+        uid=str(getattr(db, "uid", "") or ""),
+        dry_run=bool(dry_run),
+    )
     return out
