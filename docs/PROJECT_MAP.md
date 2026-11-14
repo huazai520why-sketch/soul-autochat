@@ -163,5 +163,5 @@ t_tts_contract.py         t_voice_style.py         t_voice_send_ui.py
 - `core/`、`eyes/`、`hands/`、`brain/`、`data/`、`guard/`
 - `tools/silent_launch.py`、`tools/_silent/`
 - 10 个已上线 Soul 运维脚本
-- `tests/t_match_loop.py`（`run.py match` 的运行依赖）
+- `tests/t_match_loop.py`（兼容包装；`run.py match` 直接走 brain/match_runner.py，非运行依赖）
 - `config/model.env`、`data/state/`、`logs/`、`memory/`、`models/`

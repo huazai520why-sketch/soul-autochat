@@ -63,7 +63,12 @@ def _device_last_side(device, uid, sid):
         name = _IM._db_name_for_uid(device, uid)
         if not name:
             return None, ""
+        # 2026-11-14 夜审修复（B-05，P1）：不过滤系统卡/空文本时，senderId 落在
+        #   我 uid 名下的 tip/图片行会被当成「我发的末条」→「冲突裁决：末条是我 ''」
+        #   → 漏回（22:56:25 生产实证）。裁据必须是最近一条真人文本；查不到交回
+        #   上层原判（None → 必回优先）。
         sql = ("select senderId, ifnull(text,'') from chatmsg where sessionId='%s' "
+               "and msgType not in (27, 35) and ifnull(text,'')<>'' "
                "order by localTime desc limit 1" % str(sid))
         txt = _IM._dev_sql(device, name, sql, timeout=12) or ""
         line = ""
@@ -855,6 +860,15 @@ def _reply_and_send(actor, db, out, dry_run):
                               page_checked=not _pic_sent, sid=out.sid or "")
     if sent_n:
         out.sent = True
+        # 2026-11-14 夜审修复（B-04，P1）：flow 红点路径原来不写 replied.json
+        #   台账 → 已读未回链路对它「失明」，镜像 300s 滞后窗口内同一会话可被
+        #   再处理一次（22:12 实测回完 29s 后又被入队）。补记台账（宁多记不漏记），
+        #   与 pendingq._mark_replied 同一存储、同一 key 语义。
+        try:
+            from data import pending_ledger as _PLF
+            _PLF.mark_replied(db.uid, sid=(out.sid or ""), text=(out.last_text or ""))
+        except Exception:
+            pass
     if err:
         out.err = err
         log.warning("[%s] %s（已发 %d/%d 条）", out.nick, err, sent_n, len(out.lines))

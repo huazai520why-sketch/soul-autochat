@@ -30,8 +30,10 @@ ADB = os.path.join(BASE, "..")
 MUMU = r"D:\Program Files\Netease\MuMu"
 ADB_EXE = os.path.join(MUMU, "nx_main", "adb.exe")
 MM_EXE = os.path.join(MUMU, "nx_main", "MuMuManager.exe")
-LOG = os.path.join(BASE, "uimap", "daemon", "devwatch.log")
-STATE = os.path.join(BASE, "uimap", "daemon", "devwatch.json")
+# 2026-11-14（E-07）：原写仓库外旧 soul2.1 路径 uimap\daemon\，logrotate 与
+#   取证 pull 都看不见。迁到标准 logs/ 与 data/state/。
+LOG = os.path.join(BASE, "logs", "devwatch.log")
+STATE = os.path.join(BASE, "data", "state", "devwatch.json")
 NEED = 2            # 连续失败多少次才动手
 WAIT_ADB = 360      # launch 后等 adb 的上限（秒）
 

@@ -40,6 +40,11 @@ DEFAULT_MAX_MB = 4.0
 KEEP = 2
 # 残留清理：pgn 截图 / daemon.out.bak 超过多少天删（0 = 不清理）
 CLEAN_DAYS = int(os.environ.get("SOUL_LOG_CLEAN_DAYS", "2"))
+# 2026-11-14（E-06）：以下运维日志纯追加、不走 RotatingFileHandler、
+#   原版从不轮转 → 无限膨胀（msg_probe 15s 一行起步）。统一按大小轮转。
+OPS_LOGS = ("msg_probe.log", "alerts.log", "crash_alert.log", "cost_watch.log",
+            "logrotate.log", "silent_launch.err", "daemon_stdout.out")
+OPS_MAX_MB = float(os.environ.get("SOUL_OPS_LOG_MAX_MB", "8") or 8)
 
 
 class _Tee:
@@ -184,6 +189,48 @@ def clean_stale_files(days: int) -> int:
     return removed
 
 
+def rotate_ops_log(path: Path, threshold: int) -> bool:
+    """运维日志轮转：复制→截断（写入方持 append 句柄，不能 rename）。"""
+    try:
+        if not path.exists() or path.stat().st_size < threshold:
+            return False
+        temp, copied = _copy_snapshot(path)
+        if copied == 0:
+            return False
+        old = Path(str(path) + ".old")
+        try:
+            if old.exists():
+                old.unlink()
+        except OSError:
+            pass
+        os.replace(temp, old)
+        temp = None
+        _truncate_preserving_appends(path, copied)
+        print("[logrotate] rotated ops log %s: snapshot=%d bytes" % (path.name, copied))
+        return True
+    except BaseException as exc:
+        print("[logrotate] skipped ops %s: %s: %s" % (path.name, type(exc).__name__, exc))
+        return False
+
+
+def clean_state_junk(days: int) -> int:
+    """删 data/state/daemon.lock.bak-*（HY-01 重启风暴一天 136 个，无人清理）。"""
+    state = ROOT / "data" / "state"
+    if days <= 0 or not state.is_dir():
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for p in state.iterdir():
+        if p.is_file() and p.name.startswith("daemon.lock.bak-"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def main() -> int:
     try:
         _lf = None
@@ -197,10 +244,18 @@ def main() -> int:
         threshold = _max_bytes()
         rotated = rotate_daemon_out(threshold)
         cleaned = clean_stale_files(CLEAN_DAYS)
+        ops_rotated = 0
+        for _name in OPS_LOGS:
+            if rotate_ops_log(LOG_DIR / _name, int(OPS_MAX_MB * 1024 * 1024)):
+                ops_rotated += 1
+        for _p in LOG_DIR.glob("*.out"):
+            if rotate_ops_log(_p, int(OPS_MAX_MB * 1024 * 1024)):
+                ops_rotated += 1
+        cleaned += clean_state_junk(CLEAN_DAYS)
         p = LOG_DIR / TARGET
         size_mb = (p.stat().st_size / 1024 / 1024) if p.exists() else 0.0
-        print("[logrotate] 巡检 daemon.out=%.1fMB 阈值=%.1fMB 轮转=%s 清理残留=%d"
-              % (size_mb, threshold / 1024 / 1024, rotated, cleaned))
+        print("[logrotate] 巡检 daemon.out=%.1fMB 阈值=%.1fMB 轮转=%s 运维日志轮转=%d "
+              "清理残留=%d" % (size_mb, threshold / 1024 / 1024, rotated, ops_rotated, cleaned))
         return 0
     except BaseException as exc:
         print("[logrotate] fatal-contained: %s: %s" % (type(exc).__name__, exc))

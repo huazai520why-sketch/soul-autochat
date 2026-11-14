@@ -942,6 +942,7 @@ def cycle(a, dev, db, st, dry_run=False):
             t_streak = time.time()
             n_done = 0
             n_fail = 0
+            need_advance = False   # G3-a：上一张卡已处理完 → 下一轮开头才点下一个
             last_res = ""
             for i in range(MATCH_STREAK_N):
                 # ① 每步前看红点
@@ -974,6 +975,14 @@ def cycle(a, dev, db, st, dry_run=False):
                         #   只有「真的还能去回的人」才打断匹配。
                         _cands2 = PQ.candidates(db, limit=1)
                         _hd = bool(_cands2)
+                        # 2026-11-14 夜审修复（G1，P1）：空烧降级放行匹配时，
+                        #   这里的红点打断会把降级路径重新堵死（闸门刚说「回复侧
+                        #   失效→放行」，步①又说「有候选→立刻停」，同一判据两处
+                        #   语义相反 → 11-08 原始死锁场景依旧匹配 0 个）。降级轮
+                        #   只认 ② 的库新消息（真·新消息），红点候选打断跳过。
+                        if _hd and (int(st.get("pending_zero_rounds", 0) or 0)
+                                    >= PENDING_ZERO_MAX):
+                            _hd = False
                     except Exception:
                         # 库不可用才退回屏幕判定（慢，但保底）
                         _hd, _b, _n = CL.has_dot_now(a, db=db)
@@ -1002,13 +1011,11 @@ def cycle(a, dev, db, st, dry_run=False):
                     break
 
                 log.info("── 无人聊 → 星球匹配（本轮第 %d/%d 个）──", i + 1, MATCH_STREAK_N)
-                res = do_match(a, dev, db, st, dry_run=dry_run)
+                res = do_match(a, dev, db, st, dry_run=dry_run,
+                               advance_first=need_advance)
                 st["last_match"] = time.time()
                 lock.touch("matched")
                 last_res = res or ""
-                # 🔴 2026-11-13 修复 HY-05（P2 死代码）：do_match 早已只返回字符串
-                #   （"fail"/"matched"/…），从不返回 False —— `or res is False` 恒假，
-                #   是残留旧判断，混淆熔断语义。只保留 `res == "fail"`。
                 if res == "fail":
                     n_fail += 1
                     st["match_fail"] = int(st.get("match_fail", 0)) + 1
@@ -1017,12 +1024,9 @@ def cycle(a, dev, db, st, dry_run=False):
                         st["match_fail"] = 0
                         log.warning("匹配连续失败 → 静默 %.0f 分钟", MATCH_SILENT / 60)
                         break
+                    # 发送失败不点下一个：卡留在屏上，下一迭代原地重试
+                    need_advance = False
                     continue
-                else:
-                    n_fail = 0
-                    st["match_fail"] = 0
-                    n_done += 1
-
                 # ④ 额度用完就是终点（用户要的是"花光"）
                 if res == "no_quota":
                     log.info("今日匹配额度已用完（本轮共匹配 %d 个）→ 转唤醒", n_done)
@@ -1032,6 +1036,13 @@ def cycle(a, dev, db, st, dry_run=False):
                 if res == "preempted":
                     log.info("匹配途中被打断 → 立刻回去处理消息（已匹配 %d 个）", n_done)
                     return "replied"
+                # "sent"/"said_skip"：卡已处理完。G3-a：这里**不点**下一个，
+                #   need_advance 记账，下一轮开头才点——中断时手里没有已扣费的卡。
+                n_fail = 0
+                st["match_fail"] = 0
+                if res == "sent":
+                    n_done += 1
+                need_advance = not dry_run
                 # ⑥ 小间隔，避免连点太快被判机器
                 if i < MATCH_STREAK_N - 1:
                     time.sleep(max(1.0, MATCH_EVERY - 5.0))
@@ -1136,13 +1147,40 @@ def _preempt_now(a, dev, db):
     return None
 
 
-def do_match(a, dev, db, st, dry_run=False):
-    """处理当前新匹配卡；没有卡时才从星球页开一次匹配。"""
+def do_match(a, dev, db, st, dry_run=False, advance_first=False):
+    """处理当前新匹配卡；没有卡时才从星球页开一次匹配。
+
+    2026-11-14 夜审重构（G3/C06，P1）：advance 从「本轮末尾」移到「下一轮
+      开头」（advance_first=True 时先点「匹配下一个」再处理新卡）。旧版每轮
+      处理完就点下一个（扣费+载新卡），连打一旦在下一轮开始前被打断（红点/
+      预算/12 次用尽/切号），这张已扣费新卡必然被下轮轮首 nav.to_chatlist
+      顶掉 —— 稳态每轮连打浪费 >=1 次额度。改后：中断/退出时手里没有
+      「已扣费未处理」的卡，结构性浪费归零。
+    """
+    if advance_first:
+        _s0 = a.snap(force=True)
+        _pg0 = detect(_s0)
+        if _pg0 == "chat" and M.has_card(_s0):
+            _s1, _pg1, _how = M.advance(a)
+            if _how == "no_quota":
+                st["match_quota_day"] = time.strftime("%Y-%m-%d")
+                log.warning("今日匹配额度已用完（点下一个时发现）→ 今天不再匹配")
+                return "no_quota"
+            if _how != "next":
+                log.warning("匹配下一个未成功（%s）→ 改走常规匹配", _how)
+        else:
+            log.info("上一张卡已不在屏上（page=%s）→ 直接常规匹配", _pg0)
     snap = a.snap(force=True)
     pg = detect(snap)
     # `M.advance()` 成功后会直接加载下一张匹配卡。下一轮连续匹配必须复用
     # 这张已扣费的新卡，不能先 nav.to_tab("星球") 再重新匹配，否则会把它顶掉。
     if pg == "chat" and M.has_card(snap):
+        # 2026-11-14 夜审修复（C07，P2）：复用前先看额度弹层——遮罩下
+        #   detect 仍可能判 chat+有卡，复用后 run_once 在遮罩下必败。
+        if M.quota_out(snap):
+            log.warning("屏上有匹配卡但额度弹层残留 → 先关弹层，本轮按失败退避")
+            M._dismiss_quota(a, snap)
+            return "fail"
         log.info("复用已加载的新匹配卡（sig=%s）", snap.signature())
     else:
         snap, pg = M.start_match(a)
@@ -1169,9 +1207,8 @@ def do_match(a, dev, db, st, dry_run=False):
     #    之前这里把它当失败直接 return、跳过 advance → 永远卡在同一张匹配卡。
     #    已说过话 = 这个会话已经聊过了，直接前进（不浪费额度，也不卡死）。
     if out.get("skip_said"):
-        log.info("该匹配会话已说过话 → 前进到下一个人（不重发）")
-        M.advance(a)
-        return True
+        log.info("该匹配会话已说过话 → 下一轮开头再前进（不重发，G3-a）")
+        return "said_skip"
     if out["err"] and not out["sent"]:
         log.warning("本轮匹配未发送: %s", out["err"])
         # 没发出去就不要点匹配下一个（白费次数）
@@ -1185,9 +1222,11 @@ def do_match(a, dev, db, st, dry_run=False):
     if out.get("preempted"):
         log.info("⚡ 因「%s」提前退出匹配（开场白已发，不点下一个）", out["preempted"])
         return "preempted"
-    # 前进到下一个人，为下一轮准备（若没有「匹配下一个」会回星球重新匹配）
-    M.advance(a)
-    return True
+    # 2026-11-14 夜审（G3-a）：本轮开场白已发、卡已处理完。**不在这里点
+    #   「匹配下一个」**——下一轮 do_match(advance_first=True) 开头才点；
+    #   若连打在本轮与下一轮之间被打断（红点/预算/额度/切号），手里没有
+    #   已扣费的卡，不浪费。
+    return "sent"
 
 
 def do_wake(a, dev, db, st, dry_run=False):

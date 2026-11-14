@@ -95,11 +95,15 @@ def resolve_msg(msg, db=None, sid=None):
     if db is None or not sid:
         return msg
     try:
+        # 2026-11-14 夜审修复（B-06，P1）：回查不加方向约束时，取到的可能是
+        #   我方语音（voice-send 链路发出的）→ 转写内容与「她这条」不对应，
+        #   回复答错对象。只取她发的最新一条。
         row = db.con.execute(
             "SELECT msgContent,localTime,senderId,msgId FROM chatmsg "
             "WHERE sessionId=? AND msgType=5 AND msgContent IS NOT NULL "
-            "AND msgContent != '' ORDER BY localTime DESC LIMIT 1",
-            (str(sid),)).fetchone()
+            "AND msgContent != '' AND senderId<>? "
+            "ORDER BY localTime DESC LIMIT 1",
+            (str(sid), str(getattr(db, "uid", "") or ""))).fetchone()
         if row:
             return _VoicePayload(row[0], row[1], row[2], row[3])
     except Exception as e:

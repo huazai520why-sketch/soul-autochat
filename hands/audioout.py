@@ -133,8 +133,18 @@ def play_wav(path, device_hint="VB-Audio", gain=1.0):
             if time.time() - t0 > timeout:
                 raise RuntimeError("waveOut playback timeout")
             time.sleep(0.02)
-        mm.waveOutUnprepareHeader(handle, byref(hdr), ctypes.sizeof(hdr))
     finally:
+        # 2026-11-14 夜审修复（D9，P2）：超时/异常路径直接 Close 会因缓冲区
+        #   仍在播放返回 WAVERR_STILLPLAYING 静默失败 → 句柄泄漏 + 旧音频继续
+        #   送 VB-Cable 与下一通语音叠音。MME 协议要求 Close 前先 Reset+Unprepare。
+        try:
+            mm.waveOutReset(handle)
+        except Exception:
+            pass
+        try:
+            mm.waveOutUnprepareHeader(handle, byref(hdr), ctypes.sizeof(hdr))
+        except Exception:
+            pass
         mm.waveOutClose(handle)
     log.info("定向播放完成 device=%r bytes=%d", name, len(frames))
     return {"device_id": dev, "device": name, "bytes": len(frames)}

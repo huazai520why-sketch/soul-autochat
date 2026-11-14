@@ -152,7 +152,8 @@ python run.py watchdog
 `tools/` 下有现成的计划任务注册脚本：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\reg_ops_tasks.ps1
+# 已废弃（2026-11-14）：任务注册统一由 tools\silent_launch.py 无窗口链路承担，
+#   权威定义=副机计划任务 XML（Export-ScheduledTask 查看）；reg_*.ps1 已删除
 ```
 
 它会注册几个任务（日志滚动、消息探针、每日复盘等）。

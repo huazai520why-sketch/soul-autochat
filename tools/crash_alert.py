@@ -36,7 +36,12 @@ _EXC_RE = re.compile(
     r"(?=\s*:|\s*$)"
 )
 MONITOR = {
+    # 2026-11-14 夜审修复（E-01，P1）：11-14 13:18 起 daemon stdout 落
+    #   daemon_stdout.out（silent_launch daemon spec），daemon.out 只剩 ps1
+    #   状态行 → 只盯 daemon.out = 崩溃告警失明一天+。两个都盯（保留旧名
+    #   兼容非 silent_launch 启动方式）。
     "daemon.out": (re.compile(r"Traceback|ERROR|Exception|自杀|CRITICAL"), "daemon 异常"),
+    "daemon_stdout.out": (re.compile(r"Traceback|ERROR|Exception|自杀|CRITICAL"), "daemon 异常"),
     "guard.watchdog.log": (re.compile(r"拉起 daemon|已强杀卡死|强杀卡死|判卡死|心跳.*超时"), "看门狗处置"),
 }
 # 只看文件尾部的增量上限，避免大文件全量读

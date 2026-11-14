@@ -95,7 +95,8 @@ def guess_uid(path):
 
 def load_nicks(uid):
     """从旧版 soul_memory.db 读昵称表 nick(uid,name)。失败返回空 dict。"""
-    for base in (r"E:\soul2.1\data\accounts", r"E:\soul1.0\data\accounts"):
+    # 2026-11-14（E-12）：soul1.0 是当前生产，优先读它；soul2.1 旧路径仅兜底。
+    for base in (r"E:\soul1.0\data\accounts", r"E:\soul2.1\data\accounts"):
         p = os.path.join(base, str(uid), "soul_memory.db")
         if not os.path.exists(p):
             continue

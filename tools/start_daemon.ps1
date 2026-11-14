@@ -82,9 +82,16 @@ try {
                       -WorkingDirectory $Root `
                       -WindowStyle Hidden
 
-        Start-Sleep -Seconds 2
-        $now = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
-               Where-Object { $_.CommandLine -match 'run\.py daemon' }
+        # 2026-11-14 (G14): old code waited only 2s before recheck - shim cold-start
+        #   chain usually exceeds 2s; 9 starts / 8 NOT-detected on 11-14. Poll 12s.
+        #   KEEP THIS FILE ASCII-ONLY (PS5.1 reads no-BOM UTF-8 as GBK).
+        $now = $null
+        foreach ($_i in 1..6) {
+            Start-Sleep -Seconds 2
+            $now = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
+                   Where-Object { $_.CommandLine -match 'run\.py daemon' }
+            if ($now) { break }
+        }
         if ($now) {
             $pids = ($now | ForEach-Object { $_.ProcessId }) -join ','
             Write-Log "=== daemon started pid=$pids ==="

@@ -141,10 +141,24 @@ def record_and_release(actor, speech_seconds, play=None, lead=0.35):
     thread = threading.Thread(target=_play_later, name="voice-audio", daemon=True)
     thread.start()
     note_action()
-    try:
-        actor.dev.u2().long_click(rec.center[0], rec.center[1], duration=hold_s)
-    except Exception as exc:
-        raise VoiceSendUnconfirmed("按住录音失败: %r" % (exc,))
+    # 2026-11-14 夜审修复（D3，P1）：u2 的 HTTP 调用无超时，长按几十秒期间
+    #   设备卡死/掉线会把主流程无限期挂死（与已发生两次的「u2 无超时挂死」
+    #   同类缺口）。手势放线程里跑 + join 预算兜底；超时按未确认失败处理。
+    click_result = {"error": None}
+
+    def _click():
+        try:
+            actor.dev.u2().long_click(rec.center[0], rec.center[1], duration=hold_s)
+        except Exception as exc:
+            click_result["error"] = exc
+
+    click_thread = threading.Thread(target=_click, name="voice-hold", daemon=True)
+    click_thread.start()
+    click_thread.join(timeout=hold_s + 15.0)
+    if click_thread.is_alive():
+        raise VoiceSendUnconfirmed("长按手势 %.1fs 未返回（设备疑似挂死）" % (hold_s + 15.0))
+    if click_result["error"] is not None:
+        raise VoiceSendUnconfirmed("按住录音失败: %r" % (click_result["error"],))
     thread.join(timeout=hold_s + 8.0)
     if thread.is_alive():
         raise VoiceSendUnconfirmed("录音期间音频播放线程未结束")

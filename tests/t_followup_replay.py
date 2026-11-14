@@ -125,7 +125,12 @@ d = SG.allow("g1", 2)
 ck(d.ok and d.n == 2, "正常待回放行 2 条")
 SG.note_sent("g1", d.n)
 d2 = SG.allow("g1", 2)
-ck(not d2.ok and d2.n == 0 and d2.state == V.FOLLOWING, "发满 2 条后本日闸死")
+# 2026-11-14 夜审（B-01）：allow 现在用台账 sends 兜底 my_last_ts_ms，
+#   「我方已回、她未再发」时 verdict 判 awaiting（语义更准：在等她回，
+#   判定顺序在 following 之前）。拒发的本质（2 条用满 → 0 条）不变。
+#   verdict.py 头注要求契约改动同步本测试。
+ck(not d2.ok and d2.n == 0 and d2.state in (V.FOLLOWING, V.AWAITING),
+   "发满 2 条后本日闸死")
 
 RS.set_archived("g1", True)
 d3 = SG.allow("g1", 1)

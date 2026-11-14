@@ -48,6 +48,19 @@ def _ensure_match_card(a):
 def main(rounds=0, dry=False):
     # rounds=0 表示一直跑到额度清零；200 只是防失控的硬上限。
     max_rounds = int(rounds or 0) or 200
+    # 🔴 2026-11-14 夜审修复（G2/C04，P0）：run.py match 必须先拿全局锁。
+    #   match_runner 是“生产逻辑”却绕过 guard.lock —— 今晚 22:20-22:35 两个
+    #   不同版本的临时 match 进程与 daemon 并发抢同一台模拟器：烧 4+ 次额度、
+    #   0 开场白、弹层残留、daemon 6 轮全被抢成 preempted（hands.input.log
+    #   22:31:04 daemon 点发送 与 22:31:25 匹配进程点灵魂卡并存实证）。
+    #   拿不到锁立即退出，绝不抢屏；atexit 保证异常退出也释放。
+    from guard import lock as _LK
+    _ok, _why = _LK.acquire("match")
+    if not _ok:
+        print("!! 全局锁被占用（%s）→ 不与 daemon/其他 match 并发抢屏，退出" % _why)
+        return 2
+    import atexit as _atexit
+    _atexit.register(_LK.release)
     dev = Device.get()
     a = Actor(dev)
     db = open_account(dev)
@@ -63,6 +76,12 @@ def main(rounds=0, dry=False):
     fail = []
     quota_done = False
     for i in range(1, max_rounds + 1):
+        # 🔴 G2 配套：连跑可能数小时，必须按轮续心跳，否则锁被 15min 心跳/
+        #   55min TTL 判死接管，runner 变成无保护裸奔。
+        try:
+            _LK.touch("match")
+        except Exception:
+            pass
         print("\n========== 第 %d 轮 ==========" % i)
         snap, pg = M.wait_match_card(a, timeout=12.0)
         if pg != "chat" or not M.has_card(snap):

@@ -140,10 +140,12 @@ def status():
         return False, d
     if not _alive(pid):
         return False, dict(d, why="owner %s 已死" % pid)
-    if age > HEARTBEAT_S:
-        return False, dict(d, why="心跳 %.0fs 超时" % age)
+    # 2026-11-14（G8）：TTL(55min) > 心跳(15min)，原顺序下 TTL 分支不可达。
+    #   先判 TTL 再判心跳，语义才与注释一致。
     if age > TTL_S:
         return False, dict(d, why="TTL 到期")
+    if age > HEARTBEAT_S:
+        return False, dict(d, why="心跳 %.0fs 超时" % age)
     return True, d
 
 

@@ -75,6 +75,17 @@ def allow(
         rec = RS.get(sid)
         _her = float(rec.get("her_ts_ms") or 0) or float(her_ts_ms or 0)
         _sends = rec.get("sends") or []
+        # 2026-11-14 夜审修复（B-01，P0）：调用方（flow/pendingq/wake）从不传
+        #   my_last_ts_ms → verdict 的 AWAITING 判据恒不触发 → 同一句 4 分钟内
+        #   被回两次（pendingq.log 22:54:20 与 22:58:26 生产实证）。用台账实时的
+        #   sends 兜底：我方末条晚于她末条 → AWAITING → 只跟不追。台账不受
+        #   300s 镜像滞后影响；她若真回了新话，on_her 已清空 sends（且有
+        #   ts<=old 保护，旧消息不会误清），不会误伤。
+        if not my_last_ts_ms and _sends:
+            try:
+                my_last_ts_ms = max(float(x) for x in _sends) * 1000.0
+            except Exception:
+                pass
         if _her <= 0:
             # 🔴 不伪造 her_ts 落盘：台账没有真人消息时间戳时，
             #    用本回合最早一条发送时刻作起点（一条都没发则用当前时刻）。

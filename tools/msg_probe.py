@@ -39,7 +39,12 @@ LOGS = os.path.join(ROOT, "logs")
 PROBE_LOG = os.path.join(LOGS, "msg_probe.log")
 PROBE_STATE = os.path.join(STATE, "msg_probe.json")
 LOCKFILE = os.path.join(STATE, "msg_probe.lock")
-DAEMON_OUT = os.path.join(LOGS, "daemon.out")
+# 2026-11-14 夜审修复（E-01）：daemon stdout 11-14 起落 daemon_stdout.out
+#   （silent_launch daemon spec），daemon.out 只剩 ps1 状态行。取存在的那个。
+def _daemon_out():
+    _p = os.path.join(LOGS, "daemon_stdout.out")
+    return _p if os.path.exists(_p) else os.path.join(LOGS, "daemon.out")
+DAEMON_OUT = _daemon_out()
 SKIPFILE = os.path.join(STATE, "pending_skip.json")
 PIDFILE = os.path.join(STATE, "daemon.pid")
 LOCKJSON = os.path.join(STATE, "daemon.lock")

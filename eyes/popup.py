@@ -122,6 +122,16 @@ def detect(snap):
                 cand = n
                 break
         if cand is None:
+            # 2026-11-14 夜审修复（D2，P1）：部分弹层关闭钮是图标+content-desc
+            #   （如额度弹层的 X），纯文本扫描够不着 → 22:30:58 实证弹层关不掉。
+            #   补 desc 匹配（同一词表），仍受底栏区域约束。
+            try:
+                _dn = snap.find_one(desc=label)
+            except Exception:
+                _dn = None
+            if _dn is not None and _dn.bounds[3] <= TAB_Y_MIN:
+                cand = _dn
+        if cand is None:
             continue
         # 从这个候选向上/向外找真正可点击的容器（弹窗按钮常是外层 ViewGroup）。
         n = snap._clickable_of(cand)

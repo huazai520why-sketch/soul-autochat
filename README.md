@@ -277,7 +277,6 @@ soul-autochat/
 │  ├─ acct.py                 多账号轮转
 │  ├─ casepack.py             画像/案情包
 │  ├─ ratelimit.py            发送配额
-│  ├─ scheduler.py            时段策略
 │  ├─ env.py                  环境探测
 │  ├─ localq.py / picreq.py / stage*.py    辅助模块
 │  └─ engine/                 ── 出话引擎
@@ -401,7 +400,8 @@ adb shell dumpsys window | findstr mCurrentFocus
 2. `logs/guard.daemon.log` 有没有新增行
 3. 进程的 CPU 时间有没有在累加
 
-> ⚠️ `logs/daemon.out` **只是 stdout 的副本**，会随启动方式被块缓冲甚至 GBK 乱码。
+> ⚠️ 2026-11-14 起 daemon stdout 落 `logs/daemon_stdout.out`（silent_launch 启动链），
+>    `logs/daemon.out` 只剩 ps1 状态行；崩溃告警两处都盯（tools/crash_alert.py MONITOR）。
 > 拿它判断死活会误判——本项目就踩过这个坑。
 
 ---

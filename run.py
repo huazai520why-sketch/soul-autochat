@@ -189,7 +189,7 @@ def cmd_wake(n=2):
     return 0 if ok else 2
 
 
-def cmd_match(n=0):
+def cmd_match(n=3):
     from brain import match_runner as L
     return L.main(rounds=n, dry=False)
 
@@ -408,7 +408,10 @@ def main():
     if args.cmd == "wake":
         return cmd_wake(args.n or 2)
     if args.cmd == "match":
-        return cmd_match(args.n if args.n is not None else 0)
+        # 2026-11-14 夜审修复（C04 配套）：默认回 3 轮。Codex 版默认 0=连跑到
+        #   额度清零（上限 200），配合无锁入口把生产机当测试机，当晚烧 4+ 次
+        #   额度 0 开场白。显式 --n 0 仍可连跑到清零，但入口已有锁保护。
+        return cmd_match(args.n if args.n is not None else 3)
     if args.cmd == "clear":
         return cmd_clear()
     if args.cmd == "pending":

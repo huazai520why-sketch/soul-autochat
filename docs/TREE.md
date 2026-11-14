@@ -61,7 +61,6 @@ soul-autochat/
 │  ├─ acct.py                      多账号轮转
 │  ├─ casepack.py                  画像/案情包
 │  ├─ ratelimit.py                 发送配额
-│  ├─ scheduler.py                 时段策略
 │  ├─ env.py                       环境探测
 │  ├─ localq.py / picreq.py        本地队列、发图判断
 │  ├─ sendgate.py                  发送闸门与归档
@@ -114,8 +113,6 @@ soul-autochat/
 │  ├─ restart_daemon.ps1           daemon 重启
 │  ├─ do_start_daemon.ps1          兼容启动
 │  ├─ rebuild_db_cache.ps1         数据库缓存重建
-│  ├─ reg_ops_tasks.ps1            注册运维任务
-│  └─ reg_probe.ps1               注册消息探针
 │
 ├─ tests/                          30 个保留验收/回放与离线测试
 │  ├─ _nolog.py
