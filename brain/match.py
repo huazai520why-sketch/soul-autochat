@@ -4,7 +4,7 @@
 硬规则（用户 2026-11-02 定）：
   1. **每次匹配后必须先把开场白发出去，再点「匹配下一个」**，否则这一天的
      匹配次数就白费了。
-  2. 匹配页**不一定有**「匹配下一个」按钮；没有时就退回星球页重新「开始匹配」。
+  2. 发完后点会话页左上角「匹配下一个」；没有按钮或没换成新卡就停手，不重复点。
   3. 开场白用**通用开场白**（用户 2026-11-02 定），不用引擎现生成。
 
 为什么不再用旧引擎生成匹配开场白（engine_gen=True 仍保留）：
@@ -21,7 +21,9 @@ from eyes.page import detect
 
 log = get_logger("brain.match")
 
-NEXT_TEXT = "匹配下一个"      # 实测 res=tv_rem b=(168,88,288,121) click=True
+NEXT_TEXT = "匹配下一个"      # 会话页左上角；实测 res=tv_rem
+MATCH_ENTRY_TEXTS = ("灵魂匹配", "开始匹配", "立即寻找懂你的人")
+REMAIN_RE = re.compile(r"今日剩余\s*(\d+)\s*次")
 LIMIT = 20                    # 与旧引擎 opening_line 默认一致
 # 🔴 2026-11-08（_report/14 实测：match 开场白问句率 31.3%）
 #   目标线：硬问句 ≤12%（对齐回复侧 12.5% 的水平，不再做「问句优先」）。
@@ -563,31 +565,88 @@ def _has_chat_input(snap):
         return False
 
 
-def next_one(actor, waits=(1.0, 1.0, 1.0)):
-    """点「匹配下一个」→ 等 1s → 重新识屏；还在匹配就再等 1s，**最多 3 次**。
+def _clickable_text(snap, texts):
+    """按文案顺序找可点击目标；只返回 clickable 节点。"""
+    for text in texts:
+        n = snap.hit(text=text)
+        if n is not None and n.clickable:
+            return n
+    return None
 
-    用户 2026-11-02 明确的口径。不能一次等到 14s：
-    匹配换人通常 1~2s 就完成，等太久会卡在无效轮询上；
-    也不能只看一次：设备卡时 dump 本身要 2.3s，第一次识屏可能还在转场。
+
+def match_entry(snap):
+    """返回星球页的灵魂匹配卡片和该卡片今日剩余次数。
+
+    新版星球页没有「开始匹配」按钮，而是在 `ratioContainer` 卡片里显示
+    「灵魂匹配 / 今日剩余 N 次」。语音匹配卡片也有一个「今日剩余 M 次」，
+    所以不能简单取页面上第一个剩余次数；必须绑定到灵魂匹配卡片自己的 bounds。
     """
-    snap = actor.snap()
-    n = snap.find_one(text=NEXT_TEXT)
+    entry = _clickable_text(snap, MATCH_ENTRY_TEXTS)
+    if entry is None:
+        return None, None
+    left, top, right, bottom = entry.bounds
+    remain = None
+    labels = []
+    for n in snap.nodes:
+        if not n.visible or "今日剩余" not in (n.label or ""):
+            continue
+        x, y = n.center
+        if left <= x <= right and top <= y <= bottom:
+            m = REMAIN_RE.search(n.label)
+            if m:
+                labels.append(int(m.group(1)))
+    if labels:
+        remain = labels[0]
+    return entry, remain
+
+
+def next_button(snap):
+    """找会话页左上角「匹配下一个」，兼容旧版仅有资源 id 的节点。"""
+    n = snap.hit(text=NEXT_TEXT)
+    if n is not None:
+        return n
+    for x in snap.nodes:
+        if (x.visible and x.clickable and "tv_rem" in (x.res_id or "")
+                and x.center[0] < 260 and x.center[1] < 200):
+            return x
+    return None
+
+
+def next_one(actor, max_wait=8.0):
+    """点一次左上角「匹配下一个」，只接受页面上出现的新匹配卡。
+
+    2026-11-14 用户口径：匹配到人 → 点个人主页建档 → 发开场白 → 点左上角
+    「匹配下一个」。不能退回星球页再点「灵魂匹配」，那会丢失当前匹配流并
+    多烧次数。这里也不重试点击：点击后若超时，调用方必须停手，先查设备/
+    网络，避免因同一个慢请求连点而重复消耗。
+    """
+    snap = actor.snap(force=True)
+    if quota_out(snap):
+        return snap, "no_quota", "no_quota"
+    n = next_button(snap)
     if n is None:
-        return snap, "no_button"
+        return snap, detect(snap), "no_button"
     before = snap.signature()
-    actor.hand.tap_node(n, settle=0.2)
+    actor.hand.tap_node(n, settle=1.0)
 
-    for i, w in enumerate(waits):
-        time.sleep(w)
+    deadline = time.time() + max(2.0, float(max_wait))
+    last = None
+    while time.time() < deadline:
         s = actor.snap(force=True)
-        sig, pg = s.signature(), detect(s)
-        if sig != before and (pg == "chat" or has_card(s) or _has_chat_input(s)):
-            log.info("第%d次识屏确认已换人 (sig %s -> %s)", i + 1, before, sig)
-            return s, "chat"
-        log.info("第%d次识屏还没换（page=%s sig=%s）", i + 1, pg, sig)
-
-    s = actor.snap(force=False)
-    return s, detect(s)
+        last = s
+        pg = detect(s)
+        if quota_out(s):
+            _dismiss_quota(actor, s)
+            return s, "no_quota", "no_quota"
+        # 必须同时满足：新指纹 + 仍是会话页 + 出现匹配卡。
+        # 不能只认输入框，否则普通旧会话也会被误当成下一张匹配卡。
+        if s.signature() != before and (pg == "chat" or _has_chat_input(s)) and has_card(s):
+            log.info("匹配下一个成功：已确认新卡 (sig %s -> %s)", before, s.signature())
+            return s, "chat", "next"
+        time.sleep(0.8)
+    log.warning("匹配下一个后未等到新卡（page=%s sig=%s）",
+                detect(last) if last is not None else "?", last.signature() if last else "?")
+    return last or actor.snap(force=True), detect(last) if last is not None else "unknown", "timeout"
 
 
 # 匹配额度用完的提示（实测弹层原文：「今日免费匹配机会已用完 (50/50)」）
@@ -640,9 +699,11 @@ def quota_out(snap):
 
 
 def start_match(actor, max_wait=25):
-    """回星球页点「开始匹配」，等到会话页。返回 (snap, page)。
+    """从星球页点一次灵魂匹配卡片，等到新匹配会话页。
 
-    用户 2026-11-02：匹配页有时候没有「匹配下一个」，那就退回星球页重新匹配。
+    新版卡片文案是「灵魂匹配 / 今日剩余 N 次」，不是旧版「开始匹配」。
+    读取剩余次数时只看灵魂匹配卡片自身 bounds，不能被旁边语音匹配的 3 次混淆。
+    点击失败或超时只返回失败，不在本函数里二次点击。
     """
     from brain import nav
 
@@ -651,35 +712,38 @@ def start_match(actor, max_wait=25):
     if pg != "planet":
         return snap, pg                      # 回不到星球页，由上层记失败
 
-    n = snap.hit(text="开始匹配")
+    if quota_out(snap):
+        _dismiss_quota(actor, snap)
+        return snap, "no_quota"
+    n, remain = match_entry(snap)
     if n is None:
         return snap, "no_start"
-    log.info("点开始匹配 %s", n.bounds)
+    if remain == 0:
+        log.warning("今日灵魂匹配额度已用完（卡片显示 0 次）→ 不再点击")
+        return snap, "no_quota"
+    log.info("点灵魂匹配 %s，今日剩余=%s", n.bounds, remain if remain is not None else "未知")
+
+    before = snap.signature()
     actor.hand.tap_node(n, settle=2.0)
 
-    # 🔴 点之前先看一眼（有的版本额度用完会直接在星球页弹层）
-    if quota_out(snap):
-        log.warning("今日匹配额度已用完（点之前就看到了）→ 不点，直接放弃")
-        return snap, "no_quota"
-
-    # 等进入会话页（中间有匹配动画，实测 3~5s）
-    # 🔴 原来等 50s：一旦匹配页没响应，一轮就白烧 50 秒（用户 2026-11-02：匹配在空烧）。
-    #    25s 足够覆盖动画 + 慢设备；超时就当失败，交给上层退避。
+    # 点一次后只等待，不因慢请求重复点击。匹配动画通常 3~5s；慢设备/服务端
+    # 可能到 20~30s。超时即停手，避免同一个匹配烧两次。
     t0 = time.time()
     while time.time() - t0 < max_wait:
         s = actor.snap(force=True)
-        # 额度用完：第一轮就能看出来，立刻关掉弹层别等
         if quota_out(s):
             log.warning("今日匹配额度已用完 → 关掉弹层，今天不再匹配")
             _dismiss_quota(actor, s)
             return s, "no_quota"
         pg2 = detect(s)
-        if pg2 == "chat":
-            return s, pg2
-        if has_card(s):
+        if s.signature() != before and (pg2 == "chat" or _has_chat_input(s)) and has_card(s):
+            log.info("已进入新匹配会话 (sig %s -> %s)", before, s.signature())
             return s, "chat"
-        time.sleep(1.2)
-    return actor.snap(force=True), "timeout"
+        time.sleep(0.8)
+    s = actor.snap(force=True)
+    log.warning("点灵魂匹配后未进入新匹配会话（page=%s sig=%s）",
+                detect(s), s.signature())
+    return s, "timeout"
 
 
 def run_once(actor, dev, db, dry_run=False, preempt=None):
@@ -781,19 +845,22 @@ def run_once(actor, dev, db, dry_run=False, preempt=None):
 
 
 def advance(actor):
-    """不再预开下一张匹配卡（2026-11-03 修复：省一半匹配额度）。
+    """在开场白确认发出后，点会话页左上角「匹配下一个」。
 
-    原实现：点「匹配下一个」/「开始匹配」会把下一个人加载到屏幕上，
-    但下一轮 `cycle` 开头 `nav.to_chatlist` 立刻把这张卡顶掉 ——
-    开场白一句都发不出去，而这次匹配**已经扣了额度**。
-    实测一次发送消耗 2 次匹配机会（50/50 实际只能用约 25 人）。
-
-    现在只做占位、不点任何按钮，交给下一轮 `start_match` 正常匹配（1 次/句）。
-    返回 (snap, page, how)，how 固定 "defer"；现有调用方都不使用返回值。
+    2026-11-14 用户确认的新版流程：
+      匹配到人 → 点个人主页建档 → 发开场白 → 点左上角「匹配下一个」。
+    这里必须直接切到下一张卡，不能回星球页重新匹配；返回 how：
+      next     已确认新匹配卡
+      no_quota 已用完
+      no_button/timeout 停手（不重复点击）
     """
-    snap = actor.snap()
-    log.info("不预开下一张匹配卡（省额度）→ 下一轮正常匹配")
-    return snap, "defer", "defer"
+    snap, pg, how = next_one(actor)
+    if how == "next":
+        return snap, pg, "next"
+    if how == "no_quota":
+        return snap, pg, "no_quota"
+    log.warning("匹配下一个未成功：%s（page=%s）", how, pg)
+    return snap, pg, "fail"
 
 
 def visit_profile(actor, settle=2.5):
@@ -865,7 +932,8 @@ def visit_profile(actor, settle=2.5):
     actor.hand.back(settle=1.5)                  # 主页返回是安全的（不是主框架 root）
     s2, pg = actor.wait_page(("chat",), timeout=6.0)
     if pg != "chat":
-        log.warning("从主页返回后页面=%s", pg)
+        log.warning("从主页返回后页面=%s；本轮不发送、不点匹配下一个", pg)
+        return prof, False
     return prof, True
 
 

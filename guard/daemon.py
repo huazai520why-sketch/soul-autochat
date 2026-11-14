@@ -1137,8 +1137,15 @@ def _preempt_now(a, dev, db):
 
 
 def do_match(a, dev, db, st, dry_run=False):
-    """走到星球页开一次匹配，处理这个人。返回是否真的匹配到人。"""
-    snap, pg = M.start_match(a)
+    """处理当前新匹配卡；没有卡时才从星球页开一次匹配。"""
+    snap = a.snap(force=True)
+    pg = detect(snap)
+    # `M.advance()` 成功后会直接加载下一张匹配卡。下一轮连续匹配必须复用
+    # 这张已扣费的新卡，不能先 nav.to_tab("星球") 再重新匹配，否则会把它顶掉。
+    if pg == "chat" and M.has_card(snap):
+        log.info("复用已加载的新匹配卡（sig=%s）", snap.signature())
+    else:
+        snap, pg = M.start_match(a)
     if pg == "no_quota":
         # 今日额度 50/50 用完：当天不再尝试（明天自然恢复）。
         # 不去点「购次数卡」也不做任务 —— 那是花钱/耗时的事，不归我们干。

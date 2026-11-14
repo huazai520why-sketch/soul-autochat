@@ -189,7 +189,7 @@ def cmd_wake(n=2):
     return 0 if ok else 2
 
 
-def cmd_match(n=3):
+def cmd_match(n=0):
     from brain import match_runner as L
     return L.main(rounds=n, dry=False)
 
@@ -408,7 +408,7 @@ def main():
     if args.cmd == "wake":
         return cmd_wake(args.n or 2)
     if args.cmd == "match":
-        return cmd_match(args.n or 3)
+        return cmd_match(args.n if args.n is not None else 0)
     if args.cmd == "clear":
         return cmd_clear()
     if args.cmd == "pending":

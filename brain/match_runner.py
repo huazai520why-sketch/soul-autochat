@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """Interactive planet-match runner used by `python run.py match [N]`.
 
-This is production logic, not a test. It keeps the hard rule: never click
-"匹配下一个" unless the current opening line was confirmed as sent.
+2026-11-14 用户确认的完整流程：
+  灵魂匹配 → 新匹配卡 → 点个人主页建档 → 发开场白
+  → 点会话页左上角「匹配下一个」 → 等待新卡 → 重复到额度清零。
+
+硬规则：
+  * 建档没有回到原会话页，不发送、不点下一个；
+  * 开场白没有被发送三态确认，不点下一个；
+  * 点下一个后没有确认「新指纹 + 新匹配卡」，立即停手，不重复点击；
+  * 不退回星球页重新匹配，避免多烧次数。
 """
 import sys
 import time
@@ -28,37 +35,41 @@ def describe(snap):
         card["tags"] or "-", card["common"] or "-")
 
 
-def main(rounds=3, dry=False):
-    rounds = max(0, int(rounds or 0))
+def _ensure_match_card(a):
+    """确保当前是新匹配卡；必要时从星球页点一次灵魂匹配。"""
+    snap = a.snap(force=True)
+    pg = detect(snap)
+    if pg == "chat" and M.has_card(snap):
+        return snap, pg
+    snap, pg = M.start_match(a)
+    return snap, pg
+
+
+def main(rounds=0, dry=False):
+    # rounds=0 表示一直跑到额度清零；200 只是防失控的硬上限。
+    max_rounds = int(rounds or 0) or 200
     dev = Device.get()
     a = Actor(dev)
     db = open_account(dev)
-    print("账号 uid=%s" % db.uid)
+    print("账号 uid=%s，目标轮数=%s" % (
+        db.uid, "直到额度清零" if not rounds else rounds))
 
-    snap = a.snap(force=True)
-    pg = detect(snap)
-    print("起始 page=%s sig=%s" % (pg, snap.signature()))
-
-    if pg != "chat":
-        print("不在会话页，先回星球开一次匹配")
-        snap, pg = M.start_match(a)
-        print("匹配结果 page=%s" % pg)
-        if pg != "chat":
-            print("没匹配到会话页（%s），退出" % pg)
-            return 1
+    snap, pg = _ensure_match_card(a)
+    if pg != "chat" or not M.has_card(snap):
+        print("首轮没有拿到新匹配卡（page=%s），退出；不重复点击" % pg)
+        return 1
 
     ok_cnt = 0
     fail = []
-    for i in range(1, rounds + 1):
-        print("\n========== 第 %d/%d 轮 ==========" % (i, rounds))
+    quota_done = False
+    for i in range(1, max_rounds + 1):
+        print("\n========== 第 %d 轮 ==========" % i)
         snap = a.snap(force=True)
         pg = detect(snap)
-        if pg != "chat":
-            print("  当前不是会话页（%s），尝试重新匹配" % pg)
-            snap, pg = M.start_match(a)
-            if pg != "chat":
-                fail.append("第%d轮进不了会话页(%s)" % (i, pg))
-                break
+        if pg != "chat" or not M.has_card(snap):
+            print("  当前不是新匹配卡（page=%s），停手；不把普通会话误当匹配" % pg)
+            fail.append("第%d轮不是新匹配卡(%s)" % (i, pg))
+            break
 
         card = M.read_card(snap)
         card_tags, card_common = card["tags"], card["common"]
@@ -66,16 +77,29 @@ def main(rounds=3, dry=False):
 
         said, bs = M.said_already(dev, snap)
         if said:
-            print("  该会话我已经说过话（气泡 %d 条），不重复发，直接前进" % len(bs))
+            print("  当前卡已说过话（气泡 %d 条），不重发，直接点下一个" % len(bs))
         else:
+            # 用户要求先建档再发。建档失败/没回到原聊天页就停手保留这张卡。
             prof = None
             try:
                 prof, pok = M.visit_profile(a)
-                print("  主页建档: ok=%s %s" % (pok, P.summary(prof) if prof else "-"))
+                print("  主页建档: ok=%s %s" % (
+                    pok, P.summary(prof) if prof else "-"))
             except Exception as e:
-                print("  主页建档异常 %r（继续发开场白）" % e)
+                pok = False
+                print("  主页建档异常 %r" % e)
+            if not pok:
+                fail.append("第%d轮主页建档未闭环" % i)
+                print("  !! 建档没有回到原会话页，停止；不发送、不点匹配下一个")
+                break
 
-            text, cands = M.opening(None, M.read_card(a.snap(force=True)))
+            snap = a.snap(force=True)
+            if detect(snap) != "chat" or not M.has_card(snap):
+                fail.append("第%d轮建档后不是原匹配会话" % i)
+                print("  !! 建档后页面=%s，停止；不发送、不点匹配下一个" % detect(snap))
+                break
+
+            text = M._local_opener(card)
             print("  开场白: %r" % text)
             if dry:
                 print("  [dry] 不发送")
@@ -85,40 +109,46 @@ def main(rounds=3, dry=False):
                 print("  发送: ok=%s %s (%.1fs)" % (ok, why, time.time() - t0))
                 if not ok:
                     fail.append("第%d轮发送失败: %s" % (i, why))
-                    print("  !! 发送失败，停止（不点匹配下一个，保留这次匹配）")
+                    print("  !! 发送失败，停止；不点匹配下一个，保留这次匹配")
                     break
                 ok_cnt += 1
-                time.sleep(0.8)
 
-                if prof:
-                    try:
-                        sid = CP.find_sid(db, text, device=dev)
-                        if sid:
-                            okp = CP.save_profile(sid, prof, tags=card_tags,
-                                                  common=card_common)
-                            print("  案情包: sid=%s 写入=%s" % (sid, okp))
-                        else:
-                            print("  案情包: 反查不到 sid，跳过")
-                    except Exception as e:
-                        print("  案情包异常 %r" % e)
+                try:
+                    sid = CP.find_sid(db, text, device=dev)
+                    if sid:
+                        okp = CP.save_profile(sid, prof, tags=card_tags,
+                                              common=card_common)
+                        print("  案情包: sid=%s 写入=%s" % (sid, okp))
+                    else:
+                        print("  案情包: 反查不到 sid，跳过（不猜测写错人）")
+                except Exception as e:
+                    print("  案情包异常 %r" % e)
 
-        if i == rounds:
-            print("  已是最后一轮，不再前进")
+        if dry:
+            print("  [dry] 不前进")
+            continue
+
+        # 建档 + 发送完成，才允许点左上角「匹配下一个」。
+        time.sleep(0.8)
+        snap2, pg2, how = M.next_one(a, max_wait=10.0)
+        print("  匹配下一个: how=%s page=%s sig=%s" % (
+            how, pg2, snap2.signature() if snap2 else "?"))
+        if how == "no_quota":
+            quota_done = True
+            print("  今日匹配额度已清零")
             break
-
-        snap2, pg2, how = M.advance(a)
-        print("  前进: how=%s page=%s" % (how, pg2))
-        if how == "fail":
-            fail.append("第%d轮前进失败(%s)" % (i, pg2))
+        if how != "next":
+            fail.append("第%d轮匹配下一个未确认(%s)" % (i, how))
+            print("  !! 未确认新卡，停止；不重复点击")
             break
 
     print("\n===== 结果 =====")
     print("成功发送 %d 条" % ok_cnt)
-    if fail:
-        for f in fail:
-            print("失败: %s" % f)
+    print("额度清零=%s" % quota_done)
+    for f in fail:
+        print("失败: %s" % f)
     snap = a.snap(force=True)
     print("收尾 page=%s sig=%s" % (detect(snap), snap.signature()))
-    if rounds == 0:
-        return 0
-    return 0 if ok_cnt and not fail else 2
+    if fail and not quota_done:
+        return 2
+    return 0
