@@ -873,6 +873,21 @@ def visit_profile(actor, settle=2.5):
     """
     from eyes import profile as P
 
+    def ui_back(s):
+        """只在主页左上角点 App 自己的返回控件，禁止用系统返回键。"""
+        cands = []
+        for x in s.nodes:
+            if not x.visible or not x.clickable or x.center[1] > 220:
+                continue
+            label = (x.label or "").strip()
+            if ("返回" in label or "back" in (x.res_id or "").lower()
+                    or "item_left_back" in (x.res_id or "")):
+                cands.append(x)
+        if not cands:
+            return None
+        cands.sort(key=lambda x: (x.center[1], x.center[0]))
+        return cands[0]
+
     snap = actor.snap()
     n = snap.hit(text="查看主页")
 
@@ -920,16 +935,23 @@ def visit_profile(actor, settle=2.5):
     txt = "\n".join(s.texts())
     if not any(k in txt for k in ("灵魂画像", "Ta的展品馆", "IP属地", "被关注")):
         log.warning("点了查看主页但没进主页（page=%s）", detect(s))
-        # 🔴 2026-11-03：只有真的离开了会话页才 back。点空时（仍停在 chat）
-        #    盲按返回会把会话页退到列表 —— 这就是用户看到的「瞎操作」。
         if detect(s) != "chat":
-            actor.hand.back(settle=1.2)
+            b = ui_back(s)
+            if b is not None:
+                actor.hand.tap_node(b, settle=1.2)
         return None, False
 
     prof = P.read(s)
     log.info("主页资料: %s", P.summary(prof))
 
-    actor.hand.back(settle=1.5)                  # 主页返回是安全的（不是主框架 root）
+    # 用户硬规则：匹配链路不用系统返回键。点主页左上角 App 返回控件，
+    # 未找到就停手，绝不把匹配会话踢回星球页。
+    b = ui_back(s)
+    if b is None:
+        log.warning("主页找不到页面返回控件；不按系统返回，保留现场")
+        return prof, False
+    log.info("点主页返回控件 %s", b.bounds)
+    actor.hand.tap_node(b, settle=1.5)
     s2, pg = actor.wait_page(("chat",), timeout=6.0)
     if pg != "chat":
         log.warning("从主页返回后页面=%s；本轮不发送、不点匹配下一个", pg)
