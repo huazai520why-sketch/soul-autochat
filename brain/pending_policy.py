@@ -59,6 +59,23 @@ def rank_candidates(items, fresh_hours=6.0, hot_minutes=20.0, now_ms=None):
     return hot + rest
 
 
+def prioritize_voice(items, voice_sids, hot_minutes=20.0, now_ms=None):
+    """Keep true hot messages first, then move older voice items ahead of text backlog."""
+    now_ms = (time.time() * 1000.0) if now_ms is None else float(now_ms)
+    hot_ms = float(hot_minutes) * 60.0 * 1000.0
+    voices = {str(x) for x in (voice_sids or ())}
+    hot, voice_rest, other = [], [], []
+    for item in items:
+        age_ms = now_ms - float(item[3] or 0)
+        if age_ms < hot_ms:
+            hot.append(item)
+        elif str(item[0]) in voices:
+            voice_rest.append(item)
+        else:
+            other.append(item)
+    return hot + voice_rest + other
+
+
 def compact_reason_counts(counter):
     """Return only non-zero cooldown reason counts from a Counter/dict."""
     return {

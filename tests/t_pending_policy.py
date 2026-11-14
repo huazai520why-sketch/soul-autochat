@@ -43,8 +43,20 @@ def test_reason_counts():
     assert got == {"nocue_hard": 3, "timeout": 2}
 
 
+def test_voice_backlog_priority():
+    now = 10_000_000.0
+    items = [
+        ("text_old", "1", "old text", now - 30 * 3600000, 1),
+        ("voice_old", "2", "voice transcript", now - 30 * 3600000, 1),
+        ("hot", "3", "hot text", now - 60000, 1),
+    ]
+    ranked = P.prioritize_voice(items, {"voice_old"}, now_ms=now)
+    assert [x[0] for x in ranked] == ["hot", "voice_old", "text_old"]
+
+
 if __name__ == "__main__":
     test_cooldown()
     test_rank_hot_first_then_tier()
     test_reason_counts()
+    test_voice_backlog_priority()
     print("PASS t_pending_policy")

@@ -23,7 +23,7 @@ from brain import voice as V
 from brain import search as S
 from core.log import get_logger
 from core import metrics as MET
-from core.paths import STATE
+from core.paths import LOGS, STATE
 from data import pending_ledger as PL
 from hands.input import Input
 
@@ -184,7 +184,8 @@ VOICE_OK_TTL_S = 24 * 3600
 _VOICE_CACHE = {}
 
 
-def _voice_cache_key(sid, msg):
+def _voice_cache_key(sid, msg, db=None):
+    msg = V.resolve_msg(msg, db=db, sid=sid)
     try:
         duration = int(V.duration(msg))
     except Exception:
@@ -197,9 +198,10 @@ def _voice_cache_key(sid, msg):
     )
 
 
-def _voice_text_cached(sid, msg):
+def _voice_text_cached(sid, msg, db=None):
     """返回 (文本, 来源, 是否新失败)。失败结果短期缓存，避免重复 ASR。"""
-    key = _voice_cache_key(sid, msg)
+    msg = V.resolve_msg(msg, db=db, sid=sid)
+    key = _voice_cache_key(sid, msg, db=db)
     now = time.time()
     rec = _VOICE_CACHE.get(key)
     if rec:
@@ -209,7 +211,7 @@ def _voice_text_cached(sid, msg):
         if not rec["ok"] and age < VOICE_FAIL_TTL_S:
             return None, "cached_fail", False
     try:
-        text, how = V.voice_text(msg)
+        text, how = V.voice_text(msg, db=db, sid=sid)
     except Exception as e:
         text, how = None, repr(e)
     if text:
@@ -992,20 +994,22 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   2~10s 语音 0.1~12s/条（模型已加载后 0.1s 命中缓存，冷启动约 5~12s）。
             #   转写失败 → 用占位串照样进队列（宁可回一句「没听清，你再说一遍」，
             #   也不能让她的语音永远石沉大海）。
-            vtxt, vhow, _fresh_fail = _voice_text_cached(sid, last)
+            vtxt, vhow, _fresh_fail = _voice_text_cached(sid, last, db=db)
+            full_voice = V.resolve_msg(last, db=db, sid=sid)
             if vtxt:
                 if vhow != "cache":
                     log.info("语音已转写 sid=%s（%ds, %s）: %r",
-                             sid, int(V.duration(last)), vhow, vtxt[:40])
+                             sid, int(V.duration(full_voice)), vhow, vtxt[:40])
                 txt = vtxt
             else:
                 if _fresh_fail:
                     log.warning("语音转写失败 sid=%s（%ds）→ 用占位串照常回复，"
                                 "%.0f 分钟内不重复转写",
-                                sid, int(V.duration(last)), VOICE_FAIL_TTL_S / 60.0)
+                                sid, int(V.duration(full_voice)),
+                                VOICE_FAIL_TTL_S / 60.0)
                 else:
                     log.debug("语音转写沿用失败缓存 sid=%s（%ds）",
-                              sid, int(V.duration(last)))
+                              sid, int(V.duration(full_voice)))
                 txt = V.PLACEHOLDER
             # 标记这个 sid 是语音：搜索时必须跳过「用转写文字搜」，
             # 因为 Soul 列表预览显示的是「[语音]」，转写文字搜不到（见 kw_of）。
@@ -1201,6 +1205,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     # The policy is pure and covered by tests/t_pending_policy.py.
     merged = PP.rank_candidates(out, fresh_hours=FRESH_H, hot_minutes=20,
                                 now_ms=now_ms)
+    merged = PP.prioritize_voice(merged, _VOICE_SIDS, hot_minutes=20,
+                                 now_ms=now_ms)
     # 2026-11-03：把「她末条时间」一起返回（第 4 项）——
     #   handle_pending 要用它判「是不是断太久、该走重新开场」。
     #
@@ -1337,6 +1343,30 @@ def _load_nick_file():
 
 
 _NICK_CACHE = _load_nick_file()
+_NICK_LOG_CACHE = {"at": 0.0, "map": {}}
+
+
+def _nick_from_logs(sid):
+    """Recover nicknames already seen by flow logs when the DB extMap lacks name."""
+    now = time.time()
+    if now - float(_NICK_LOG_CACHE.get("at") or 0) >= 300:
+        mapping = {}
+        try:
+            p = LOGS / "brain.flow.log"
+            raw = p.read_bytes()
+            # Nicknames from older sessions may sit near the tail after a week.
+            tail = raw[-4 * 1024 * 1024:].decode("utf-8", "replace")
+            pat = re.compile(r"\[([^\]\r\n]{1,20})\].*?\bsid=(\d{6,})")
+            for line in tail.splitlines():
+                if "快路径" not in line and "慢路径" not in line:
+                    continue
+                m = pat.search(line)
+                if m:
+                    mapping[str(m.group(2))] = m.group(1).strip()
+        except Exception as e:
+            log.debug("从 flow 日志恢复昵称失败: %r", e)
+        _NICK_LOG_CACHE.update(at=now, map=mapping)
+    return _NICK_LOG_CACHE["map"].get(str(sid))
 
 
 def nick_of(db, sid, uid):
@@ -1380,6 +1410,10 @@ def nick_of(db, sid, uid):
                 break
     except Exception as e:
         log.debug("取昵称异常 sid=%s: %r", sid, e)
+    if not nice:
+        nice = _nick_from_logs(sid)
+        if nice:
+            log.info("从 flow 日志恢复昵称 sid=%s: %r", sid, nice)
     _NICK_CACHE[key] = (time.time(), nice)
     if len(_NICK_CACHE) > 500:
         _NICK_CACHE.clear()
@@ -1435,7 +1469,7 @@ def _sessions_with(db, text):
         return -1
 
 
-def _search_plan(db, sid, to_uid, kw):
+def _search_plan(db, sid, to_uid, kw, direct_text=""):
     """搜索三级策略（用户 2026-11-10 口径）。
 
       ① 昵称 —— 唯一性最强，命中即本人；
@@ -1454,6 +1488,11 @@ def _search_plan(db, sid, to_uid, kw):
         plan.append(("昵称", nk))
     elif nk:
         log.info("昵称 %r 太短/纯符号 → 不拿它搜", nk[:12])
+    # A voice item's transcript is absent from the local chatmsg column, but
+    # Soul's own search index may still contain its server-side ASR text.
+    # Try it before falling back to an older text message.
+    if _usable_word(direct_text, 5):
+        plan.append(("语音转写", direct_text[:30]))
     if _usable_word(kw, 5):
         n = _sessions_with(db, kw)
         # 🔴🔴 2026-11-10（身份校验连续失败的真正来源）：
@@ -2034,6 +2073,11 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
 
     for cand in cands:
         sid, to_uid, txt, her_ts = cand
+        # A voice conversation already survived normal preemption twice in the
+        # last few minutes. Once it starts locating, keep its bounded search
+        # window atomic; otherwise steady traffic can starve it indefinitely.
+        # New messages are still honored at the next candidate boundary.
+        _cand_preempt = None if str(sid) in _VOICE_SIDS else _new_msg_urgent
         # ⚡ 2026-11-04（用户口径：新消息不能被积压挤住）：
         #   实测 09:15:42 她发 'hi '，09:17:46~09:23:07 一直在处理 4~144h 的老候选，
         #   09:24:18 才回出去 = **延迟 8.6 分钟**。
@@ -2206,9 +2250,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             _pg_n = 6
         else:
             _pg_n = None
+        # Voice rows often have no text/nickname in the DB. If we recovered a
+        # nickname from logs, inspect a deeper list window before paying for a
+        # likely-miss textual search. Recent sessions are usually near the top.
+        if str(sid) in _VOICE_SIDS and age_h < 48.0:
+            _pg_n = max(int(_pg_n or FIND_PAGES), 12)
         row = find_row(actor, txt, kw=kw, nick=_nick_try, db=db, sid=sid,
-                       pages=_pg_n, preempt=_new_msg_urgent)
-        if _new_msg_urgent():
+                       pages=_pg_n, preempt=_cand_preempt)
+        if _cand_preempt is not None and _new_msg_urgent():
             out["aborted"] = "preempted"
             try:
                 from data import watch as _Wp
@@ -2306,14 +2355,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             # 🔴 2026-11-10 §113（用户口径）：搜索三级 —— 昵称 → 独一无二内容 → 放弃
             #   先在**开搜索页之前**算计划：open_search 走慢路径要 40~50s，
             #   没有可搜线索就该直接跳过，不能先把这 40s 烧掉再放弃。
-            _plan = _search_plan(db, sid, to_uid, kw)
+            _plan = _search_plan(
+                db, sid, to_uid, kw,
+                direct_text=(txt if str(sid) in _VOICE_SIDS else ""))
             if not _plan:
                 log.info("昵称和独一无二内容都拿不到 → 放弃本轮 uid=%s（等她发新消息再试）",
                          to_uid)
                 mark_skip(sid, txt, "nocue", hours=NO_CUE_H)
                 out["skipped"] += 1
                 continue
-            if not S.open_search(actor, preempt=_new_msg_urgent):
+            if not S.open_search(actor, preempt=_cand_preempt):
                 if getattr(S, "LAST_REASON", "") == "preempted":
                     out["aborted"] = "preempted"
                     try:
@@ -2328,7 +2379,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     break
                 out["skipped"] += 1
                 continue
-            if _new_msg_urgent():
+            if _cand_preempt is not None and _new_msg_urgent():
                 out["aborted"] = "preempted"
                 try:
                     from data import watch as _Wp1
@@ -2340,7 +2391,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             _got = 0
             for _label, _word in _plan:
                 log.info("搜索[%s] %r", _label, _word[:16])
-                _got = S.search(actor, dev, _word, preempt=_new_msg_urgent)
+                _got = S.search(actor, dev, _word, preempt=_cand_preempt)
                 if _got < 0:
                     out["aborted"] = "preempted"
                     try:

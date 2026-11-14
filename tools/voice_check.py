@@ -24,6 +24,7 @@ def main():
     try:
         from core.device import Device
         from data import imdb
+        from brain import voice as V
     except Exception as e:
         print("导入失败: %r" % (e,))
         return 3
@@ -61,22 +62,28 @@ def main():
             pass
         word = (d.get("word") or "").strip()
         dur = d.get("duration") or 0
+        msg = type("VoiceMsg", (), {
+            "msg_type": 5, "content": mc or "", "text": "", "ts": int(lt),
+            "sender": str(sender),
+        })()
+        asr_text, how = V.voice_text(msg, db=db, sid=sid)
         # 她这条语音之后，我有没有回过
         after = con.execute(
             "SELECT COUNT(*) FROM chatmsg WHERE sessionId=? AND senderId=? AND localTime>?",
             (sid, uid, int(lt))).fetchone()[0]
         age_h = (now_ms - float(lt)) / 3600000.0
         tag = "已回" if after else "未回"
-        print("  %-14s %2ds word=%-6s 之后我发了%d条  %s  龄%.1fh" % (
-            str(sid)[-14:], dur, "有" if word else "无", after, tag, age_h))
-        if not after and age_h > 2.0:      # 超 2 小时还没回 = 真漏了
-            bad.append((sid, lt, age_h))
+        print("  %-14s %2ds app_word=%-5s asr=%-5s 之后我发了%d条  %s  龄%.1fh" % (
+            str(sid)[-14:], dur, "有" if word else "无",
+            "有" if asr_text else how, after, tag, age_h))
+        if not asr_text or (not after and age_h > 2.0):
+            bad.append((sid, lt, age_h, "ASR失败" if not asr_text else "未回复"))
 
     if bad:
         print("")
         print("⚠ %d 条语音超过 2 小时仍未回：" % len(bad))
-        for sid, lt, age_h in bad[:10]:
-            print("   sid=%s  龄%.1fh" % (sid, age_h))
+        for sid, lt, age_h, why in bad[:10]:
+            print("   sid=%s  龄%.1fh  原因=%s" % (sid, age_h, why))
         return 2
     print("")
     print("✓ 语音链路正常")

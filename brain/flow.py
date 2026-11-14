@@ -108,7 +108,7 @@ def her_burst(db, sid, uid, max_n=None):
             continue
         if str(m.sender) == str(uid):
             break                      # 我说的 → 连发到这里为止
-        t, how = V.her_msg_of(m)
+        t, how = V.her_msg_of(m, db=db, sid=sid)
         if how == "tip":
             continue                   # 系统提示不算她说话
         if t:
@@ -148,7 +148,7 @@ def her_last_real(db, sid, uid):
             continue
         if str(m.sender) == str(uid):
             return None
-        _t, _how = V.her_msg_of(m)
+        _t, _how = V.her_msg_of(m, db=db, sid=sid)
         if _how == "tip":
             continue
         return m
@@ -297,10 +297,16 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
     db_last, _src = db.latest(sid_fast) if sid_fast else (None, "")
     if sid_fast and db_last is not None:
         out.sid = sid_fast
+        if out.nick:
+            try:
+                from brain.pendingq import remember_nick
+                remember_nick(sid_fast, out.nick)
+            except Exception:
+                pass
         side = "me" if str(db_last.sender) == str(db.uid) else "her"
         out.side = side
         # 语音（type=5）的 text 通常为空，必须走 voice 层转文字，否则会被当成"无话可说"
-        out.last_text, how = V.her_msg_of(db_last)
+        out.last_text, how = V.her_msg_of(db_last, db=db, sid=sid_fast)
         out.kind = how
         nb = take_burst(db, out)
         log.info("[%s] 快路径 sid=%s 末条=%s %r（%s/%s，她连发 %d 条）",
@@ -313,7 +319,8 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
         #   往前找她最后一条真实消息，找到了就继续走正常流程。
         if how == "tip":
             _real = her_last_real(db, out.sid, db.uid)
-            _rt, _rh = V.her_msg_of(_real) if _real is not None else ("", "tip")
+            _rt, _rh = (V.her_msg_of(_real, db=db, sid=out.sid)
+                        if _real is not None else ("", "tip"))
             if _rh != "text" or not _rt:
                 log.info("[%s] 末条是系统卡片，前面是 %s → 不在此处理", out.nick, _rh or "无")
                 actor.hand.back(settle=0.9)
@@ -497,13 +504,14 @@ def _slow_path(actor, db, out, dry_run):
         if forced_her:
             her_msg, how = (out.last_text or ""), "text"
         else:
-            her_msg, how = V.her_msg_of(db_last)
+            her_msg, how = V.her_msg_of(db_last, db=db, sid=out.sid)
         out.kind = how
         if how == "tip":
             # 🔴 2026-11-05：同快路径 —— 末条是卡片时往前找她真实的话，
             #   有未接的就继续出话，别让她的话被一张卡片挡死。
             _real = her_last_real(db, out.sid, db.uid)
-            _rt, _rh = V.her_msg_of(_real) if _real is not None else ("", "tip")
+            _rt, _rh = (V.her_msg_of(_real, db=db, sid=out.sid)
+                        if _real is not None else ("", "tip"))
             if _rh != "text" or not _rt:
                 log.info("[%s] 末条是系统卡片，前面是 %s → 不在此处理", out.nick, _rh or "无")
                 actor.hand.back(settle=0.9)

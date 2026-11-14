@@ -36,6 +36,18 @@ OTHER_PLACEHOLDER = "（她发来一条消息）"
 _ASR = None
 
 
+class _VoicePayload(object):
+    __slots__ = ("msg_type", "content", "text", "ts", "sender", "msg_id")
+
+    def __init__(self, content="", ts=0, sender="", msg_id=""):
+        self.msg_type = VOICE_MT
+        self.content = content or ""
+        self.text = ""
+        self.ts = int(ts or 0)
+        self.sender = sender
+        self.msg_id = msg_id
+
+
 def asr():
     """懒加载 ASR（模型在 E:/soul1.0/models/whisper，随 brain/asr.py 的 __file__ 推导）。"""
     global _ASR
@@ -68,6 +80,33 @@ def is_voice(msg):
     return int(getattr(msg, "msg_type", 0) or 0) == VOICE_MT
 
 
+def resolve_msg(msg, db=None, sid=None):
+    """Return a voice message that still carries msgContent.
+
+    `db.latest()` may return the session summary (`text='[语音]'`) instead of
+    the chatmsg row. That summary has no URL/duration, so direct ASR cannot run.
+    Fall back to the newest real type=5 chatmsg row for the same sid.
+    """
+    if not is_voice(msg):
+        return msg
+    d = content(msg)
+    if (d.get("url") or d.get("word") or d.get("localUrl")):
+        return msg
+    if db is None or not sid:
+        return msg
+    try:
+        row = db.con.execute(
+            "SELECT msgContent,localTime,senderId,msgId FROM chatmsg "
+            "WHERE sessionId=? AND msgType=5 AND msgContent IS NOT NULL "
+            "AND msgContent != '' ORDER BY localTime DESC LIMIT 1",
+            (str(sid),)).fetchone()
+        if row:
+            return _VoicePayload(row[0], row[1], row[2], row[3])
+    except Exception as e:
+        log.debug("语音消息内容回查失败 sid=%s: %r", sid, e)
+    return msg
+
+
 def duration(msg):
     try:
         return float(content(msg).get("duration") or 0)
@@ -75,12 +114,13 @@ def duration(msg):
         return 0.0
 
 
-def voice_text(msg, allow_asr=True, timeout=30):
+def voice_text(msg, allow_asr=True, timeout=30, db=None, sid=""):
     """语音 → 文本。返回 (text, how)。
 
     how: "word" App 转写 / "asr" 本地转写 / "none" 都没拿到
     text 为 "" 时上层应使用 PLACEHOLDER 并照样回复。
     """
+    msg = resolve_msg(msg, db=db, sid=sid)
     d = content(msg)
     w = (d.get("word") or "").strip()
     if w:
@@ -137,7 +177,7 @@ def image_url(msg):
     return ""
 
 
-def her_msg_of(msg, allow_asr=True):
+def her_msg_of(msg, allow_asr=True, db=None, sid=""):
     """给 flow / pendingq 用：把「她这一条」变成可回复的文本。
 
     返回 (text, how)。how 同时是消息大类，上层据此选话术：
@@ -150,7 +190,7 @@ def her_msg_of(msg, allow_asr=True):
     if k == "text":
         return (getattr(msg, "text", "") or "").strip(), "text"
     if k == "voice":
-        t, how = voice_text(msg, allow_asr=allow_asr)
+        t, how = voice_text(msg, allow_asr=allow_asr, db=db, sid=sid)
         return (t, how) if t else (PLACEHOLDER, "none")
     if k == "image":
         return IMAGE_PLACEHOLDER, "image"

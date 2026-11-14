@@ -301,7 +301,7 @@ soul-autochat/
 │  ├─ prepare_photos.py       照片进相册（发图前置）
 │  └─ *.ps1                   Windows 计划任务注册脚本
 ├─ scripts/repo_sync.ps1      Git 漂移检查与脱敏扫描
-├─ tests/                     ── 26 个保留验收/回放与离线脚本（t_*.py）
+├─ tests/                     ── 27 个保留验收/回放与离线脚本（t_*.py）
 └─ docs/                      ── 架构与部署文档
 ```
 

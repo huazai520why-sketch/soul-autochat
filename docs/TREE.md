@@ -1,7 +1,7 @@
 # 目录树
 
 > 2026-11-14 副机生产目录实测。当前 HEAD `bc50b70`。
-> 当前约 105 个 Python 文件、2.38 万行、1.20 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
+> 当前约 106 个 Python 文件、24,004 行、1.21 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ```text
 soul-autochat/
@@ -113,7 +113,7 @@ soul-autochat/
 │  ├─ reg_ops_tasks.ps1            注册运维任务
 │  └─ reg_probe.ps1               注册消息探针
 │
-├─ tests/                          26 个保留验收/回放与离线测试
+├─ tests/                          27 个保留验收/回放与离线测试
 │  ├─ _nolog.py
 │  ├─ t_device.py / t_eyes.py / t_chatlist.py
 │  ├─ t_dbcheck.py / t_casepack.py / t_flow_dry.py
@@ -126,6 +126,7 @@ soul-autochat/
 │  ├─ t_flow_preempt.py / t_health_contract.py
 │  ├─ t_lock_health.py / t_metrics.py
 │  ├─ t_pending_ledger.py / t_pending_policy.py
+│  ├─ t_voice_contract.py / t_flow_preempt.py
 │  └─ 说明：t_match_loop.py 现仅包装生产模块 brain.match_runner
 │
 ├─ scripts/

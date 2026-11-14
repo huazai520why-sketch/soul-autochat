@@ -100,10 +100,10 @@ flowchart LR
 | `brain/` | 36 | 决策、流程、候选排序、匹配运行器、出话引擎、案情包、账号与技能 |
 | `data/` | 6 | App SQLite、待回台账、共享冷却/已回台账、回复状态、变更监听 |
 | `guard/` | 4 | 主循环、单实例锁、看门狗、公开导出 |
-| `tests/` | 26 | 保留的验收/回放与离线契约测试 |
+| `tests/` | 27 | 保留的验收/回放与离线契约测试 |
 | `tools/` | 13 | 静默启动、探针、守护、运维与注册脚本 |
 
-合计约 105 个 Python 文件、2.38 万行、1.20 MB（不含回收区）。
+合计约 106 个 Python 文件、24,004 行、1.21 MB（不含回收区）。
 
 ## 5. 当前保留的测试
 
@@ -119,7 +119,7 @@ t_followup_replay.py      t_kw_masked_phone.py  t_run_loop.py
 t_skills_replay.py        t_wake_plan.py
 t_flow_preempt.py         t_health_contract.py
 t_lock_health.py          t_metrics.py
-t_pending_ledger.py       t_pending_policy.py
+t_pending_ledger.py       t_pending_policy.py       t_voice_contract.py
 ```
 
 历史 `t_probe_*`、`t_switch*`、`t_doubletap_*`、相册/截图/一次性诊断脚本已移入 `E:\_soul_trash_20261114`，可按 `manifest.csv` 和 `rollback.ps1` 恢复。
@@ -148,6 +148,8 @@ t_pending_ledger.py       t_pending_policy.py
 - `data/state/daemon.lock`：存活 daemon 由实际子进程持有；缺锁/被替换时 daemon 会自愈重建，若已有活 owner 则新进程退出。
 - `tools/msg_probe.py`：缺锁时步骤龄为 unknown，不再把 Unix 纪元秒误报成“步骤未推进几十年”。
 - `tools/watchdog_live.py`：日志静默和锁心跳联合判断，避免长阶段被单一日志来源误杀。
+- `brain/voice.py`：先读 App 自带 `word`，为空时本地 Whisper 转写；会话摘要 `[语音]` 缺少 URL 时回查真实 type=5 `chatmsg` 行。
+- 语音转写成功后会进入正常待回排序，并优先于较老的纯文本积压；搜索计划可用昵称、语音转写文本和历史唯一句。昵称缺失时会从 flow 日志回填，较老语音候选允许检查更深列表；已经开始的单条语音定位窗口不再被普通新消息无限打断。
 
 ## 8. 清理边界
 
