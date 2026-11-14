@@ -139,7 +139,9 @@ def should_reply_list(db, limit=0):
         from data import pending as _P
         return _P.should_reply(db, limit=limit)
     except Exception as e:
-        log.warning("库判定待回失败: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：库判定失败时返回 []，调用方走屏幕/搜索兜底，
+        #   已兜住，不是故障。降为 INFO。
+        log.info("库判定待回失败: %r", e)
         return []
 
 
@@ -270,12 +272,18 @@ def to_list(actor, tries=3):
                 log.warning("[clear] 恢复后仍无底栏(%s) → 放弃本轮，不空烧", pg)
                 return snap if snap is not None else actor.snap()
             recovered = True
-            log.warning("[clear] 无底栏(%s) → 不盲点 tab / 不 back，"
-                        "am start clear-top 回主框架", pg)
+            # 🔴 2026-11-11（WARN 噪声）：无底栏 → 走 am start clear-top 恢复是**既定
+            #   自愈路径**（goto_main 成功即恢复），不是故障。真正的失败在下面
+            #   clear-top 恢复失败分支另行告警。降为 INFO。
+            log.info("[clear] 无底栏(%s) → 不盲点 tab / 不 back，"
+                     "am start clear-top 回主框架", pg)
             try:
                 goto_main(actor.dev)
             except Exception as e:
-                log.warning("[clear] clear-top 恢复失败（交回上层跳过本轮）: %r", e)
+                # 🔴 2026-11-11（WARN 噪声）：goto_main 只是**一次**恢复尝试（成功即恢复），
+                #   与 flow `_enter` 的重试中间态同性质。真正的失败是下一轮「恢复后仍无底栏
+                #   → 放弃本轮」那条 WARN。首次恢复尝试失败降为 INFO。
+                log.info("[clear] clear-top 恢复失败（交回上层跳过本轮）: %r", e)
                 return snap if snap is not None else actor.snap()
             continue
 
@@ -301,7 +309,9 @@ def _pull_down(actor, n=1, budget=12.0):
     try:
         d = actor.dev.u2()
     except Exception as e:
-        log.warning("下拉刷新取 u2 失败: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：取 u2 失败 → 直接返回 False，调用方放弃本轮刷新
+        #   （已有注释：宁可列表旧，也不能必回停摆），已兜住。降为 INFO。
+        log.info("下拉刷新取 u2 失败: %r", e)
         return False
     # 🔴 2026-11-04（duration 单位事故，这就是 08:20 卡 10 分钟的真因）：
     #   u2 的 duration 是**秒**（源码 steps = int(duration * 200)，每 step 约 5ms）。
@@ -324,10 +334,12 @@ def _pull_down(actor, n=1, budget=12.0):
     t.start()
     t.join(budget)
     if t.is_alive():
-        log.warning("下拉刷新手势超时（>%.0fs），放弃本次刷新，不阻塞主流程", budget)
+        # 🔴 2026-11-11（WARN 噪声）：超时/失败都返回 False，调用方放弃本轮刷新 ——
+        #   **这正是防卡死设计**（宁可列表旧），不是故障。降为 INFO。
+        log.info("下拉刷新手势超时（>%.0fs），放弃本次刷新，不阻塞主流程", budget)
         return False
     if not box["ok"]:
-        log.warning("下拉刷新手势失败: %r", box["err"])
+        log.info("下拉刷新手势失败: %r", box["err"])
         return False
     return True
 
@@ -343,7 +355,9 @@ def _to_top(actor, rounds=4, budget=12.0):
     try:
         d = actor.dev.u2()
     except Exception as e:
-        log.warning("回顶取 u2 失败: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：取 u2 失败 → 返回 False，调用方继续用当前屏
+        #   （已兜住）。降为 INFO。
+        log.info("回顶取 u2 失败: %r", e)
         return False
     box = {"ok": False}
     stop = {"hit": False}
@@ -364,7 +378,9 @@ def _to_top(actor, rounds=4, budget=12.0):
     t.start()
     t.join(budget)
     if t.is_alive():
-        log.warning("回顶手势超时（>%.0fs），放弃本次", budget)
+        # 🔴 2026-11-11（WARN 噪声）：回顶超时/失败都返回 False，调用方继续用当前屏
+        #   （已兜住，注释已写明）。降为 INFO。
+        log.info("回顶手势超时（>%.0fs），放弃本次", budget)
         return False
     return box["ok"]
 
@@ -425,12 +441,17 @@ def ensure_fresh(actor, db, rounds=1):
         if hit:
             log.info("列表已跟上库（未读 %d 个，命中 %d 个）", len(unread), hit)
             return snap
-        log.warning("列表比库旧（未读 %d 个，屏上没有最新那条）→ 下拉刷新 #%d",
-                    len(unread), i + 1)
+        # 🔴 2026-11-11（WARN 噪声）：「列表比库旧 → 下拉刷新」是**常态自愈路径**
+        #   （UI 镜像滞后 2.5h 在实测中很常见），刷新成功即恢复，不是故障。
+        #   真正失败是下面「下拉刷新不可用」分支。降为 INFO。
+        log.info("列表比库旧（未读 %d 个，屏上没有最新那条）→ 下拉刷新 #%d",
+                 len(unread), i + 1)
         if not _pull_down(actor):
             # 🔴 2026-11-04：手势失败就放弃本轮（原来还会再 #2 次，每次可能挂 10 分钟）。
             #    列表旧只是定位变难，还能走搜索兜底；把整轮拖死等于必回停摆。
-            log.warning("下拉刷新不可用 → 本轮放弃刷新，继续用当前列表")
+            # 🔴 2026-11-11（WARN 噪声）：这条是「刷新不可用 → 本轮放弃」的**兜底结论**，
+            #    列表旧还能走搜索兜底（已兜住），不是需要人看的故障。降为 INFO。
+            log.info("下拉刷新不可用 → 本轮放弃刷新，继续用当前列表")
             break
         time.sleep(1.2)
     return actor.snap(force=True)
@@ -472,7 +493,9 @@ def handle_greeting(actor, dev, dry_run=False, max_people=4):
         actor.hand.tap_node(n, settle=2.5)
         s2, pg = actor.wait_page(("chat",), timeout=8.0)
         if pg != "chat":
-            log.warning("没进对话页（%s），返回", pg)
+            # 🔴 2026-11-11（WARN 噪声）：新招呼二级页没进对话页 → back 后 continue，
+            #   由 handle_greeting 的循环继续处理下一个，已兜住。降为 INFO。
+            log.info("没进对话页（%s），返回", pg)
             actor.hand.back(settle=1.5)
             continue
 
@@ -503,7 +526,9 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
 
     snap = to_list(actor)
     if detect(snap) != "chatlist":
-        log.warning("回不到会话列表，跳过清红点")
+        # 🔴 2026-11-11（WARN 噪声）：回不到会话列表 → 跳过本轮清红点，**交回上层**
+        #   （daemon 后续会走已读未回/匹配），已兜住。降为 INFO。
+        log.info("回不到会话列表，跳过清红点")
         out["left"] = -1
         return out
     # 🔴 2026-11-04：列表 UI 会落后于库（实测落后 2.5h）→ 红点/行定位全失灵。
@@ -516,13 +541,17 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         if _to_top(actor, rounds=3):
             snap = actor.snap(force=True)
     except Exception as e:
-        log.warning("回顶失败（继续用当前屏）: %r", e)
+        # 🔴 2026-11-11（WARN 噪声）：回顶失败 → 继续用当前屏，由下面 ensure_fresh
+        #   兜底刷新，已兜住。降为 INFO。
+        log.info("回顶失败（继续用当前屏）: %r", e)
     snap = ensure_fresh(actor, db)
 
     try:
         from brain import ratelimit as _RL
         if not _RL.can_send():
-            log.warning("本小时发送已达上限 → 本轮不清红点（避免封号）")
+            # 🔴 2026-11-11（WARN 噪声）：本小时发送达上限 → 本轮不清红点（**避免封号**）
+            #   是**预期中的节流**，不是故障。降为 INFO。
+            log.info("本小时发送已达上限 → 本轮不清红点（避免封号）")
             out["left"] = badge_chat(actor.snap())
             return out
     except Exception:
@@ -709,7 +738,9 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         try:
             res = flow.handle_one(actor, db, r, dry_run=dry_run)
         except Exception as e:
-            log.warning("[%s] 进会话处理异常（跳过此人，继续本轮）: %r", r.nickname, e)
+            # 🔴 2026-11-11（WARN 噪声）：单人异常是**设计内的隔离**（跳过此人、本轮继续），
+            #   整轮不会因此中止，已兜住。降为 INFO，仍记录原始证据。
+            log.info("[%s] 进会话处理异常（跳过此人，继续本轮）: %r", r.nickname, e)
             out["entered"] += 1
             try:
                 actor.hand.back(settle=1.0)
@@ -734,8 +765,10 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
             #    角标归零 → 程序判「最后一条是我发的」没发 → 记成假红点 → 冷却 15 分钟 → 漏回。
             if getattr(res, "side", "?") == "her":
                 her_stuck += 1
-                log.warning("[%s] 末条是她但没发出话（第 %d 次）→ 不判假红点，留给已读未回",
-                            getattr(res, "nick", "?") or "?", her_stuck)
+                # 🔴 2026-11-11（WARN 噪声）：这是每轮进同一人会重复打的**计数中间态**
+                #   （真正需要人看的结论是下面 her_stuck>=3 熔断那一行）。降为 INFO。
+                log.info("[%s] 末条是她但没发出话（第 %d 次）→ 不判假红点，留给已读未回",
+                         getattr(res, "nick", "?") or "?", her_stuck)
                 if her_stuck >= 3:
                     log.warning("连续 %d 次「末条是她但发不出」→ 本轮先停，交给已读未回",
                                 her_stuck)
@@ -744,8 +777,11 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                 idle += 1
                 if idle >= 2:
                     _FAKE_DOT["until"] = time.time() + FAKE_DOT_COOL_S
-                    log.warning("连续 %d 次进会话都无需回复 → 判定假红点，"
-                                "清红点冷却 %.0f 分钟", idle, FAKE_DOT_COOL_S / 60.0)
+                    # 🔴 2026-11-11（WARN 噪声）：连续空转判「假红点」并进入 15 分钟冷却
+                    #   是**既定的防空转设计**（冷却期内交给 pendingq 查库兜底，不漏消息），
+                    #   不是故障。降为 INFO。
+                    log.info("连续 %d 次进会话都无需回复 → 判定假红点，"
+                             "清红点冷却 %.0f 分钟", idle, FAKE_DOT_COOL_S / 60.0)
                     break
         if res.err:
             log.warning("[%s] %s", res.nick, res.err)
@@ -776,7 +812,9 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                 snap = to_list(actor)
                 continue
         except Exception as e:
-            log.warning("轮内铃检查异常（继续清扫）: %r", e)
+            # 🔴 2026-11-11（WARN 噪声）：轮内铃检查异常只是**扫铃失败**（本轮继续清扫，
+            #   下轮回首会再扫一次），已兜住。降为 INFO。
+            log.info("轮内铃检查异常（继续清扫）: %r", e)
 
         snap = to_list(actor)
         time.sleep(0.3)
@@ -817,8 +855,11 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
             and not interrupted and (out["left"] or 0) <= 0
             and _pend <= 0):
         _FAKE_DOT["until"] = time.time() + FAKE_DOT_COOL_S
-        log.warning("进了 %d 人一条没发、角标=0、库无待回 → 判定假红点，清红点冷却 %.0f 分钟",
-                    out["entered"], FAKE_DOT_COOL_S / 60.0)
+        # 🔴 2026-11-11（WARN 噪声）：这是**防空转设计的最终结论**（进了人、没发话、
+        #   角标=0、库无待回 → 判定假红点并冷却），与循环内 idle>=2 那条同机制 ——
+        #   冷却期内交给 pendingq 查库兜底，不漏消息。降为 INFO。
+        log.info("进了 %d 人一条没发、角标=0、库无待回 → 判定假红点，清红点冷却 %.0f 分钟",
+                 out["entered"], FAKE_DOT_COOL_S / 60.0)
     elif out["entered"] > 0 and out["replied"] == 0 and _pend > 0:
         log.info("进了 %d 人没发话，但库里还有 %d 个待回 → **不判假红点**（不冷却）",
                  out["entered"], _pend)
