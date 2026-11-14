@@ -50,35 +50,54 @@ function Write-Log([string]$msg) {
     }
 }
 
-# Do not start a second instance if one is already running.
-$existing = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'run\.py daemon' }
-if ($existing) {
-    $pids = ($existing | ForEach-Object { $_.ProcessId }) -join ','
-    Write-Log "=== daemon already running (pid=$pids) -> skip ==="
-    exit 0
+# A named mutex closes the check-then-start race between SoulGuard, msg_probe,
+# and a manual launch. FileShare locks are not reliable across sessions on
+# Windows, so use a Global mutex and hold it only for the startup transaction.
+$startMutex = New-Object System.Threading.Mutex($false, 'Global\Soul1DaemonStart')
+$gotStartMutex = $startMutex.WaitOne(30000)
+if (-not $gotStartMutex) {
+    Write-Log "=== another launcher is starting daemon -> skip ==="
+    exit 2
 }
 
-Write-Log "=== daemon starting (detached, windowless) ==="
+$exitCode = 0
+try {
+    # Do not start a second instance if one is already running.
+    $existing = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match 'run\.py daemon' }
+    if ($existing) {
+        $pids = ($existing | ForEach-Object { $_.ProcessId }) -join ','
+        Write-Log "=== daemon already running (pid=$pids) -> skip ==="
+    }
+    else {
+        Write-Log "=== daemon starting (detached, windowless) ==="
 
-$pyw = $py.Replace('python.exe', 'pythonw.exe')
-if (-not (Test-Path $pyw)) {
-    $pyw = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe'
-}
-if (-not (Test-Path $pyw)) { $pyw = $py }
-Start-Process -FilePath $pyw `
-              -ArgumentList (Join-Path $Root 'tools\silent_launch.py'), 'daemon' `
-              -WorkingDirectory $Root `
-              -WindowStyle Hidden
+        $pyw = $py.Replace('python.exe', 'pythonw.exe')
+        if (-not (Test-Path $pyw)) {
+            $pyw = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe'
+        }
+        if (-not (Test-Path $pyw)) { $pyw = $py }
+        Start-Process -FilePath $pyw `
+                      -ArgumentList (Join-Path $Root 'tools\silent_launch.py'), 'daemon' `
+                      -WorkingDirectory $Root `
+                      -WindowStyle Hidden
 
-Start-Sleep -Seconds 2
-$now = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
-       Where-Object { $_.CommandLine -match 'run\.py daemon' }
-if ($now) {
-    $pids = ($now | ForEach-Object { $_.ProcessId }) -join ','
-    Write-Log "=== daemon started pid=$pids ==="
-    exit 0
-} else {
-    Write-Log "=== daemon NOT detected after start ==="
-    exit 1
+        Start-Sleep -Seconds 2
+        $now = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -match 'run\.py daemon' }
+        if ($now) {
+            $pids = ($now | ForEach-Object { $_.ProcessId }) -join ','
+            Write-Log "=== daemon started pid=$pids ==="
+        }
+        else {
+            Write-Log "=== daemon NOT detected after start ==="
+            $exitCode = 1
+        }
+    }
 }
+finally {
+    $startMutex.ReleaseMutex()
+    $startMutex.Dispose()
+}
+
+exit $exitCode
