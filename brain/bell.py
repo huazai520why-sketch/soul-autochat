@@ -708,8 +708,17 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
         try:
             said, bubbles = M.said_already(dev, s2)
         except Exception as e:
-            log.warning("稍后再聊已有消息检查失败（按未发处理）: %r", e)
-            said, bubbles = False, []
+            # 🔴 2026-11-14（F04）：异常时若按"未发"处理会重发开场白，风险大于漏发。
+            #    fail-closed：退回 chatlist 并按 failed+冷却处理，本轮不发送，
+            #    冷却后仍可重试（不会永久跳过该人）。
+            log.warning("稍后再聊已有消息检查异常（fail-closed 跳过本轮）: %r", e)
+            try:
+                actor.hand.back(settle=1.2)
+            except Exception:
+                pass
+            _mark(key, "failed", nick, tag, ts, time.time() + BELL_FAIL_RETRY_S)
+            skipped += 1
+            continue
         if said:
             log.info("🔔 稍后再聊 %r 已有我的消息（气泡 %d 条）→ 不重复发", nick, len(bubbles))
             _mark(key, "already", nick, tag, ts)
@@ -727,6 +736,7 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
             continue
 
         prof = None
+        pok = False  # 🔴 F01：先初始化，防 visit_profile 抛异常时未定义
         try:
             prof, pok = M.visit_profile(actor)
             if pok and prof:
@@ -743,6 +753,22 @@ def handle_list(actor, dev, dry_run=False, limit=None, db=None, uid="", max_scro
             except Exception:
                 pass
             continue
+
+        # 🔴 2026-11-14（F01）：visit_profile 三条 pok=False 路径都可能把 App 留在
+        #    主页/未知页（无返回控件 / 返回超时），原代码从不检查 pok 就无条件 M.send
+        #    → 从非 chat 页灌字必失败（实际 None），同一人每 30min 反复白烧。
+        #    发送前先确认回到会话页，回不去就 fail-closed 跳过本轮。
+        if not pok:
+            try:
+                actor.hand.back(settle=1.2)
+            except Exception:
+                pass
+            _pg = detect(actor.snap(force=True))
+            if _pg != "chat":
+                log.warning("稍后再聊 %r 主页未回到会话页（page=%s）→ 跳过本轮发送", nick, _pg)
+                _mark(key, "failed", nick, tag, ts, time.time() + BELL_FAIL_RETRY_S)
+                skipped += 1
+                continue
 
         text = M.pick_opener()
         # 新会话开场白无 sid → 走 match.send 的 sid="" 分支，过闸但不占跟进额度

@@ -95,9 +95,17 @@ def _read():
 
 
 def _write(d):
+    """原子写锁文件（tmp + os.replace），崩溃不留半截 JSON。
+
+    🔴 2026-11-14（B3 P1）：原 write_text 非原子，中途崩溃会留半截 JSON，
+    `_read` 的 json.loads 抛异常 → 返回 {} → status() 判「未持锁」→
+    另一进程可能同时抢锁，放大竞态。与 `_save_skip` / `_save` 同款方案。
+    """
     try:
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-        LOCK_FILE.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+        tmp = LOCK_FILE.with_name(LOCK_FILE.name + ".tmp-%d" % _pid)
+        tmp.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+        os.replace(str(tmp), str(LOCK_FILE))
         return True
     except Exception as e:
         log.warning("写锁失败: %r", e)
@@ -140,12 +148,10 @@ def status():
         return False, d
     if not _alive(pid):
         return False, dict(d, why="owner %s 已死" % pid)
-    # 2026-11-14（G8）：TTL(55min) > 心跳(15min)，原顺序下 TTL 分支不可达。
-    #   先判 TTL 再判心跳，语义才与注释一致。
-    if age > TTL_S:
-        return False, dict(d, why="TTL 到期")
     if age > HEARTBEAT_S:
         return False, dict(d, why="心跳 %.0fs 超时" % age)
+    if age > TTL_S:
+        return False, dict(d, why="TTL 到期")
     return True, d
 
 
@@ -212,13 +218,26 @@ def ensure(owner="daemon"):
 
 
 def touch(step=""):
-    """刷新心跳。只有持锁时才写。"""
+    """刷新心跳。只有持锁时才写。
+
+    🔴 2026-11-14（B3 P1）：原 owner 变更时只 log.error + return False，不自愈也不上抛；
+    调用点若忽略返回值，本进程会在「已不是 owner」状态下继续跑（_held 仍 True），
+    与接管进程并发操作模拟器。现在 owner 变更后直接调 ensure(owner) 尝试原地自愈，
+    自愈失败（别人真活着且锁合法）再 return False，由调用方决定收工。
+    """
+    global _held
     if not _held:
         return False
     d = _read()
     if d.get("pid") != _pid:
         # 锁被别人接管了（自己的心跳不该续别人的命）
-        log.error("心跳失败：锁 owner 已变为 pid=%s（本进程 pid=%s）", d.get("pid"), _pid)
+        log.error("心跳失败：锁 owner 已变为 pid=%s（本进程 pid=%s）→ 尝试原地自愈",
+                  d.get("pid"), _pid)
+        _held = False
+        ok, why = ensure(step or "daemon")
+        if ok:
+            return True
+        log.error("心跳自愈失败：%s → 本进程应立即停止操作模拟器", why)
         return False
     d["ts"] = time.time()
     if step:

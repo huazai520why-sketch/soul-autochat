@@ -27,7 +27,7 @@ log = get_logger("brain.flow")
 
 class Outcome(object):
     __slots__ = ("nick", "last_text", "side", "sid", "reply", "sent", "err", "kind",
-                 "burst", "lines")
+                 "burst", "lines", "image_desc")
 
     def __init__(self):
         self.nick = ""
@@ -40,6 +40,7 @@ class Outcome(object):
         self.reply = ""
         self.sent = False
         self.err = ""
+        self.image_desc = ""    # 🔴 B6：图片识图描述（合成串），**不回写 last_text**
 
     def __repr__(self):
         return ("<Outcome %r side=%s reply=%r sent=%s %s>"
@@ -245,11 +246,32 @@ def _enter(actor, row, timeout=8.0, retries=2):
     # 🔴 2026-11-04（提速）：这里原来先 dump 一次 actor.snap(force=True)，
     #   但返回值在循环里必被 wait_page 覆盖、上层也只用 page → 纯白烧一次 dump(2~3.5s)。
     snap, pg = None, None
+    # 🔴 2026-11-14（F03①）：点之前先确认还在 chatlist。若上层导航/前一次 back
+    #   已把页面带走（已非 chatlist），再点就是拿上一棵树的坐标乱戳（F03 白烧
+    #   + 误触付费页同源）→ 立刻原样返回，别 tap、别等 8s。
+    try:
+        from eyes.page import detect as _detect_pre
+        _pre = _detect_pre(actor.snap())
+        if _pre != "chatlist":
+            log.info("_enter 前置校验：当前页=%s（非 chatlist）→ 不点直接返回", _pre)
+            return actor.snap(), _pre
+    except Exception as _e:
+        log.debug("_enter 前置校验异常（继续按原流程）: %r", _e)
     for i in range(retries):
         # settle 1.6(×slow_factor 2.5=4s) -> 0.25：紧跟 wait_page 轮询，
         #   而一次 dump 本身就要 3s 远大于转场 0.5s，等两遍纯属重复。
         actor.hand.tap_node(row.node, settle=0.25)
         snap, pg = actor.wait_page(("chat",), timeout=timeout)
+        if pg == "chat":
+            return snap, pg
+        # 🔴 2026-11-14（F03②）：wait_page 超时后补一次 force snap 再判。
+        #   转场慢/改版时 detect 可能刚好在超时帧之后才稳定为 chat，
+        #   这里判到 chat 就按成功，避免把真会话当失败误冻 0.5h。
+        try:
+            snap = actor.snap(force=True)
+            pg = _detect_pre(snap)
+        except Exception as _e:
+            log.debug("_enter 终判 snap 异常: %r", _e)
         if pg == "chat":
             return snap, pg
         if i + 1 < retries:
@@ -706,7 +728,12 @@ def _send_lines(actor, lines, nick, page_checked=False, sid=""):
             log.info("[%s] 已发送(%d/%d): %r", nick, i + 1, len(lines), line)
             try:
                 from data import watch as _W
-                _W.mark_self_write(6.0)      # 自己写的库变化，别当成别人来消息
+                # 🔴 2026-11-14（B4）：原来这里传 6.0，比发送前的 15.0 短。
+                #    mark_self_write 内部虽取 max（只延长不缩短），但多条连发时
+                #    最后一条只被 6s 覆盖，App 落库慢于 6s 时自己的写库会被判成
+                #    「她来新消息」→ 触发 preempted 中断本轮。统一传 15.0，
+                #    让每一条发出后都续上 15s 护栏（与 665 行发送前那次一致）。
+                _W.mark_self_write(15.0)     # 自己写的库变化，别当成别人来消息
             except Exception:
                 pass
             try:
@@ -808,9 +835,16 @@ def _reply_and_send(actor, db, out, dry_run):
         _desc = _describe_image(db, out)
         if _desc:
             out.kind = "text"
-            out.last_text = "（她发来一张图片，图里是：%s）" % _desc
-            log.info("[%s] 图片识图成功 → 按内容出话", out.nick)
+            # 🔴 2026-11-14（B6）：原来这里把 last_text 覆写成
+            #    「（她发来一张图片，图里是：%s）」合成串，导致后续基于 last_text
+            #    的去重/反查/落盘/关键词全拿到非原文（轻则关键词无效走 nocue，
+            #    重则 turns 落一行非原文）。改为只把描述存 image_desc，last_text 保持原文；
+            #    合成串只通过下面的 _model_msg 喂给出话模型，不影响判据/落盘。
+            out.image_desc = _desc
+            log.info("[%s] 图片识图成功 → 按内容出话（last_text 保持原文）", out.nick)
 
+    # 喂模型的「她这句话」：图片识图成功时用合成描述，否则用原文 last_text。
+    _model_msg = out.image_desc or out.last_text
     if out.kind in MEDIA_REPLIES:
         import random as _rnd
         lines = [_rnd.choice(MEDIA_REPLIES[out.kind])]
@@ -821,16 +855,16 @@ def _reply_and_send(actor, db, out, dry_run):
         # 🔴 2026-11-03：连发已合并成一句话（上限 10 条），合并后长度会被撑大，
         #    若拿合并文本算 target_n 会一路判成 3 条 → 她发几条我就回三条，像刷屏。
         #    所以条数只看**她最后一条**（她一次说完的落脚点）。
-        _tn_in = [out.burst[-1]] if out.burst else [out.last_text]
+        _tn_in = [out.burst[-1]] if out.burst else [_model_msg]
         n = R.target_n(_tn_in, hist)
         lines = R.generate(out.sid or ("x" + str(int(time.time()))),
-                           out.last_text, hist=hist, n_cand=n)
+                           _model_msg, hist=hist, n_cand=n)
         if lines:
             log.info("[%s] 她要回 %d 条 → 引擎给了 %d 条: %r",
                      out.nick, n, len(lines), " | ".join(lines)[:60])
     if not lines:
         # 必回铁律：引擎不给话也必须发一句，不能沉默
-        lines = [fallback_line(out.last_text)]
+        lines = [fallback_line(_model_msg)]
         # 🔴 2026-11-11（FAIL 噪声）：引擎出话**无产出**已被兜底话术完全接住——
         #   必回铁律保证一定发一句（fallback_line 永不空），不是故障，与 PR#13
         #   降级的「已兜住」路径同类。用「无产出」取代「失败」避免被 nightly_collect
@@ -848,7 +882,7 @@ def _reply_and_send(actor, db, out, dry_run):
     _pic_sent = False
     try:
         from brain import picreq as _PR
-        _pic_sent, _why = _PR.try_send(actor, actor.dev, out.sid or out.nick, out.last_text)
+        _pic_sent, _why = _PR.try_send(actor, actor.dev, out.sid or out.nick, _model_msg)
         if _pic_sent:
             log.info("[%s] 已按她要的发了照片", out.nick)
     except Exception as _e:

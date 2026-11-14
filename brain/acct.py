@@ -612,8 +612,17 @@ def switch_account(actor, dev):
                     log.info("✓ 切号成功：%s -> %s", before, after)
                     return True, "已切号 %s -> %s" % (before, after)
                 if not before and pg2 == "me":
-                    log.info("✓ 切号后回到自己页（切号前就读不到 uid，无法校验）")
-                    return True, "已切号（无 uid 校验）"
+                    # 🔴 2026-11-14（F08）：切号前就读不到 uid（before 空）时，
+                    #    原来只要回到「自己」页就无条件判成功，若 uid 读不到是因
+                    #    设备/库异常（不是真没切），会误报切号成功 → 停留错误账号
+                    #    继续发消息（串号风险）。改为 fail-closed：仅当切号后
+                    #    也读到非空 uid（after != ""）才放行，否则判失败走退避。
+                    if after:
+                        log.info("✓ 切号后回到自己页（uid 校验: %s -> %s）", before, after)
+                        return True, "已切号 %s -> %s" % (before, after)
+                    log.warning("   切号前 uid 读不到且切号后仍读不到 → 无法校验，"
+                                "判失败（fail-closed）")
+                    break
                 if not after:
                     log.warning("   切号后 3 次都读不到 uid（库未刷新）→ 本次判失败，"
                                 "但**不确定**是否真没切过去")

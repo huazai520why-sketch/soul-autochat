@@ -266,24 +266,11 @@ class IMDB(object):
                 votes[pre] = votes.get(pre, 0) + 1
         if votes:
             return max(votes.items(), key=lambda kv: kv[1])[0]
-        # 2026-11-14 夜审修复（D4，P1）：旧兜底「发文本最多的人 = 自己」没有
-        #   方向性依据——她话多时对方 uid 被当成自己，方向判定全反转（漏回+重发）。
-        #   改用方向排除法：session.toUserId 永远是「别人」，chatmsg 的 senderId
-        #   里不在 toUserId 集合里的那个才可能是自己；唯一才采纳，否则 None。
         try:
-            _rows = self.con.execute(
-                "SELECT DISTINCT toUserId FROM session "
-                "WHERE toUserId IS NOT NULL LIMIT 2000").fetchall()
-            _others = {str(r[0]) for r in _rows if r[0]}
-            _rows2 = self.con.execute(
-                "SELECT DISTINCT senderId FROM chatmsg "
-                "WHERE senderId IS NOT NULL LIMIT 200").fetchall()
-            _mine = [str(r[0]) for r in _rows2 if r[0] and str(r[0]) not in _others]
-            if len(_mine) == 1:
-                return _mine[0]
-            log.warning("_guess_uid 方向排除后剩 %d 个候选 → 放弃猜测（uid=None）",
-                        len(_mine))
-            return None
+            row = self.con.execute(
+                "SELECT senderId, COUNT(*) c FROM chatmsg WHERE msgType = ? "
+                "GROUP BY senderId ORDER BY c DESC LIMIT 1", (MSG_TEXT,)).fetchone()
+            return str(row[0]) if row else None
         except Exception:
             return None
 
@@ -953,7 +940,7 @@ def _assert_readonly(sql):
     return True
 
 
-def _dev_sql(device, dbname, sql, timeout=15):
+def _dev_sql(device, dbname, sql, timeout=15, ok=None):
     """在设备上对指定库跑一条**只读** SQL，返回原始文本（失败返回 ""）。
 
     抽出来只为让下面的函数少重复那串 `sqlite3 "路径" "SQL"` 样板。
@@ -966,7 +953,18 @@ def _dev_sql(device, dbname, sql, timeout=15):
       这样即使将来有人（或我）写错一句 UPDATE，也不会真的打到设备库上。
       注意：读也走 `su -c`（u0_a52 私有目录，非 root 读不到），
       所以「只读」必须由代码保证，不能依赖文件权限。
+
+    🔴 2026-11-14（A2 P0）：新增可选 ``ok`` 参数（传 dict 才生效），
+      让调用方能区分「成功 0 行」与「查询失败」—— 两者当前都被洗成 ""。
+      成功时 ``ok["v"]=True``（包括 0 行，因为 sqlite3 对 count/无匹配 SELECT
+      仍会打印表头或空行/退出码 0）；失败（关键字被拒 / adb 抖动 / su 报错）
+      时 ``ok["v"]=False``。不传 ``ok`` 的旧调用点行为不变（仍返回 ""/文本）。
     """
+    if ok is not None:
+        try:
+            ok["v"] = False
+        except Exception:
+            pass
     if not _assert_readonly(sql):
         return ""
     # 🔴🔴 2026-11-08 12:59（第二次踩 `su` 这个坑，这次是**错误被当成结果返回**）
@@ -994,19 +992,50 @@ def _dev_sql(device, dbname, sql, timeout=15):
                 return ""
         return t
 
+    def _mark(ok_):
+        if ok is not None:
+            try:
+                ok["v"] = bool(ok_)
+            except Exception:
+                pass
+
     # ① 裸 sqlite3（本环境首选：adb 已 root）
     try:
-        out = _clean(device.text('sqlite3 "%s/%s" "%s" 2>&1'
-                                 % (DB_DIR_ANDROID, dbname, sql), timeout=timeout))
+        raw = device.text('sqlite3 "%s/%s" "%s" 2>&1'
+                          % (DB_DIR_ANDROID, dbname, sql), timeout=timeout)
+        out = _clean(raw)
         if out:
+            _mark(True)
             return out
+        # 🔴 A2：裸命令拿到空（可能是成功 0 行，也可能是 stderr 的非 su 类错误），
+        #   再用一次「能稳定区分成功/失败」的 probe 复核：跑一次 `select 1` 健康检查。
+        #   能拿到 "1" → 库存在 + 连接 OK + SQL 语法合法（同一 shell 都通）→
+        #   此时原 SQL 返回 "" 就是真正的「成功 0 行」。
+        #   拿不到 "1" → 库/连接/权限有问题 → 判失败（ok=False），不在此处返回，
+        #   让流程走到 su -c 兜底，仍失败则上层返回 None 降级。
+        try:
+            healthy = _clean(device.text(
+                'sqlite3 "%s/%s" "select 1" 2>&1'
+                % (DB_DIR_ANDROID, dbname, sql), timeout=timeout))
+            if healthy.strip() == "1":
+                _mark(True)
+                return out          # 真的是 0 行，原样返回 ""（带 ok=True）
+        except Exception:
+            pass
     except Exception:
         pass
     # ② 退回 su -c（兼容非 root adb 环境）
     try:
-        return _clean(device.text('su -c \'sqlite3 "%s/%s" "%s"\' 2>&1'
-                                  % (DB_DIR_ANDROID, dbname, sql), timeout=timeout))
+        raw2 = device.text('su -c \'sqlite3 "%s/%s" "%s"\' 2>&1'
+                           % (DB_DIR_ANDROID, dbname, sql), timeout=timeout)
+        out2 = _clean(raw2)
+        if out2:
+            _mark(True)
+            return out2
+        _mark(False)
+        return out2
     except Exception:
+        _mark(False)
         return ""
 
 
@@ -1067,11 +1096,18 @@ def device_live_uids(device, uid, timeout=15):
         log.debug("device_live_uids: 找不到 uid=%s 对应的设备库", uid)
         return None
     try:
+        _ok = {"v": False}
         txt = _dev_sql(device, name,
                        "select distinct toUserId from session where toUserId>0",
-                       timeout=timeout)
+                       timeout=timeout, ok=_ok)
     except Exception as e:
         log.debug("device_live_uids: 查 %s 失败 %r", name, e)
+        return None
+    if not txt and not _ok.get("v"):
+        # 🔴 2026-11-14（A2 P0）：_dev_sql 已通过 ok 哨兵区分「成功 0 行」与「失败」。
+        #   失败（adb 抖动 / 库不存在 / 被只读闸拒绝）→ 沿用旧行为返回 None 降级不过滤，
+        #   避免一次抖动被当成「设备真没会话」而漏回全部。
+        log.debug("device_live_uids: 查 %s 失败（ok=False）→ 返回 None 降级", name)
         return None
     out = set()
     for ln in (txt or "").replace("\r", "").splitlines():
@@ -1079,22 +1115,18 @@ def device_live_uids(device, uid, timeout=15):
         if s and s.lstrip("-").isdigit():
             out.add(s)
     if not out:
-        # 🔴🔴 2026-11-12（DS-08 空集判断 · 最终结论：**保持 None，不过滤**）
-        #   空集合有两种可能：真的一个人都没有 / 查询失败。
-        #   修法原本想把「查询成功但 0 会话」与「查询失败」区分开：成功返回空 set、
-        #   失败返回 None，让调用方在「设备真 0 会话」时过滤掉全部镜像僵尸。
-        #   —— 但做不到，根因在 `_dev_sql`（本文件 903）：它用 `_clean()` 把
-        #   错误标记统一洗成 ""，于是**「0 行成功」和「查询失败」都返回 ""**，
-        #   到这一层根本无法区分。
-        #   若强行返回空 set：一次 adb 抖动/查询失败（同样得到 ""）会被当成
-        #   「设备真没会话」→ 调用方过滤掉**全部**候选 → 漏回（最差失败模式）。
-        #   权衡后**宁可保持 None（旧行为=降级不过滤）**：设备缩水 962 次的主因是
-        #   「设备仍有很多会话，只是比镜像少」，device_live_uids 返回的是**非空**
-        #   集合（仅缺死人）→ 过滤依然生效；真正的「0 会话」是罕见边缘，不值得
-        #   为它冒「一次 adb 抖动就漏回全部」的风险。
-        #   HY-13 已把同一设备存活校验补到 unread_sids()（清红点目标源），
-        #   常见缩水场景已被覆盖；此处保留旧行为并留档。
-        return None
+        # 🔴🔴 2026-11-14（A2 P0 修复 · 覆盖 DS-08 旧行为）
+        #   旧行为：成功 0 行也返回 None（不过滤），根因是 `_dev_sql` 把
+        #   「0 行成功」和「查询失败」都洗成 ""，上层无法区分。
+        #   现在 `_dev_sql` 已支持 ok 哨兵，能可靠区分两者：
+        #     · 成功 0 行 → **返回空 set**，调用方据此过滤掉全部镜像僵尸
+        #       （设备真把账号清空时不再把 1495 个死人全量入队）；
+        #     · 失败 → 上面已返回 None（降级不过滤）。
+        #   这样既保住 DS-08「一次 adb 抖动不能漏回全部」的底线，
+        #   又补上「设备真 0 会话」被当成「未知」而全量入队的反向漏洞。
+        log.info("device_live_uids: 设备库 %s 查询成功但 0 个活会话 → 返回空 set（过滤全部镜像）",
+                 name)
+        return out
     return out
 
 

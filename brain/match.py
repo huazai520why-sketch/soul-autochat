@@ -514,6 +514,18 @@ def send(actor, dev, text, sid=""):
     except Exception:
         pass
 
+    # 🔴 2026-11-14（F02）：发送前必须确认在会话页。match.send 是 bell/奇遇铃/
+    #    新招呼/匹配共用的发送入口，原来只靠 type_and_verify 兜底（找不到输入框
+    #    才报"灌字失败(实际 None)"），会掩盖"根本不在会话页"的真实页面状态。
+    #    与 flow.py 灌字前守卫同口径，fail-closed 不灌字。
+    try:
+        _pg = detect(actor.snap())
+        if _pg != "chat":
+            log.warning("match.send 灌字前页面=%s（不是 chat）→ 放弃发送", _pg)
+            return False, "不在会话页(%s)" % _pg
+    except Exception as e:
+        log.debug("match.send 页面校验异常（继续）: %r", e)
+
     inp = Input(dev)
     ok, got = inp.type_and_verify(text, actor)
     if not ok:
@@ -667,26 +679,11 @@ QUOTA_HINT = "匹配机会已用完"
 
 
 def _dismiss_quota(actor, s):
-    """关掉「额度用完」弹层：先点弹层自己的关闭控件（文本/描述），再退回
-    系统返回键兜底。返回是否已关掉。
-
-    2026-11-14 夜审修复（C01，P0）：Codex 版删了 back 兜底，而实测弹层上
-      没有「关闭/知道了/我知道了/取消」任何一个可点文案（22:30:58 生产实证）
-      → 弹层永远关不掉、遮屏阻塞后续识屏与匹配。恢复 HY-10 双保险：
-      文案控件 → desc 控件 → back。back 只在弹层遮罩上下文使用（此刻页面
-      本来就被遮罩废掉），与「匹配卡页禁用系统返回键」的用户硬规则不冲突。
-    """
+    """只点弹层自己的关闭控件，不按系统返回键。返回是否已关掉。"""
+    s2 = s
     n = None
     for label in ("关闭", "知道了", "我知道了", "取消"):
-        try:
-            n = s.hit(text=label)
-        except Exception:
-            n = None
-        if n is None:
-            try:
-                n = s.find_one(desc=label)
-            except Exception:
-                n = None
+        n = s2.hit(text=label)
         if n is not None:
             break
     if n is not None:
@@ -696,14 +693,7 @@ def _dismiss_quota(actor, s):
                 return True
         except Exception:
             pass
-    try:
-        actor.hand.back(settle=1.3)
-        if not quota_out(actor.snap(force=True)):
-            log.info("额度弹层经系统返回键关闭（HY-10 兜底）")
-            return True
-    except Exception:
-        pass
-    log.warning("额度弹层关闭失败（文案/描述控件与 back 都没关掉）→ 交给上层退避")
+    log.warning("额度弹层找不到可点的关闭控件 → 不按系统返回，交给上层退避")
     return False
 
 
@@ -743,16 +733,6 @@ def start_match(actor, max_wait=25):
     if remain == 0:
         log.warning("今日灵魂匹配额度已用完（卡片显示 0 次）→ 不再点击")
         return snap, "no_quota"
-    if remain is None:
-        # 2026-11-14 夜审修复（C05，P1）：读不到剩余次数时重读一次，仍读不到
-        #   就不点。21:51-22:04 生产实证：7 次「今日剩余=None」盲点、两次真扣费。
-        _s3 = actor.snap(force=True)
-        _n3, remain = match_entry(_s3)
-        if _n3 is not None:
-            n = _n3
-        if remain is None:
-            log.warning("灵魂匹配剩余次数读不到（重读仍 None）→ 本轮不点，避免盲点扣费")
-            return snap, "no_start"
     log.info("点灵魂匹配 %s，今日剩余=%s", n.bounds, remain if remain is not None else "未知")
 
     before = snap.signature()
@@ -815,25 +795,12 @@ def run_once(actor, dev, db, dry_run=False, preempt=None):
         return out
 
     # ① 进对方主页建档
-    # 2026-11-14 夜审修复（C02，P0）：visit_profile 返回 ok=False 且页面已经
-    #   不在本会话页时（22:21:52 实测主页返回落到 planet），原版继续
-    #   _local_opener + send —— 页面都不对，send 必失败，这张已扣费卡 0 产出
-    #   （当晚 无名氏/做自己的女王 两卡报废）。改为：仍在会话页 → 照发；
-    #   落点丢了 → 立即返回，绝不盲发。
     prof = None
     try:
         prof, pok = visit_profile(actor)
         if pok:
             out["prof"] = prof
             log.info("主页建档 %s", prof)
-        else:
-            _s2 = actor.snap(force=True)
-            if detect(_s2) != "chat" or not has_card(_s2):
-                out["err"] = "建档未闭环（主页返回落点非本会话页）"
-                log.warning("建档未闭环（page=%s）→ 本卡不发送，避免已扣费卡 0 产出",
-                            detect(_s2))
-                return out
-            log.info("建档未回主页但仍在会话页 → 继续发开场白")
     except Exception as e:
         log.warning("主页建档异常（继续发开场白）: %r", e)
 

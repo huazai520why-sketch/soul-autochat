@@ -115,7 +115,8 @@ class Input(object):
                 self._snap = snap2          # 给 tap_send 复用
                 return True, got
             log.warning("第%d次灌字未落地：期望 %r 实际 %r", i + 1, text, got)
-        return False, self.box_text(actor.snap())
+        # 🔴 2026-11-14（F09）：失败返回读真实当前帧，避免复用 TTL 内旧帧误判。
+        return False, self.box_text(actor.snap(force=True))
 
     def tap_send(self, actor, settle=1.2, snap=None):
         """点发送按钮。返回 True/False。

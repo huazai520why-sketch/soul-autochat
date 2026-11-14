@@ -154,6 +154,12 @@ IDFAIL_MAX_TRIES = 4
 IDFAIL_GIVEUP_H = 2.0
 SKIP_FILE = PL.SKIP_FILE
 
+# 🔴 2026-11-14（A3 P0）：设备未读对账补入封顶改可配（默认仍 8，保持 DS-13 行为）。
+#   设备真未读 > 8 时（如批量积压 / 切号），原硬封顶静默丢弃超出部分 → 长时间漏回；
+#   改成 env 可调 + 超出数打 WARNING，让巡检能立刻看到漏回量。
+RECONCILE_CAP = int(os.environ.get("SOUL_RECONCILE_CAP", "8") or 8)
+_RECONCILE_CAP = RECONCILE_CAP
+
 # 🔴 2026-11-08（P0「瞎操作」根因修复 · 设备级故障熔断）：
 #   改前：主循环里 `if pg != "chatlist": break` —— 回不到列表就**作废整轮**。
 #   日志实证（daemon.out 11-08 00:19–00:30）：连续 14 个候选、回 0 条、
@@ -750,12 +756,40 @@ def _burst_n(db, sid, uid):
 
     复用 flow.her_burst 的语义（从最后一条往前、遇到我发的就停、跳过系统提示），
     只取条数。任何异常都返回 1（当作单条，绝不因为算条数失败丢掉候选）。
+
+    🔴 2026-11-14（B2 P1）：原实现每个候选都跑一次 `flow.her_burst`，
+    它会 `SELECT * LIMIT 24` + 逐行 `Msg(r)` + `V.her_msg_of`（语音/图片还会触发
+    resolve）。60 候选 × (candidates 排序 + handle_pending 2563 再算一次) ≈ 数百次
+    全字段查询，单轮 cycle 被线性拖长（05/07 时「43/41 轮空烧」低吞吐同源）。
+    这里改为**只查轻量列**（senderId/msgType/text），逐行判断与 her_burst 一致，
+    不构造 Msg、不解析 extMap，跳系统卡片的口径用 msgType∈{27,35}（同 889 行）。
+    末条是「我」立即停；遇到 tip 跳过；只计数不喂模型。
     """
     try:
-        from brain import flow
-        return max(1, len(flow.her_burst(db, sid, uid) or []))
+        rows = db.con.execute(
+            "SELECT senderId, msgType, text FROM chatmsg "
+            "WHERE sessionId=? ORDER BY localTime DESC LIMIT 24",
+            (sid,)).fetchall()
     except Exception:
         return 1
+    n = 0
+    try:
+        for r in rows:
+            sender = str(r[0] or "")
+            if sender == str(uid):
+                break                      # 我说的 → 连发到这里为止
+            mt = int(r[1] or 0)
+            if mt in (27, 35):             # 系统提示不算她说话（同 889 行口径）
+                continue
+            # 与 her_burst 一致：空文本（纯表情/图片占位）也不计入
+            if not (r[2] or "").strip():
+                continue
+            n += 1
+            if n >= 10:                    # 与 flow.R.HER_BURST_MAX=10 对齐，够排序用
+                break
+    except Exception:
+        return max(1, n) if n else 1
+    return max(1, n)
 
 
 def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
@@ -797,6 +831,14 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         SKIP_FILE.stat().st_mtime_ns if SKIP_FILE.exists() else 0,
         REPLIED_FILE.stat().st_mtime_ns if REPLIED_FILE.exists() else 0,
         _rs_mtime,
+        # 🔴 2026-11-14（B5 P1）：_VOICE_SIDS 每轮 2002 清空、循环内 1016 增补；
+        #   不进 key 时，轮内第二次 candidates() 命中 8s 缓存返回的 merged 已是
+        #   上次快照的排序，prioritize_voice(1208) 拿当前 _VOICE_SIDS 与建缓存
+        #   那一刻不一致 → 语音候选排序错位。把集合指纹加进 key，任何增删都会失配。
+        tuple(sorted(_VOICE_SIDS)),
+        # 同轮 idfail 升级（2497 递增）也要反映到候选缓存 key，否则 8s 内的
+        # 二次调用拿不到最新失败计数 → 可能错位进入冷却/重试判定。
+        IDFAIL_FILE.stat().st_mtime_ns if IDFAIL_FILE.exists() else 0,
     )
     _cache_now = time.time()
     if (_CANDIDATE_CACHE.get("key") == _cache_key
@@ -891,6 +933,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                                and int(last.ts or 0) > _RSa.her_ts_of(str(sid)))
                 if _is_new_her:
                     _SGa.on_her(str(sid), int(last.ts or 0), human=True)
+                    # 🔴 2026-11-14（B1 P1）：归档集合是本轮快照，复活后必须同步更新，
+                    #   否则同一轮 candidates() 再次被调用（wake / 主循环复用）会按
+                    #   876 行 `if str(sid) in _archived` 再跳一次 → 漏回一轮。
+                    _archived.discard(str(sid))
                     log.info("归档会话来了新的人话 sid=%s → 解除归档，重新计入待回", sid)
                 else:
                     scan_stats["archived"] += 1
@@ -933,24 +979,6 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                             scan_stats["system"] += 1
                             log.debug("设备未读硬放行·系统文本 sid=%s uid=%s 摘要=%r → 跳过（C5/C8）",
                                       sid, to_uid, _d_txt[:16])
-                            continue
-                    except Exception:
-                        pass
-                # 2026-11-14 夜审修复（B-02，P0）：摘要文本可能就是我方刚发出的
-                #   原句——我方发送后 App 立刻把 session.lastMsgText 更新为我的文本，
-                #   镜像 chatmsg 未同步 → latest() 判「末条是我」→ 本分支把**我自己
-                #   的话**当「她新话」硬入队（21:58:55 实证摘要=flow 21:56:42 我方
-                #   原句；同模式对 ...68238498 一晚重复 10+ 次，且入队即清额度）。
-                #   交叉验证：这句在镜像里是我发的且时间贴近 → 视为「镜像未拉到我方
-                #   回复」，直接跳过，不入队、不清额度。
-                if _d_txt:
-                    try:
-                        _my_ts = db.my_text_ts(sid, _d_txt)
-                        if _my_ts and abs(int(_d_ts) - int(_my_ts)) <= 120000:
-                            scan_stats["mine_last"] += 1
-                            log.info("设备未读硬放行·镜像滞后 sid=%s 摘要=%r 是我方 "
-                                     "刚发的原句 → 跳过（不入队、不清额度）",
-                                     sid, _d_txt[:16])
                             continue
                     except Exception:
                         pass
@@ -1102,6 +1130,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 try:
                     from data import reply_state as _RSa
                     _RSa.set_archived(str(sid), True)   # wake.candidates() 也要排除
+                    # 🔴 2026-11-14（B1 P1）：刚归档的会话加入本轮快照，避免同轮
+                    #   candidates() 再次命中时仍按旧集合处理（当轮重复处理一次）。
+                    _archived.add(str(sid))
                 except Exception:
                     pass
             if _vd.state in (_VD.AWAITING, _VD.FOLLOWING,
@@ -1155,9 +1186,18 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         #   取 8 = 原 5 + 3 余量，兼顾「设备未读多于 5 条时不漏」与「不冲爆」。
         #   设备未读对账本身仍**不受冷却限制**（它是「设备明说有人等」的最后保证，
         #   冷却是本地台账，不能反过来掩盖设备真值）—— 保持原意，只调封顶。
+        #
+        # 🔴 2026-11-14（A3 P0）：封顶改可配（SOUL_RECONCILE_CAP，默认仍 8），
+        #   且**被截断的 _missing 数量必须打 WARNING**（原代码静默丢弃超出部分 →
+        #   设备真未读 >8 时巡检看不出漏回）。缺摘要的 sid 也必须 WARNING（原 DEBUG），
+        #   并降级用 db.latest() 再试一次，避免一次摘要缺失就永久漏回。
+        _recon_cap = _RECONCILE_CAP
+        _dropped_by_cap = 0
+        _missing_no_digest = []
         for _s in _missing:
-            if _added >= 8:            # 一次最多补 8 个，别把队列冲爆
-                break
+            if _added >= _recon_cap:            # 一次最多补 _recon_cap 个，别把队列冲爆
+                _dropped_by_cap += 1
+                continue
             # 🔴 2026-11-12 夜班修复（D4）：归档会话不补入（C4）。
             #   改前这段对账补入循环没有任何归档过滤 —— 归档会话若设备 unReadCount>0
             #   会被强制补入队列，违背「归档不回、不唤醒、不计待回」（主循环 879-903 有过滤）。
@@ -1172,9 +1212,32 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             _t = (_dig.get("text") or "").strip()
             _uid2 = str(_dig.get("to_uid") or "")
             _ts2 = int(_dig.get("ts") or 0)
+            # 🔴 2026-11-14（A3 P0）：摘要不完整时降级用 db.latest(_s) 取末条再补；
+            #   仍拿不到才丢弃，且**升级为 WARNING**（原 DEBUG 静默漏回巡检看不到）。
             if not _t or not _uid2 or not _ts2:
-                log.debug("设备未读对账：sid=%s 摘要不完整（text=%r uid=%r ts=%s）→ 无法补入",
-                          _s, _t[:16], _uid2, _ts2)
+                try:
+                    _last_fb, _src_fb = db.latest(_s)
+                except Exception:
+                    _last_fb, _src_fb = None, ""
+                if _last_fb is not None:
+                    _fb_txt = (getattr(_last_fb, "text", "") or "").strip()
+                    _fb_ts = int(getattr(_last_fb, "ts", 0) or 0)
+                    _fb_sender = str(getattr(_last_fb, "sender", "") or "")
+                    # 末条不是「我」→ 她/系统发的 → to_uid = sender
+                    if _fb_sender and _fb_sender != str(db.uid) and _fb_ts > 0:
+                        if not _t and _fb_txt:
+                            _t = _fb_txt
+                        if not _uid2:
+                            _uid2 = _fb_sender
+                        if not _ts2:
+                            _ts2 = _fb_ts
+                        log.warning("设备未读对账：sid=%s 摘要不完整 → 已用 db.latest 降级补"
+                                    "（source=%s，sender=%s text=%r ts=%s）",
+                                    _s, _src_fb, _fb_sender[-6:], _t[:16], _ts2)
+            if not _t or not _uid2 or not _ts2:
+                _missing_no_digest.append(_s)
+                log.warning("设备未读对账：sid=%s 摘要与末条均无法定位收件人/文本 → 本轮无法补入"
+                            "（已尝试 session_digest + db.latest）", _s)
                 continue
             if _uid2.startswith(SKIP_UID_PREFIX):
                 continue
@@ -1190,6 +1253,16 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             _lv = log.info if _added else log.debug
             _lv("设备未读对账：设备未读 %d 个，其中 %d 个不在队列（已补 %d 个）",
                 len(_unread_sids), len(_missing), _added)
+        # 🔴 2026-11-14（A3 P0）：封顶截断 + 摘要缺失的 sid 数量必须 WARNING 暴露，
+        #   否则「设备真未读 > cap」和「多 sid 摘要缺失」都会被静默吞掉，巡检看不出漏回。
+        if _dropped_by_cap:
+            log.warning("设备未读对账：本轮因封顶 %d 截断 %d 个未补 sid（可设 "
+                        "SOUL_RECONCILE_CAP 调高；补入的 %d 个仍走定位/身份校验/发送三态）",
+                        _recon_cap, _dropped_by_cap, _added)
+        if _missing_no_digest:
+            log.warning("设备未读对账：%d 个 sid 摘要与末条均无法定位 → 本轮漏回，"
+                        "sid=%s（巡检若频发需查镜像完整性/sync 时序）",
+                        len(_missing_no_digest), _missing_no_digest[:8])
     except Exception as _e:
         log.warning("设备未读对账异常（不影响已有候选）: %r", _e)
 
@@ -1399,8 +1472,16 @@ def nick_of(db, sid, uid):
     """
     key = str(sid)
     hit = _NICK_CACHE.get(key)
-    if hit and (time.time() - hit[0]) < 600.0:
-        return hit[1]
+    if hit:
+        _age = time.time() - hit[0]
+        # 🔴 2026-11-14（A1 P0）：None 也进缓存（避免每候选重复扫 extMap），
+        #   但**只给 60s 短 TTL**——否则一次「末条太短+库 extMap 无昵称」的 None
+        #   会被锁 10 分钟，期间界面 remember_nick 也补不回来（见 remember_nick），
+        #   昵称这条唯一可靠定位信号被缓存锁死 → 走 nocue_hard 短冷却（实测「源
+        #   300→有效 0」的放大器之一）。
+        _ttl = 60.0 if not hit[1] else 600.0
+        if _age < _ttl:
+            return hit[1]
     nice = None
     try:
         rows = db.con.execute(
@@ -1468,6 +1549,13 @@ def remember_nick(sid, nick):
         log.info("记住昵称 sid=%s → %r（下次可搜昵称）", key[-10:], t)
     except Exception as e:
         log.debug("昵称缓存落盘失败: %r", e)
+    # 🔴 2026-11-14（A1 P0）：旧缓存若是 None（nick_of 在库 extMap 无昵称 + 末条太短
+    #   时写入，TTL 600s），原逻辑只落盘不回填内存 → 界面刚拿到的昵称被 None 锁死
+    #   10 分钟，candidates 处理循环里 `_usable_word(_nick_pre,2)` 与
+    #   `len(_norm(_nick_try) or "")<2` 判空 → 走 nocue 短冷却。这里强制回填内存，
+    #   让 nick_of 下一次立刻拿到真实昵称（NICK_FILE 已在上面落盘）。
+    if not (old and old[1]):
+        log.info("昵称缓存回填（原为 None/缺失）sid=%s → %r", key[-10:], t)
 
 
 def _sessions_with(db, text):
@@ -2398,13 +2486,6 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     except Exception:
                         pass
                     break
-                # 2026-11-14 夜审修复（B-03，P1）：open_search 失败原来是
-                #   「无日志无台账」的静默 continue → 同一候选一晚反复烧（12 屏
-                #   深翻 + 搜索入口 40~50s/次，实证 10+ 轮 0 回复）。补 12 分钟
-                #   冷却 + 一行日志，让失败可见、可停。
-                log.warning("搜索入口打不开（reason=%s）→ 冷却 12 分钟 uid=%s sid=%s",
-                            getattr(S, "LAST_REASON", "?"), to_uid, sid)
-                mark_skip(sid, txt, "search_fail", hours=0.2)
                 out["skipped"] += 1
                 continue
             if _cand_preempt is not None and _new_msg_urgent():

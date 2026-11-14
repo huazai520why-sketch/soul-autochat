@@ -365,8 +365,8 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
                     if getattr(_v, "state", "") == V.ARCHIVED:
                         log.info("唤醒候选跳过 sid=%s（age>=%gh 归档，不唤醒）", sid, _ARCHIVE_H)
                         continue
-        except Exception:
-            pass            # 拿不到 her_ts / 台账状态机异常 → 不拦（降级放行）
+        except Exception as e:
+            log.debug("归档判定异常，降级放行: sid=%s %r", sid, e)  # 拿不到 her_ts / 台账状态机异常 → 不拦
         # 🔴 2026-11-12（F-02）：跟进阶梯里 FOLLOWING/AWAITING（她正在等我回 /
         #    我在跟进她）→ 不唤醒。原来 candidates() 只滤 ARCHIVED，到 send_wake
         #    的 SG.allow 才拦，然后 _bump_miss 把「额度已满/等她回」错计成「唤不醒」
@@ -380,8 +380,8 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
                 if _stn in (V.FOLLOWING, V.AWAITING):
                     log.info("唤醒候选跳过 sid=%s（state=%s，不唤醒）", sid, _stn)
                     continue
-        except Exception:
-            pass            # 台账状态机异常 → 不拦（降级放行）
+        except Exception as e:
+            log.debug("跟进阶梯状态机异常，降级放行: sid=%s %r", sid, e)  # 拿不到 state → 不拦
         out.append(Candidate(sid, s.to_uid, n, last_ts, last.text, side,
                              kws=_kw_list(db, sid, db.uid)))
         if len(out) >= limit:
@@ -650,9 +650,9 @@ def send_wake(actor, dev, cand, text, db=None):
                 #   FOLLOWING/AWAITING，走到这里说明是轮内状态变化/边界情况，
                 #   本轮不发送，但**不递增放弃计数**，下轮候选仍会回来。
                 return False, "跟进阶梯拦截(%s)" % _d.state
-    except Exception:
-        pass
-
+    except Exception as e:
+        # 发送闸裁决整段异常 → 降级放行（绝不掐断唤醒链路），但留痕便于排障。
+        log.debug("发送闸裁决异常，降级放行: sid=%s %r", getattr(cand, "sid", "?"), e)
     inp = Input(dev)
     ok, got = inp.type_and_verify(text, actor)
     if not ok:
@@ -698,7 +698,7 @@ def send_wake(actor, dev, cand, text, db=None):
         from brain import sendgate as SG
         if SG.ON:
             SG.note_sent(cand.sid, 1)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("唤醒记账异常（不改变返回值）: sid=%s %r", getattr(cand, "sid", "?"), e)
     log.info("已记唤醒台账 uid=%s（24h 内不再找他）", cand.uid)
     return True, "已发送"

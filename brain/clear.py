@@ -26,6 +26,11 @@ log = get_logger("brain.clear")
 LIST_TOP, LIST_BOTTOM = 200, 1500     # 会话行有效纵向范围
 MAX_ENTER = 8                         # 单次 sweep 最多进几个人
 
+# 🔴 2026-11-14（F05）：假红点冷却状态。原定义在文件末尾（引用之后），
+#    虽然运行时可解析，但属维护隐患。提前到模块顶部。
+_FAKE_DOT = {"until": 0.0}
+FAKE_DOT_COOL_S = 900          # 冷却 15 分钟
+
 # 🔴 清红点**只用双击**，绝不滑动（用户 2026-11-02 反复强调，不止十次）。
 #   双击的实测语义：跳到下一个有红点的位置；没有红点就原地不动；
 #   在红点区间内一次推进约 1 行。所以它是「红点导航键」，
@@ -823,12 +828,6 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         log.info("进了 %d 人没发话，但库里还有 %d 个待回 → **不判假红点**（不冷却）",
                  out["entered"], _pend)
     return out
-
-
-# 假红点冷却（连续进会话都无需回复 → UI 树里的「红点」是误判）
-_FAKE_DOT = {"until": 0.0}
-
-FAKE_DOT_COOL_S = 900          # 冷却 15 分钟
 
 
 def fake_dot_cooling():
