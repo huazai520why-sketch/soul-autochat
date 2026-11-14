@@ -2,6 +2,7 @@
 
 > 本文写给要改代码的人。只想跑起来看 [README](README.md)。
 > 每一节末尾的「为什么」比「是什么」重要——那些都是真实故障换来的。
+> 2026-11-14 当前任务拓扑与包依赖总图见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ---
 
@@ -53,6 +54,10 @@ guard/  ──依赖──▶ brain/ ──依赖──▶ eyes/ + hands/ ──
 2. `hands/` **不许** import `eyes/`——动作层永远不做判断。
 3. `brain/` 不许直接调 `u2`——必须走 `Actor`，否则帧缓存会脏。
 4. 所有「谁该回」的判断只能来自 `pendingq.candidates()`。
+
+**当前生产例外（结构债，不要扩散）**：`data/pending.py` 会反向导入
+`brain.pendingq`、`brain.sendgate`、`brain.verdict`；`eyes/sysmsg.py` 会直接读
+`data.imdb`。这两处是历史演进留下的耦合，现有运行稳定，新增架构不要再照此扩展。
 
 第 3 条的由来：早期为了图快，在几个地方直接 `u2(...)` 点了屏幕，
 `Actor` 的缓存帧不知道页面已经变了，后续所有基于旧帧的坐标全部错位。

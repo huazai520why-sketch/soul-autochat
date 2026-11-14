@@ -44,6 +44,7 @@
 
 | 文档 | 内容 |
 |---|---|
+| [docs/PROJECT_MAP.md](docs/PROJECT_MAP.md) | 当前生产架构图：计划任务、进程拓扑、包依赖、主链路和清理边界 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构详解：分层、数据流、一次读屏/点击的完整过程、关键常量总表、已知坑 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 部署与运行：从零到跑起来、排障速查、**改代码的铁律** |
 | [docs/TREE.md](docs/TREE.md) | 目录树：每个文件一行说明，外加「我想做什么 → 去哪个文件」对照表 |
@@ -104,6 +105,9 @@
 
 **依赖方向是单向的**：`guard → brain → eyes/hands → core`。
 `eyes` 不许 import `hands`，`hands` 不许 import `eyes`。这条规则让「读」和「写」永远可以单独测试。
+
+> 当前生产代码另有两个已登记的结构债：`data/pending.py` 反向导入 `brain` 三个判据模块，
+> `eyes/sysmsg.py` 直读 `data.imdb`。它们运行稳定，本轮不强拆；新增代码仍应遵守上方的正常依赖方向。
 
 ### 一次「她发消息 → 我回复」的完整时间线
 
@@ -264,10 +268,10 @@ soul-autochat/
 │  ├─ localq.py / picreq.py / stage*.py    辅助模块
 │  └─ engine/                 ── 出话引擎
 │     ├─ llm.py               模型调用（方舟 / Ollama / 兼容端点）
-│     ├─ prompt*.py           提示词组装（v9/v11/v12 三版并存）
-│     ├─ persona*.py          人设（身份表插值，避免多账号串味）
+│     ├─ prompt.py            提示词组装（当前 v9）
+│     ├─ persona.py           人设（身份表插值，避免多账号串味）
 │     ├─ rules.py             出话规则层
-│     ├─ brief*.py            「她的简报」压缩
+│     ├─ brief.py             「她的简报」压缩
 │     ├─ opener.py            开场白
 │     └─ gate.py              🔒 硬闸：13 条拒绝规则
 ├─ guard/                     ── 守护层
@@ -279,6 +283,8 @@ soul-autochat/
 │  ├─ pending.py              待回台账
 │  └─ watch.py                数据库变更监听
 ├─ tools/                     ── 运维脚本
+│  ├─ silent_launch.py        所有 Soul 计划任务统一静默启动
+│  ├─ _silent/                子进程无窗口注入（禁止删除）
 │  ├─ msg_probe.py            消息探针（每 15s 查一次新消息）
 │  ├─ devwatch.py             设备存活守护（offline 自动重建）
 │  ├─ watchdog_live.py        进程守护
@@ -289,7 +295,8 @@ soul-autochat/
 │  ├─ voice_check.py          语音链路自检
 │  ├─ prepare_photos.py       照片进相册（发图前置）
 │  └─ *.ps1                   Windows 计划任务注册脚本
-├─ tests/                     ── 121 个探针/验收脚本（t_*.py）
+├─ scripts/repo_sync.ps1      Git 漂移检查与脱敏扫描
+├─ tests/                     ── 20 个保留验收/回放脚本（t_*.py）
 └─ docs/                      ── 架构与部署文档
 ```
 
