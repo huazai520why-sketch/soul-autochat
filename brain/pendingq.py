@@ -1752,13 +1752,15 @@ def _list_sig(snap):
         return ()
 
 
-def _scroll_top(actor, rounds=4):
+def _scroll_top(actor, rounds=4, preempt=None):
     """回列表顶部（最多 rounds 次），否则下次进来从中间开始会漏上面的人。"""
     try:
         prev = _list_sig(actor.snap())
     except Exception:
         prev = ()
     for _ in range(max(1, rounds)):
+        if preempt and preempt():
+            return False
         if not _swipe_list(actor, up=False):
             return False
         try:
