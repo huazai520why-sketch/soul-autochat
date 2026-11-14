@@ -266,11 +266,24 @@ class IMDB(object):
                 votes[pre] = votes.get(pre, 0) + 1
         if votes:
             return max(votes.items(), key=lambda kv: kv[1])[0]
+        # 2026-11-14 夜审修复（D4，P1）：旧兜底「发文本最多的人 = 自己」没有
+        #   方向性依据——她话多时对方 uid 被当成自己，方向判定全反转（漏回+重发）。
+        #   改用方向排除法：session.toUserId 永远是「别人」，chatmsg 的 senderId
+        #   里不在 toUserId 集合里的那个才可能是自己；唯一才采纳，否则 None。
         try:
-            row = self.con.execute(
-                "SELECT senderId, COUNT(*) c FROM chatmsg WHERE msgType = ? "
-                "GROUP BY senderId ORDER BY c DESC LIMIT 1", (MSG_TEXT,)).fetchone()
-            return str(row[0]) if row else None
+            _rows = self.con.execute(
+                "SELECT DISTINCT toUserId FROM session "
+                "WHERE toUserId IS NOT NULL LIMIT 2000").fetchall()
+            _others = {str(r[0]) for r in _rows if r[0]}
+            _rows2 = self.con.execute(
+                "SELECT DISTINCT senderId FROM chatmsg "
+                "WHERE senderId IS NOT NULL LIMIT 200").fetchall()
+            _mine = [str(r[0]) for r in _rows2 if r[0] and str(r[0]) not in _others]
+            if len(_mine) == 1:
+                return _mine[0]
+            log.warning("_guess_uid 方向排除后剩 %d 个候选 → 放弃猜测（uid=None）",
+                        len(_mine))
+            return None
         except Exception:
             return None
 

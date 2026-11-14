@@ -982,6 +982,24 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                             continue
                     except Exception:
                         pass
+                # 2026-11-14 夜审修复（B-02，P0）：摘要文本可能就是我方刚发出的
+                #   原句——我方发送后 App 立刻把 session.lastMsgText 更新为我的文本，
+                #   镜像 chatmsg 未同步 → latest() 判「末条是我」→ 本分支把**我自己
+                #   的话**当「她新话」硬入队（21:58:55 实证摘要=flow 21:56:42 我方
+                #   原句；同模式对 ...68238498 一晚重复 10+ 次，且入队即清额度）。
+                #   交叉验证：这句在镜像里是我发的且时间贴近 → 视为「镜像未拉到我方
+                #   回复」，直接跳过，不入队、不清额度。
+                if _d_txt:
+                    try:
+                        _my_ts = db.my_text_ts(sid, _d_txt)
+                        if _my_ts and abs(int(_d_ts) - int(_my_ts)) <= 120000:
+                            scan_stats["mine_last"] += 1
+                            log.info("设备未读硬放行·镜像滞后 sid=%s 摘要=%r 是我方 "
+                                     "刚发的原句 → 跳过（不入队、不清额度）",
+                                     sid, _d_txt[:16])
+                            continue
+                    except Exception:
+                        pass
                 if _d_txt and _d_ts and not _recently_replied(
                         to_uid, sid=sid, text=_d_txt, her_ts_ms=_d_ts):
                     log.info("设备未读硬放行·镜像滞后 uid=%s sid=%s 摘要=%r"
@@ -2486,6 +2504,13 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     except Exception:
                         pass
                     break
+                # 2026-11-14 夜审修复（B-03，P1）：open_search 失败原来是
+                #   「无日志无台账」的静默 continue → 同一候选一晚反复烧（12 屏
+                #   深翻 + 搜索入口 40~50s/次，实证 10+ 轮 0 回复）。补 12 分钟
+                #   冷却 + 一行日志，让失败可见、可停。
+                log.warning("搜索入口打不开（reason=%s）→ 冷却 12 分钟 uid=%s sid=%s",
+                            getattr(S, "LAST_REASON", "?"), to_uid, sid)
+                mark_skip(sid, txt, "search_fail", hours=0.2)
                 out["skipped"] += 1
                 continue
             if _cand_preempt is not None and _new_msg_urgent():
