@@ -157,6 +157,8 @@ class Hand(object):
         from core.paths import SOUL_PKG
         try:
             self.dev.u2().app_start(SOUL_PKG, wait=True)
+            from core.device import note_action
+            note_action()
         except Exception as e:
             log.warning("[back] app_start 失败 %r -> monkey 兜底", e)
             try:

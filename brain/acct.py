@@ -588,6 +588,8 @@ def switch_account(actor, dev):
                 time.sleep(2.5)
                 try:
                     dev.u2().app_start(SOUL_PKG, wait=True)
+                    from core.device import note_action
+                    note_action()
                 except Exception:
                     pass
                 s2, pg2 = nav.to_tab(actor, "自己")

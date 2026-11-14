@@ -118,8 +118,29 @@ def acquire_lock():
     pid = int(d.get("pid") or 0)
     if pid and pid != os.getpid() and _pid_alive(pid):
         return False
-    save_json(LOCKFILE, {"pid": os.getpid(), "ts": _now()})
-    return True
+    # 🔴 2026-11-15 上午复查（G10，P2）：原读-判-写三步非原子，两个探针同时
+    #   启动会都判「无主」双跑。改 O_EXCL 原子创建；已存在再复核一次 owner。
+    try:
+        fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        d2 = load_json(LOCKFILE, {})
+        pid2 = int(d2.get("pid") or 0)
+        if pid2 and pid2 != os.getpid() and _pid_alive(pid2):
+            return False
+        try:
+            os.remove(LOCKFILE)
+        except OSError:
+            return False
+        return acquire_lock()
+    except OSError:
+        save_json(LOCKFILE, {"pid": os.getpid(), "ts": _now()})
+        return True
+    else:
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid(), "ts": _now()}).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
 
 
 def touch_lock():

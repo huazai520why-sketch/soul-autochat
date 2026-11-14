@@ -788,8 +788,10 @@ def cycle(a, dev, db, st, dry_run=False):
             and st.get("match_quota_day") != time.strftime("%Y-%m-%d")
         )
         if _can_match:
-            log.info("已回过人，但匹配也到点（距上次 %.0fs）→ 继续走匹配段",
-                     _now_r - float(st.get("last_match", 0) or 0))
+            _lm = float(st.get("last_match", 0) or 0)
+            log.info("已回过人，但匹配也到点（%s）→ 继续走匹配段",
+                     "切号/重启后首次，无历史" if _lm <= 0
+                     else "距上次 %.0fs" % (_now_r - _lm))
             # 注意：**不 return**，往下走到 ④唤醒 / ⑤匹配
         else:
             return "replied"
@@ -943,6 +945,11 @@ def cycle(a, dev, db, st, dry_run=False):
             n_done = 0
             n_fail = 0
             need_advance = False   # G3-a：上一张卡已处理完 → 下一轮开头才点下一个
+            # 🔴 2026-11-15 上午复查（G7，P2）：空烧降级放行的连打给短预算——
+            #   原版预算超时后仍继续匹配，单轮可拉到 1100s+，打破「单轮 600s」承诺。
+            _degraded_now = (int(st.get("pending_zero_rounds", 0) or 0)
+                             >= PENDING_ZERO_MAX)
+            _streak_budget = 180.0 if _degraded_now else float(MATCH_STREAK_BUDGET)
             last_res = ""
             for i in range(MATCH_STREAK_N):
                 # ① 每步前看红点
@@ -1002,9 +1009,9 @@ def cycle(a, dev, db, st, dry_run=False):
                 except Exception:
                     pass
                 # ③ 预算/失败保护
-                if time.time() - t_streak > MATCH_STREAK_BUDGET:
+                if time.time() - t_streak > _streak_budget:
                     log.info("连续匹配用满 %.0fs 预算 → 先停（已匹配 %d 个，余下轮次继续）",
-                             MATCH_STREAK_BUDGET, n_done)
+                             _streak_budget, n_done)
                     break
                 if n_fail >= MATCH_STREAK_FAIL_MAX:
                     log.warning("连续匹配失败 %d 次 → 停手（判定通道异常）", n_fail)
@@ -1019,6 +1026,8 @@ def cycle(a, dev, db, st, dry_run=False):
                 if res == "fail":
                     n_fail += 1
                     st["match_fail"] = int(st.get("match_fail", 0)) + 1
+                    # 熔断阈值=2（连续 2 次失败即静默）——历史口径比
+                    #   MATCH_STREAK_FAIL_MAX=3 更严；G5 仅对齐语义注释，不改行为。
                     if st["match_fail"] >= 2:
                         st["match_broken_at"] = time.time()
                         st["match_fail"] = 0

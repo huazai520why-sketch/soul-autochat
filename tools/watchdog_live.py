@@ -51,7 +51,10 @@ LOCK_JSON = os.path.join(ROOT, "data", "state", "daemon.lock")
 # 判活用的模块日志：只要其中**任意一个**在动，就说明 daemon 活着
 LIVE_LOGS = ("brain.pendingq.log", "brain.act.log", "core.device.log",
              "brain.clear.log", "data.imdb.log", "brain.wake.log")
-STALL_SEC = 300
+# 🔴 2026-11-15 上午复查（G11/E-03，P2）：原 300s 与 guard 看门狗 HANG_S=900
+#   口径不一致——daemon 单阶段（pendingq 慢路径）实测可 300~500s 不写模块日志，
+#   300s 就 kill 有误杀风险。对齐到 900（guard 是杀权权威，live 只兜底）。
+STALL_SEC = 900
 LOOP_WINDOW = 600
 LOOP_RESTART_MAX = 4
 

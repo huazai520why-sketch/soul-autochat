@@ -717,6 +717,18 @@ def _send_lines(actor, lines, nick, page_checked=False, sid=""):
                 if not _ok:
                     log.warning("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
                                 nick, i + 1)
+                    # 🔴 2026-11-15 上午复查（B-10，P2）：unknown 后页面可能已转场；
+                    #   直接灌下一条会对着别的页面灌字（实测「第2条灌字失败(None)」
+                    #   成串跟在 unknown 后面）。先确认仍在 chat 再继续。
+                    try:
+                        from eyes.page import detect as _det_flow
+                        _s_chk = actor.snap(force=True)
+                        _pg_chk = _det_flow(_s_chk)
+                        if _pg_chk != "chat":
+                            return sent, "第%d条unknown后页面已离开chat(%s)" % (
+                                i + 1, _pg_chk)
+                    except Exception:
+                        pass
             except Exception as e:
                 log.warning("[%s] 第%d条发送异常: %r", nick, i + 1, e)
                 try:

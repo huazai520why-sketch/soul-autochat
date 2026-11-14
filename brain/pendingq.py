@@ -2493,6 +2493,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 continue
             if not S.open_search(actor, preempt=_cand_preempt):
                 if getattr(S, "LAST_REASON", "") == "preempted":
+                    log.info("⚡ 搜索入口阶段被新消息抢占 → 中止本轮积压（B-07 补日志）")
                     out["aborted"] = "preempted"
                     try:
                         from data import watch as _Wp0

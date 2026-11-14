@@ -60,6 +60,8 @@ def ensure_app(device, wait=18):
     log.info("Soul 不在前台（%s），拉起", device.current_app()[0])
     try:
         device.u2().app_start(SOUL_PKG, wait=True)
+        from core.device import note_action
+        note_action()
     except Exception as e:
         log.warning("app_start 失败 %r", e)
         device.sh("monkey -p %s -c android.intent.category.LAUNCHER 1" % SOUL_PKG, timeout=30)

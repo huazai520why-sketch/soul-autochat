@@ -161,12 +161,26 @@ def check():
                 _, info = lock.status()
                 pid = info.get("pid") or read_pid()
                 if pid:
+                    _is_daemon = True
                     try:
-                        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                       capture_output=True, timeout=30, check=False)
-                        log.warning("已强杀卡死 daemon pid=%s，下一轮检查会重新拉起", pid)
-                    except Exception as e:
-                        log.error("强杀卡死 daemon 失败: %r", e)
+                        _out = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             "(Get-CimInstance Win32_Process -Filter \"ProcessId=%d\").CommandLine" % pid],
+                            capture_output=True, timeout=20).stdout.decode("utf-8", "replace")
+                        _is_daemon = "run.py daemon" in _out
+                    except Exception:
+                        _is_daemon = True   # 判不了按旧逻辑杀，别让卡死 daemon 永远占锁
+                    if not _is_daemon:
+                        # 🔴 2026-11-15 上午复查（G9，P2）：Windows 会复用 pid，
+                        #   不核实就杀可能误杀无辜进程。
+                        log.warning("pid=%s 命令行不含 run.py daemon（疑似 pid 复用）→ 不杀，仅清锁重拉", pid)
+                    else:
+                        try:
+                            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                           capture_output=True, timeout=30, check=False)
+                            log.warning("已强杀卡死 daemon pid=%s，下一轮检查会重新拉起", pid)
+                        except Exception as e:
+                            log.error("强杀卡死 daemon 失败: %r", e)
                 try:
                     msg = lock.clear_stale()
                     log.info("清锁：%s", msg)

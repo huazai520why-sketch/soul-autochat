@@ -46,6 +46,10 @@ def classify(text: str = "", msg_type: Optional[int] = None, uid: Optional[str] 
     u = str(uid or "")
     if u.startswith("2042683") or (u.startswith("-") and u[1:].isdigit()):
         return AD
+    # 🔴 2026-11-15 上午复查（D10，P2）：号段会变，文案特征更稳——与 data/imdb
+    #   口径一致（≥2 个营销词命中判 AD）。只命中 1 词不判（误杀真人话=永久漏回）。
+    if sum(1 for k in AD_HINTS if k in t) >= 2:
+        return AD
     if any(k in t for k in SYSTEM_HARD):
         return SYSTEM
     if len(t) >= 12 and any(t.startswith(p) for p in SYSTEM_PREFIX):

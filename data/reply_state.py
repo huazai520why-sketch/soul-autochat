@@ -162,14 +162,18 @@ def on_her(sid: str, her_ts_ms: float, human: bool = True) -> None:
             return
         ts = float(her_ts_ms or 0)
         old = float(rec.get("her_ts_ms") or 0)
-        # C2：她再发真人消息 → 回合重置（计数清零、回第 1 档、解除归档）。
+        # C2：她再发真人消息 → 回合重置（回第 1 档、解除归档）。
         # 只有「更新的」消息才重置，库 pull 补进来的旧消息不能把计数洗掉。
         # 无变化直接返回：避免每轮 300 次无谓写盘。
         # sys_only 只在「更新的真人消息」到来时清除（上一分支已处理系统卡）。
         if ts <= old:
             return
         rec["her_ts_ms"] = ts
-        rec["sends"] = []
+        # 🔴 2026-11-15 上午复查（B-09，P1）：这里原来 `rec["sends"] = []` 清空
+        #   整个发送台账 → 滚动 24h 计数（C6「24h 至多 2 条」）被连带洗掉，实证
+        #   sendgate.log 一小时内对同一 sid 10 次放行（其中两次标「24h 0/2」）。
+        #   verdict.state_of 本就按 her_ts 裁本回合（turn = sends >= her_s），
+        #   回合重置由水位线推进自动生效，台账保留供 24h/累计口径。
         rec["archived"] = False
         rec["sys_only"] = False
         rec["updated"] = time.time()
@@ -201,7 +205,10 @@ def note_sent(sid: str, n: int = 1, ts: Optional[float] = None) -> None:
             sends.append(now - 1.6 * max(0, int(n) - 1 - i))
         rec["sends"] = sends[-MAX_SENDS:]
         rec["sys_only"] = False
-        rec["updated"] = now
+        # 🔴 2026-11-15（B-09 配套）：updated 是 _purge 的新鲜度标记（与真实
+        #   now 比对），必须用真实墙钟时间；原来 =now（可被 ts 参数带到过去）
+        #   → 回填/模拟 ts 时整条记录被 purge 误清。
+        rec["updated"] = time.time()
         d[str(sid)] = rec
         _save(_purge(d))
 

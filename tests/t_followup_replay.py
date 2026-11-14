@@ -98,7 +98,9 @@ print("\n--- 2 · 水位线台账 C2/C5/C8 ---")
 RS.reset("t1")
 RS.on_her("t1", ms(NOW - 10 * H), human=True)
 ck(RS.her_ts_of("t1") == ms(NOW - 10 * H), "真人消息推进 her_ts")
-RS.note_sent("t1", 2)
+# B-09（2026-11-15）：模拟真实时序——我先回（NOW-10h+60s），她 NOW-30s 再回。
+#   原来不带 ts（=测试时刻），比她的新消息还晚，turn 裁剪语义测不出来。
+RS.note_sent("t1", 2, ts=NOW - 10 * H + 60)
 ck(len(RS.sends_of("t1")) == 2, "发送成功即追加 2 条（不等库 pull）")
 
 # 系统消息：不推进水位线、不清 sends、不解除归档
@@ -110,8 +112,13 @@ ck(len(RS.sends_of("t1")) == 2, "系统消息不冷却、不清计数（C8）")
 RS.set_archived("t1", True)
 ck(RS.is_archived("t1") and "t1" in RS.archived_sids(), "归档可查（candidates/wake 双处排除）")
 RS.on_her("t1", ms(NOW - 30), human=True)
-ck(not RS.is_archived("t1") and RS.sends_of("t1") == [],
-   "她再发人话 → 解除归档 + 回合重置（C4/C2）")
+ck(not RS.is_archived("t1"), "她再发人话 → 解除归档（C4）")
+# B-09（2026-11-15）：回合重置由 verdict 按 her_ts 裁剪，台账 sends 保留供
+#   24h/累计口径（原来这里清空 sends，把「24h 至多 2 条」连带洗掉）。
+ck(len(RS.sends_of("t1")) == 2, "台账保留（B-09：on_her 不再清 sends）")
+_v_t1 = SG.state_of("t1", n_lines=2, now=NOW)  # now=NOW：与模拟时间线一致
+ck(_v_t1.sent_total == 0 and _v_t1.sent_24h >= 2,
+   "回合重置由 her_ts 裁剪生效（C2）；24h 计数保留（B-09）")
 
 
 # --------------------------------------------------------------- 3 · sendgate

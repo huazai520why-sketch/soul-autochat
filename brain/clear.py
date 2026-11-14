@@ -320,6 +320,8 @@ def _pull_down(actor, n=1, budget=12.0):
         try:
             for _ in range(max(1, n)):
                 d.swipe(450, 380, 450, 1200, duration=0.55)   # 秒！
+                from core.device import note_action
+                note_action()
                 time.sleep(0.8)
             box["ok"] = True
         except Exception as e:      # noqa: BLE001
@@ -359,6 +361,8 @@ def _to_top(actor, rounds=4, budget=12.0):
                 if stop["hit"]:
                     break
                 d.swipe(450, 380, 450, 1250, duration=0.5)   # 秒！手指下滑 = 看更上面
+                from core.device import note_action
+                note_action()
                 time.sleep(0.5)
                 # 顶部再滑也不动时，再加滑一次就是浪费 —— 由调用方按行指纹判断
             box["ok"] = True

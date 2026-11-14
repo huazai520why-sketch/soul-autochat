@@ -113,6 +113,11 @@ class Input(object):
             got = self.box_text(snap2)
             if got and text.strip() in got:
                 self._snap = snap2          # 给 tap_send 复用
+                try:
+                    from core.device import action_gen as _ag
+                    self._snap_gen = _ag()
+                except Exception:
+                    self._snap_gen = None
                 return True, got
             log.warning("第%d次灌字未落地：期望 %r 实际 %r", i + 1, text, got)
         # 🔴 2026-11-14（F09）：失败返回读真实当前帧，避免复用 TTL 内旧帧误判。
@@ -130,6 +135,16 @@ class Input(object):
           输入框区分「字还在（渲染慢）」与「字被吃（明确失败）」并打进日志。
         """
         s = snap or self._snap or actor.snap()
+        if s is self._snap and s is not None:
+            # 🔴 2026-11-15 上午复查（D7，P2）：缓存帧 freshness 守卫——灌字后若
+            #   发生过其它动作（代数变化），缓存帧已过期，照旧点击=拿旧坐标乱戳。
+            try:
+                from core.device import action_gen as _ag
+                if _ag() != getattr(self, "_snap_gen", None):
+                    log.info("tap_send：灌字后动作代数变化 → 弃用缓存帧重取")
+                    s = actor.snap(force=True)
+            except Exception:
+                pass
         btn = s.hit(res=SEND_RES)
         if btn is None:
             s = actor.snap(force=True)
@@ -184,9 +199,16 @@ class Input(object):
                 return False
         self.last_reason = "residual"
         t0 = time.time()
+        _last_seen = "residual"   # 2026-11-15（D6）：记录轮询最后一次观测
         while time.time() - t0 < timeout:
             time.sleep(0.6)
-            if self.box_text(actor.snap(force=True)) == "":
+            _got = self.box_text(actor.snap(force=True))
+            if _got == "":
                 self.last_reason = "ok"
                 return True
+            if _got is None:
+                _last_seen = None   # 输入框消失=无法确认，别把 unknown 升级成 residual
+        if _last_seen is None:
+            self.last_reason = "unknown"
+            log.warning("发送校验：超时时输入框已不在 → unknown（按已发记账防重复）")
         return False

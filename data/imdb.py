@@ -418,7 +418,10 @@ class IMDB(object):
         sender = str(self.uid) if mine else str(dig["to_uid"] or "")
         return Msg({
             "msgId": "", "sessionId": session_id,
-            "senderId": sender, "receiverId": str(dig["to_uid"] or ""),
+            "senderId": sender,
+            # 🔴 2026-11-15 上午复查（D11，P2）：receiverId 原来恒填 to_uid——
+            #   她发的消息 receiver 应为自己。用 receiverId 判方向的下游才不会误判。
+            "receiverId": (str(dig["to_uid"] or "") if mine else str(self.uid or "")),
             "localTime": d_ts, "msgType": _digest_mt(d_txt),
             "msgStatus": 0, "text": d_txt, "msgContent": "",
         }), "session"
@@ -452,7 +455,10 @@ class IMDB(object):
         """
         out = []
         for s in self.sessions(unread_only=True, include_official=False):
-            last = self.last_message(s.session_id)
+            # 🔴 2026-11-15 上午复查（D5，P2）：原来只用 last_message(chatmsg)。
+            #   入向不落 chatmsg 的账号（402857053 实测）chatmsg 末条永远是我方
+            #   → pending() 静默漏判。改用 latest()（chatmsg+session 摘要融合）。
+            last, _src = self.latest(s.session_id)
             if last is None:
                 continue
             if self.uid and str(last.sender) == str(self.uid):
@@ -615,6 +621,25 @@ def _merge_device_into_mirror(device, name, local, dest_dir):
     con = sqlite3.connect(str(local))
     try:
         con.execute("ATTACH DATABASE ? AS dev", (str(tmp_db),))
+        # 🔴 2026-11-15 上午复查（D12，P2）：合并正确性依赖 chatmsg.msgId 唯一索引
+        #   （INSERT OR IGNORE 才不重不漏）。索引缺失时 OR IGNORE 变全量重复插入
+        #   → 镜像膨胀。先验索引，缺失就放弃合并（维持旧「镜像冻结」行为）并告警。
+        try:
+            _idx = con.execute("PRAGMA main.index_list(chatmsg)").fetchall()
+            _has_msgid_uniq = False
+            for _r in _idx:
+                if not _r[2]:
+                    continue
+                _ic = [x[2] for x in con.execute("PRAGMA main.index_info(%s)" % _r[1])]
+                if _ic == ["msgId"]:
+                    _has_msgid_uniq = True
+                    break
+            if not _has_msgid_uniq:
+                log.warning("合并设备库：镜像 chatmsg.msgId 无唯一索引 → 放弃合并（防重复插入）")
+                return None
+        except Exception as _e:
+            log.warning("合并设备库：索引检查异常 %r → 放弃合并", _e)
+            return None
 
         def cols(table, schema="main"):
             try:
