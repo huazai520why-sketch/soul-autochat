@@ -6,8 +6,10 @@
 
 只读，不点设备，不进会话。退出码：
   0 = 正常（最近语音都处理了，或最近根本没有语音）
-  2 = 有语音没被处理（需要人看）
+  2 = 有语音无法完成 ASR（ASR 故障）
   3 = 自身异常
+
+转写成功但超过 2 小时未回复只告警，不算 ASR 任务失败。
 """
 import io
 import json
@@ -53,7 +55,8 @@ def main():
     print("最近 %.0fh 语音 %d 条（她的 %d 条）" % (MAX_AGE_H, len(rows), len(hers)))
 
     # 她的语音 vs 我在同会话里之后有没有发过消息
-    bad = []
+    asr_bad = []
+    reply_bad = []
     for sid, sender, mc, lt in hers[:20]:
         d = {}
         try:
@@ -76,17 +79,25 @@ def main():
         print("  %-14s %2ds app_word=%-5s asr=%-5s 之后我发了%d条  %s  龄%.1fh" % (
             str(sid)[-14:], dur, "有" if word else "无",
             "有" if asr_text else how, after, tag, age_h))
-        if not asr_text or (not after and age_h > 2.0):
-            bad.append((sid, lt, age_h, "ASR失败" if not asr_text else "未回复"))
+        if not asr_text:
+            asr_bad.append((sid, lt, age_h, "ASR失败"))
+        elif not after and age_h > 2.0:
+            reply_bad.append((sid, lt, age_h, "未回复"))
 
-    if bad:
+    if asr_bad:
         print("")
-        print("⚠ %d 条语音超过 2 小时仍未回：" % len(bad))
-        for sid, lt, age_h, why in bad[:10]:
+        print("⚠ %d 条语音无法转写：" % len(asr_bad))
+        for sid, lt, age_h, why in asr_bad[:10]:
             print("   sid=%s  龄%.1fh  原因=%s" % (sid, age_h, why))
         return 2
+    if reply_bad:
+        print("")
+        print("⚠ 转写正常，但 %d 条语音超过 2 小时仍未回（业务积压，不判 ASR 故障）："
+              % len(reply_bad))
+        for sid, lt, age_h, why in reply_bad[:10]:
+            print("   sid=%s  龄%.1fh  原因=%s" % (sid, age_h, why))
     print("")
-    print("✓ 语音链路正常")
+    print("✓ ASR 链路正常")
     return 0
 
 
