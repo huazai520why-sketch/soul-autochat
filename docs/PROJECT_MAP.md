@@ -32,6 +32,8 @@ Soul 相关计划任务共 9 个：`SoulGuard`、`SoulMsgProbe`、`SoulLiveWatch
 
 所有 Soul 运维入口统一经过 `tools/silent_launch.py`。该启动器必须保留，同目录下 `tools/_silent/sitecustomize.py` 也不能删除；它们负责 `pythonw.exe` 静默启动和子进程无窗口化。
 
+`tools/start_daemon.ps1` 使用 `Global\Soul1DaemonStart` 命名互斥，把 SoulGuard、msg_probe 和人工启动的“检查后启动”串行化，避免两个启动器同时拉起 daemon。
+
 ## 2. 包依赖与职责
 
 ```mermaid

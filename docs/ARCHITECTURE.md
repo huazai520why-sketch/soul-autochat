@@ -315,6 +315,9 @@ user   = 她刚发来的原话
 | `MATCH_STREAK_BUDGET` | 420.0s | 连匹上限（时长） |
 | `PENDING_ZERO_MAX` | 3 | 空烧多少轮后放行匹配 |
 
+启动侧由 `tools/start_daemon.ps1` 的 `Global\Soul1DaemonStart` 命名互斥串行化，
+daemon 启动后再由 `guard.lock` 的原子锁接管单实例控制。
+
 ---
 
 ## 8. 数据层：为什么直读数据库

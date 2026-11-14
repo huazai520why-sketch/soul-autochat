@@ -106,7 +106,7 @@ soul-autochat/
 │  ├─ voice_check.py               语音链路自检
 │  ├─ action_audit.py              动作审计
 │  ├─ prepare_photos.py            相册准备
-│  ├─ start_daemon.ps1             daemon 启动
+│  ├─ start_daemon.ps1             daemon 启动（命名互斥串行化）
 │  ├─ restart_daemon.ps1           daemon 重启
 │  ├─ do_start_daemon.ps1          兼容启动
 │  ├─ rebuild_db_cache.ps1         数据库缓存重建
