@@ -37,9 +37,9 @@ TARGET = "daemon.out"
 #   单文件越大，tail/seek 越慢，也越容易和写入方抢句柄。
 #   降到 4MB：约每 3~4 天轮转一次，单文件始终可全量扫。
 DEFAULT_MAX_MB = 4.0
-KEEP = 3
+KEEP = 2
 # 残留清理：pgn 截图 / daemon.out.bak 超过多少天删（0 = 不清理）
-CLEAN_DAYS = int(os.environ.get("SOUL_LOG_CLEAN_DAYS", "7"))
+CLEAN_DAYS = int(os.environ.get("SOUL_LOG_CLEAN_DAYS", "2"))
 
 
 class _Tee:

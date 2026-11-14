@@ -11,6 +11,13 @@
 #   NOW: Start-Process detached. Script returns immediately, daemon runs alone.
 #   Parent is WmiPrvSE (created by scheduled task / WMI), survives SSH disconnect.
 #
+# 2026-11-14: launch through tools/silent_launch.py so NO console window is
+#   created in the interactive session. The "daemon" spec keeps the exact same
+#   command (python.exe -u run.py daemon), redirects stdout to a file and
+#   injects the CREATE_NO_WINDOW shim into the whole process tree.
+#   NOTE: keep this launcher name free of the literal "run.py daemon" pattern,
+#   otherwise watchdog/start_daemon process detection would match the launcher.
+#
 # NOTE: keep this file PURE ASCII. Chinese chars get mangled to GBK over scp
 #       and cause "string missing terminator" parser errors on the remote host.
 $ErrorActionPreference = "Continue"
@@ -46,10 +53,12 @@ if ($existing) {
     exit 0
 }
 
-Write-Log "=== daemon starting (detached) ==="
+Write-Log "=== daemon starting (detached, windowless) ==="
 
-Start-Process -FilePath $py `
-              -ArgumentList '-u', 'run.py', 'daemon' `
+$pyw = $py.Replace('python.exe', 'pythonw.exe')
+if (-not (Test-Path $pyw)) { $pyw = 'C:\Users\JIAN\.workbuddy\binaries\python\envs\soulocr\Scripts\pythonw.exe' }
+Start-Process -FilePath $pyw `
+              -ArgumentList 'E:\soul1.0\tools\silent_launch.py', 'daemon' `
               -WorkingDirectory 'E:\soul1.0' `
               -WindowStyle Hidden
 
