@@ -173,9 +173,13 @@ rows()       → 双闸：行高 ≥ 6.9% 屏高 + 行内有内容
 - 暂停预览态有 `rlVoiceContainer`（播放）、`btn_delete`（取消）和
   `btnChangeText`（转文字）。
 
-当前可访问树没有独立“发送语音”控件，因此 `hands/voice.py` 只做模式切换、录音启动、
-暂停和取消，`send_reviewed()` 明确拒绝猜测发送。禁止用返回键或盲点预览冒充发送，
-否则可能给真人发出空录音。
+最终用户确认：新版是**按住 `audio_record_view_optimize`“录音”，播放完松开即自动发送**。
+`hands/voice.py::record_and_release()` 按音频时长长按并松开；暂停预览态没有独立发送键，
+因此 `send_reviewed()` 仍拒绝从预览态猜测发送。禁止用返回键或盲点预览冒充发送。
+
+`hands/audioout.py` 将 TTS 的裸 PCM 封装为 WAV，并通过 Windows MME 定向播放到
+VB-Audio 的 Render endpoint；实测设备 0 `VB-Audio Virtual Cable` 可播放，设备 1
+`CABLE In 16 Ch` 当前被占用。
 
 ### 4.1 统一入口 `hands/tap.py`
 

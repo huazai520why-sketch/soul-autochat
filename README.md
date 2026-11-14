@@ -198,6 +198,7 @@ python run.py match 3          # 只跑 3 轮匹配
 python run.py bell             # 只盯奇遇铃（别和 daemon 同时开）
 python run.py voice --text "你好"  # 火山 TTS 合成到 data/state/voice_out
 python run.py voice --text "你好" --sid 402857053500884668  # 按该会话记录自动选语气
+python run.py voice-send --text "我在" --sid 402857053500884668  # 当前会话按住录音并松开发送
 ```
 
 ---
@@ -257,7 +258,8 @@ soul-autochat/
 │  ├─ input.py                输入框灌字、发送、三态校验
 │  ├─ pic.py                  发图片
 │  ├─ tts.py                  方舟按量 TTS 合成与原子落盘
-│  └─ voice.py                新版语音模式、录音层、暂停与取消
+│  ├─ voice.py                新版语音模式、按住录音/松开、暂停与取消
+│  └─ audioout.py             PCM→WAV、定向播放到 VB-Cable
 ├─ brain/                     ── 决策层：业务规则
 │  ├─ act.py                  Actor：帧复用、动作后确认、快照缓存
 │  ├─ nav.py                  导航：回到某个 tab（带升级梯子）

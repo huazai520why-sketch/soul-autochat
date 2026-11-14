@@ -1,7 +1,7 @@
 # 目录树
 
 > 2026-11-14 副机生产目录实测。当前运行时 HEAD `47d4440`。
-> 当前约 111 个 Python 文件、24,600 行、1.25 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
+> 当前约 113 个 Python 文件、28,525 行、1.26 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ```text
 soul-autochat/
@@ -39,7 +39,8 @@ soul-autochat/
 │  ├─ input.py                     灌字、发送、ok/unknown/residual 三态确认
 │  ├─ pic.py                       发图片
 │  ├─ tts.py                       方舟按量 TTS 合成、终止码校验、原子保存
-│  └─ voice.py                     新版语音输入/录音层/暂停/取消
+│  ├─ voice.py                     新版语音输入、按住录音/松开、暂停/取消
+│  └─ audioout.py                  PCM→WAV、定向播放到 VB-Cable
 │
 ├─ brain/                          决策层
 │  ├─ __init__.py

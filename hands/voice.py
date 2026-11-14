@@ -11,12 +11,14 @@
 5. 暂停/结束后：`rlVoiceContainer` 播放预览，`btn_delete` 取消，
    `btnChangeText` 转文字。
 
-当前版本的可访问树没有暴露独立的“发送语音”控件。禁止盲点预览或按返回键猜测发送，
-否则可能把空录音发给真人。等确认实际发送手势后再补最后一步。
+用户实测确认：按住“录音”按钮，松开时自动发送。`record_and_release()` 走这条主路径。
+暂停后的预览态仍没有独立发送控件，禁止盲点预览或按返回键猜测发送。
 """
 import time
+import threading
 
 from core.log import get_logger
+from core.device import note_action
 
 log = get_logger("hands.voice")
 
@@ -116,6 +118,42 @@ def review_controls(snap):
     }
 
 
+def record_and_release(actor, speech_seconds, play=None, lead=0.35):
+    """按住“录音”按钮，播完音频后松开；新版 UI 松开自动发送。
+
+    `play` 是同步可调用对象，会在线程里启动，避免阻塞长按。
+    """
+    snap, _ = ensure_voice_mode(actor)
+    rec = _node(snap, RECORD)
+    if rec is None:
+        raise VoiceSendUnconfirmed("语音模式里没有 audio_record_view_optimize")
+    hold_s = max(1.0, float(speech_seconds or 0) + float(lead) + 0.45)
+    result = {"play": None, "error": None}
+
+    def _play_later():
+        try:
+            time.sleep(float(lead))
+            if play is not None:
+                result["play"] = play()
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_play_later, name="voice-audio", daemon=True)
+    thread.start()
+    note_action()
+    try:
+        actor.dev.u2().long_click(rec.center[0], rec.center[1], duration=hold_s)
+    except Exception as exc:
+        raise VoiceSendUnconfirmed("按住录音失败: %r" % (exc,))
+    thread.join(timeout=hold_s + 8.0)
+    if thread.is_alive():
+        raise VoiceSendUnconfirmed("录音期间音频播放线程未结束")
+    if result["error"] is not None:
+        raise VoiceSendUnconfirmed("录音期间播放失败: %r" % (result["error"],))
+    log.info("按住录音 %.1fs 后松开（按新版 UI 应自动发送）", hold_s)
+    return result
+
+
 def send_reviewed(*_args, **_kwargs):
     """发送动作尚未核准：可访问树里没有独立发送控件。"""
     raise VoiceSendUnconfirmed(
@@ -124,5 +162,5 @@ def send_reviewed(*_args, **_kwargs):
 
 __all__ = [
     "VoiceSendUnconfirmed", "ensure_voice_mode", "start_hands_free",
-    "pause", "cancel", "review_controls",
+    "pause", "cancel", "review_controls", "record_and_release",
 ]

@@ -294,6 +294,73 @@ def cmd_voice(text, speaker=None, save_to=None, sid=None):
     return 0
 
 
+def cmd_voice_send(text, speaker=None, sid=None):
+    """在当前会话按住新版“录音”按钮，播放 TTS 后松开自动发送。"""
+    from brain.act import Actor
+    from brain import voice_style as VS
+    from data.imdb import open_account
+    from eyes.page import detect
+    from hands import audioout as AO
+    from hands import tts as T
+    from hands import voice as V
+
+    dev = Device.get()
+    actor = Actor(dev)
+    snap = actor.snap(force=True)
+    if detect(snap) != "chat":
+        print("当前不在聊天会话页，拒绝发送", file=sys.stderr)
+        return 3
+
+    style = None
+    db = None
+    if sid:
+        from brain import pendingq as PQ
+
+        db = open_account(dev, force=True)
+        if not PQ._session_matches(actor, db, sid):
+            print("当前会话身份无法确认为目标 sid，拒绝发送", file=sys.stderr)
+            return 4
+        style = VS.infer_from_db(db, sid)
+        print("语音风格: %s" % style["reason"], file=sys.stderr)
+
+    try:
+        result = T.synthesize(
+            text, speaker=speaker, output_format="pcm", style=style)
+        wav = AO.pcm_to_wav(
+            result["path"], sample_rate=result["sample_rate"])
+        seconds = AO.wav_duration(wav)
+        before = len([
+            n for n in snap.nodes
+            if n.res_id and n.res_id.endswith("voice_bubble")
+            and n.bounds[0] > 400
+        ])
+        hold = V.record_and_release(
+            actor, seconds,
+            play=lambda: AO.play_wav(wav, device_hint="VB-Audio"))
+    except (T.TTSConfigError, T.TTSError, V.VoiceSendUnconfirmed,
+            RuntimeError) as e:
+        print("语音发送失败: %s" % e, file=sys.stderr)
+        return 1
+
+    after_snap = actor.snap(force=True)
+    after = len([
+        n for n in after_snap.nodes
+        if n.res_id and n.res_id.endswith("voice_bubble")
+        and n.bounds[0] > 400
+    ])
+    outcome = "sent" if after > before else "unknown"
+    payload = {
+        "outcome": outcome,
+        "speaker": result["speaker"],
+        "audio_seconds": round(seconds, 2),
+        "wav": str(wav),
+        "play": hold["play"],
+        "style": result["style"],
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if outcome == "sent" else 5
+
+
 def main():
     # 🔴 2026-11-08 21:1x（修复 §79/§80 遗留 P1「daemon.out 中文乱码」）：
     #   core/log.py 早就写了 setup_stdout()，但**全仓库没有任何地方调用它**
@@ -309,7 +376,8 @@ def main():
     ap = argparse.ArgumentParser(description="soul1.0")
     ap.add_argument("cmd", nargs="?", default="check",
                     choices=["check", "screen", "once", "daemon", "watchdog",
-                             "wake", "match", "clear", "pending", "bell", "voice"])
+                             "wake", "match", "clear", "pending", "bell",
+                             "voice", "voice-send"])
     ap.add_argument("n", nargs="?", type=int, default=None)
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--text", default="", help="voice 命令要合成的文本")
@@ -350,6 +418,9 @@ def main():
     if args.cmd == "voice":
         return cmd_voice(args.text, speaker=args.speaker or None,
                          save_to=args.save_to or None, sid=args.sid or None)
+    if args.cmd == "voice-send":
+        return cmd_voice_send(args.text, speaker=args.speaker or None,
+                              sid=args.sid or None)
     return 2
 
 
