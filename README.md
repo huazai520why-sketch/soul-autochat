@@ -63,6 +63,7 @@
 | 主动唤醒沉默老友 | ✅ | `brain/wake.py` |
 | 「灵魂匹配」自动开场白 | ✅ | `brain/match.py` |
 | 语音消息转文字（faster-whisper） | ✅ | `brain/asr.py`、`brain/voice.py` |
+| 方舟语音合成（TTS 生成音频） | ⚠️ | `hands/tts.py`（需 Agent Plan Key；聊天页语音发送尚未启用） |
 | 发图片 | ✅ | `hands/pic.py` |
 | 奇遇铃（弹窗抢救） | ⚠️ | `brain/bell.py`（需要 OCR，见注释） |
 | 多账号轮转（榨干/超时切号） | ⚠️ | `brain/acct.py`（逻辑完整，UI 路径需按版本校准） |
@@ -90,7 +91,7 @@
                             │ 调用
 ┌───────────────────────────▼──────────────────────────────────┐
 │  eyes/    感知层：只读，不点。UI 树 + OCR 两条通道              │
-│  hands/   动作层：只动，不判。点击 / 输入 / 发图                │
+│  hands/   动作层：只动，不判。点击 / 输入 / 发图 / TTS           │
 └───────────────────────────┬──────────────────────────────────┘
                             │ 调用
 ┌───────────────────────────▼──────────────────────────────────┐
@@ -195,6 +196,7 @@ python run.py clear            # 只清一轮红点
 python run.py pending 5        # 只处理 5 个「已读未回」
 python run.py match 3          # 只跑 3 轮匹配
 python run.py bell             # 只盯奇遇铃（别和 daemon 同时开）
+python run.py voice --text "你好"  # 方舟 TTS 合成到 data/state/voice_out
 ```
 
 ---
@@ -213,6 +215,9 @@ python run.py bell             # 只盯奇遇铃（别和 daemon 同时开）
 | `SOUL_FLOW` | 出话流程：`direct`（直连）/ `hybrid` / `fc` | `direct` |
 | `SOUL_PROMPT_V9` | 提示词结构：`1` = 人设+档案进 system | `1` |
 | `SOUL_TENSION_START` | 从几点开始用「夜间档」语气（小时） | `23` |
+| `SOUL_TTS_SPEAKER` | 方舟 Seed-TTS 2.0 音色 ID | 邻家男孩 2.0 |
+| `SOUL_TTS_URL` / `SOUL_TTS_RESOURCE_ID` | Agent Plan TTS HTTP 接口与资源 ID | 方舟官方默认 |
+| `SOUL_TTS_KEY` | Agent Plan 个人版/企业版 Key（也可放 `.tts_key`） | 空 |
 | `SOUL_MY_CONTACT` | 你自己的联系方式（**别写进源码**） | `13800138000`（示例） |
 | `SOUL_IDLE_SWITCH_MIN` | 空闲多少分钟切号 | `30` |
 | `SOUL_RESTART_MIN_GAP` | 两次重启 App 的最小间隔（秒） | `240` |
@@ -249,7 +254,8 @@ soul-autochat/
 ├─ hands/                     ── 动作层：只动，不判
 │  ├─ tap.py                  点击（统一入口，动作后使帧缓存失效）
 │  ├─ input.py                输入框灌字、发送、三态校验
-│  └─ pic.py                  发图片
+│  ├─ pic.py                  发图片
+│  └─ tts.py                  方舟 Agent Plan TTS 合成与原子落盘
 ├─ brain/                     ── 决策层：业务规则
 │  ├─ act.py                  Actor：帧复用、动作后确认、快照缓存
 │  ├─ nav.py                  导航：回到某个 tab（带升级梯子）
@@ -301,7 +307,7 @@ soul-autochat/
 │  ├─ prepare_photos.py       照片进相册（发图前置）
 │  └─ *.ps1                   Windows 计划任务注册脚本
 ├─ scripts/repo_sync.ps1      Git 漂移检查与脱敏扫描
-├─ tests/                     ── 27 个保留验收/回放与离线脚本（t_*.py）
+├─ tests/                     ── 28 个保留验收/回放与离线脚本（t_*.py）
 └─ docs/                      ── 架构与部署文档
 ```
 

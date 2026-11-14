@@ -145,6 +145,16 @@ rows()       → 双闸：行高 ≥ 6.9% 屏高 + 行内有内容
 
 ## 4. 动作层：一次点击发生了什么
 
+### 4.0 语音合成 `hands/tts.py`
+
+`run.py voice --text "..."` 通过火山方舟 Agent Plan HTTP Chunked TTS 生成音频。
+客户端只接受 Agent Plan 个人版/企业版 Key，逐块解析 base64 音频，并且必须收到
+`code=20000000` 终止码才落盘；缺 Key、服务端错误、半截流都不会产生成品文件。
+默认音色为 `zh_male_linjiananhai_uranus_bigtts`（邻家男孩 2.0）。
+
+该模块只负责“文本 → 本地音频”，不负责模拟器录音和聊天页发送。聊天页语音消息还需要
+宿主播放到虚拟声卡、MuMu 麦克风路由和录音 UI 三态确认，不能仅凭 TTS 发声就宣称已发出语音。
+
 ### 4.1 统一入口 `hands/tap.py`
 
 ```python

@@ -10,8 +10,10 @@
     python run.py wake [N]          # 单独跑 N 个唤醒
     python run.py match [N]         # 单独跑 N 轮星球匹配
     python run.py clear             # 单独清一轮红点（进会话必回）
+    python run.py voice --text "你好"  # 火山方舟 Agent Plan TTS，只生成音频
 """
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -263,6 +265,26 @@ def cmd_pending(n=5, dry=False):
     return 0
 
 
+def cmd_voice(text, speaker=None, save_to=None):
+    """用火山方舟 Agent Plan TTS 生成音频，返回结构化结果。"""
+    from hands import tts as T
+
+    try:
+        result = T.synthesize(
+            text,
+            output_dir=save_to,
+            speaker=speaker,
+        )
+    except T.TTSConfigError as e:
+        print("TTS 配置错误: %s" % e, file=sys.stderr)
+        return 2
+    except T.TTSError as e:
+        print("TTS 失败: %s" % e, file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main():
     # 🔴 2026-11-08 21:1x（修复 §79/§80 遗留 P1「daemon.out 中文乱码」）：
     #   core/log.py 早就写了 setup_stdout()，但**全仓库没有任何地方调用它**
@@ -278,9 +300,12 @@ def main():
     ap = argparse.ArgumentParser(description="soul1.0")
     ap.add_argument("cmd", nargs="?", default="check",
                     choices=["check", "screen", "once", "daemon", "watchdog",
-                             "wake", "match", "clear", "pending", "bell"])
+                             "wake", "match", "clear", "pending", "bell", "voice"])
     ap.add_argument("n", nargs="?", type=int, default=None)
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--text", default="", help="voice 命令要合成的文本")
+    ap.add_argument("--speaker", default="", help="voice 命令音色 ID")
+    ap.add_argument("--save-to", default="", help="voice 命令音频输出目录")
     args = ap.parse_args()
 
     # 🔴 2026-11-10（日志缺陷修复）：本文件建了 `log = get_logger("run")` 却一次不用
@@ -312,6 +337,9 @@ def main():
         return cmd_pending(args.n or 5, dry=args.dry)
     if args.cmd == "bell":
         return cmd_bell(once=args.dry)
+    if args.cmd == "voice":
+        return cmd_voice(args.text, speaker=args.speaker or None,
+                         save_to=args.save_to or None)
     return 2
 
 

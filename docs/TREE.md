@@ -1,11 +1,11 @@
 # 目录树
 
 > 2026-11-14 副机生产目录实测。当前运行时 HEAD `47d4440`。
-> 当前约 106 个 Python 文件、24,004 行、1.21 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
+> 当前约 108 个 Python 文件、24,342 行、1.22 MB。完整生产拓扑见 [PROJECT_MAP.md](PROJECT_MAP.md)。
 
 ```text
 soul-autochat/
-├─ run.py                          ★ 唯一入口：check/screen/once/daemon/watchdog/wake/match/clear/pending/bell
+├─ run.py                          ★ 唯一入口：check/screen/once/daemon/watchdog/wake/match/clear/pending/bell/voice
 ├─ requirements.txt                依赖清单
 ├─ LICENSE                         MIT
 ├─ README.md                       项目总览
@@ -37,7 +37,8 @@ soul-autochat/
 │  ├─ __init__.py
 │  ├─ tap.py                       统一点击入口，动作前作废帧缓存
 │  ├─ input.py                     灌字、发送、ok/unknown/residual 三态确认
-│  └─ pic.py                       发图片
+│  ├─ pic.py                       发图片
+│  └─ tts.py                       方舟 Agent Plan TTS 合成、终止码校验、原子保存
 │
 ├─ brain/                          决策层
 │  ├─ __init__.py
@@ -113,7 +114,7 @@ soul-autochat/
 │  ├─ reg_ops_tasks.ps1            注册运维任务
 │  └─ reg_probe.ps1               注册消息探针
 │
-├─ tests/                          27 个保留验收/回放与离线测试
+├─ tests/                          28 个保留验收/回放与离线测试
 │  ├─ _nolog.py
 │  ├─ t_device.py / t_eyes.py / t_chatlist.py
 │  ├─ t_dbcheck.py / t_casepack.py / t_flow_dry.py
@@ -126,7 +127,7 @@ soul-autochat/
 │  ├─ t_flow_preempt.py / t_health_contract.py
 │  ├─ t_lock_health.py / t_metrics.py
 │  ├─ t_pending_ledger.py / t_pending_policy.py
-│  ├─ t_voice_contract.py / t_flow_preempt.py
+│  ├─ t_voice_contract.py / t_tts_contract.py / t_flow_preempt.py
 │  └─ 说明：t_match_loop.py 现仅包装生产模块 brain.match_runner
 │
 ├─ scripts/
@@ -157,6 +158,7 @@ soul-autochat/
 | 改奇遇铃 | `brain/bell.py` |
 | 改匹配/开场白 | `brain/match.py`、`brain/engine/opener.py` |
 | 改唤醒条件 | `brain/wake.py::plan()` |
+| 改主动语音合成 | `hands/tts.py`、`run.py::cmd_voice()` |
 | 改主循环顺序 | `guard/daemon.py::cycle()` |
 | 改计划任务启动 | `tools/silent_launch.py`、`tools/start_daemon.ps1` |
 | App 改版认不出页面 | `eyes/page.py::SIG`、`eyes/uitree.py::TAB_RES` |
