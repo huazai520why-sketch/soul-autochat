@@ -2348,9 +2348,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("末条 %r 短消息，昵称 %r 可用 → 走昵称搜索", txt[:12], (_nick_try or "")[:10])
             # 🔴 2026-11-04（吞吐）：单个人已经耗掉 45s（翻屏 21s + 双击 + dump），
             #   再走搜索（6~30s）就把整轮吃光。记 6 分钟冷却，下一轮再来。
-            if time.monotonic() - _t_cand > 45.0:
-                log.info("这个人已耗时 %.0fs → 本轮放过，6 分钟后再试 uid=%s",
-                         time.monotonic() - _t_cand, to_uid)
+            _soft_s = 120.0 if str(sid) in _VOICE_SIDS else 45.0
+            if time.monotonic() - _t_cand > _soft_s:
+                log.info("这个人已耗时 %.0fs（上限 %.0fs）→ 本轮放过，6 分钟后再试 uid=%s",
+                         time.monotonic() - _t_cand, _soft_s, to_uid)
                 mark_skip(sid, txt, "slow", hours=0.1)
                 out["skipped"] += 1
                 continue
