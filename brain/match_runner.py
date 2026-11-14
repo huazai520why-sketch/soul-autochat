@@ -64,8 +64,7 @@ def main(rounds=0, dry=False):
     quota_done = False
     for i in range(1, max_rounds + 1):
         print("\n========== 第 %d 轮 ==========" % i)
-        snap = a.snap(force=True)
-        pg = detect(snap)
+        snap, pg = M.wait_match_card(a, timeout=12.0)
         if pg != "chat" or not M.has_card(snap):
             print("  当前不是新匹配卡（page=%s），停手；不把普通会话误当匹配" % pg)
             fail.append("第%d轮不是新匹配卡(%s)" % (i, pg))

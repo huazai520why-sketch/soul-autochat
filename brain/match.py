@@ -612,6 +612,19 @@ def next_button(snap):
     return None
 
 
+def wait_match_card(actor, timeout=12.0):
+    """等匹配页从转场帧稳定成 `chat + 匹配卡`，期间不点击。"""
+    deadline = time.time() + max(1.0, float(timeout))
+    last = None
+    while time.time() < deadline:
+        last = actor.snap(force=True)
+        pg = detect(last)
+        if pg == "chat" and has_card(last):
+            return last, "chat"
+        time.sleep(0.8)
+    return last or actor.snap(force=True), detect(last) if last is not None else "unknown"
+
+
 def next_one(actor, max_wait=8.0):
     """点一次左上角「匹配下一个」，只接受页面上出现的新匹配卡。
 
@@ -654,24 +667,11 @@ QUOTA_HINT = "匹配机会已用完"
 
 
 def _dismiss_quota(actor, s):
-    """关掉「额度用完」弹层。back 失败时 fallback 点「关闭」。
-
-    🔴 2026-11-12（HY-10）：额度弹层（卖次数卡）有时 back 关不掉（RN 弹层），
-      原来只 back 一次，关不掉就停在遮罩上 → 下一轮仍见 quota_out → 反复。
-      这里 back 后复查一次：还在弹层就找「关闭」按钮点，再复查，尽力关掉。
-      返回是否已不在弹层。
-    """
-    try:
-        actor.hand.back(settle=1.3)
-    except Exception:
-        pass
-    s2 = actor.snap(force=True)
-    if not quota_out(s2):
-        return True
-    # back 没关掉 → 找「关闭」按钮
+    """只点弹层自己的关闭控件，不按系统返回键。返回是否已关掉。"""
+    s2 = s
     n = None
     for label in ("关闭", "知道了", "我知道了", "取消"):
-        n = s2.find_one(text=label)
+        n = s2.hit(text=label)
         if n is not None:
             break
     if n is not None:
@@ -681,7 +681,7 @@ def _dismiss_quota(actor, s):
                 return True
         except Exception:
             pass
-    log.warning("额度弹层关闭失败（仍残留）→ 交给上层退避")
+    log.warning("额度弹层找不到可点的关闭控件 → 不按系统返回，交给上层退避")
     return False
 
 

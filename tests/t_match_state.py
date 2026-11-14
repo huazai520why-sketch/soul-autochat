@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from brain import match as M  # noqa: E402
+from eyes.page import detect  # noqa: E402
 from eyes.uitree import Node, Snapshot  # noqa: E402
 
 
@@ -67,6 +68,10 @@ class FakeActor:
             return self.frames.pop(0)
         return self.frames[0]
 
+    def wait_page(self, pages, timeout=4.0):
+        s = self.snap(force=True)
+        return s, detect(s)
+
 
 class MatchStateTests(unittest.TestCase):
     def test_entry_quota_is_bound_to_soul_card(self):
@@ -123,6 +128,31 @@ class MatchStateTests(unittest.TestCase):
         self.assertEqual("next", how)
         self.assertEqual("chat", pg)
         self.assertEqual("长公主", M.read_card(s)["nick"])
+
+    def test_wait_match_card_ignores_transition_frame(self):
+        transition = snap([node("匹配中", bounds=(100, 700, 300, 760))])
+        ready = card_snap("慢慢")
+        actor = FakeActor([transition, ready])
+        s, pg = M.wait_match_card(actor, timeout=2.0)
+        self.assertEqual("chat", pg)
+        self.assertTrue(M.has_card(s))
+
+    def test_profile_uses_in_app_back_without_actor_back(self):
+        initial = card_snap("阿七")
+        profile = snap([
+            node("", desc="返回", res="profile_back", bounds=(20, 70, 80, 130), clickable=True),
+            node("灵魂画像", bounds=(40, 350, 160, 390)),
+            node("IP属地:重庆", bounds=(40, 160, 240, 200)),
+            node("Ta的展品馆", bounds=(40, 600, 240, 640)),
+            node("阿七", bounds=(300, 90, 430, 130)),
+        ])
+        returned = card_snap("阿七")
+        actor = FakeActor([initial, profile, returned])
+        prof, ok = M.visit_profile(actor)
+        self.assertTrue(ok)
+        self.assertEqual("阿七", prof["nick"])
+        labels = [t[0] for t in actor.hand.taps]
+        self.assertIn("返回", labels)
 
 
 if __name__ == "__main__":
