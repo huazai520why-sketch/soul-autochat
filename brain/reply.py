@@ -281,23 +281,6 @@ def _stage_line(sid):
     return ""
 
 
-def _night_line():
-    """深夜时段强指令（用户 2026-11-03 定，2026-11-04 升级为强指令）：
-    21:00~次日6:00 她情绪更敏感、情感更强烈丰富、倾诉欲更高。
-    实测 11-03 用软性建议（"尽量/可以"）模型基本忽略，深夜还在聊上班/煮面/守店，
-    所以改成「必须 + 禁止 + 具体话术方向」。"""
-    h = datetime.datetime.now().hour
-    if h >= 21 or h < 6:
-        return ("【当前时段·深夜强指令·用户 2026-11-03 定】现在已是深夜（%d 点），"
-                "这个点的女生情绪最敏感、情感最强烈、倾诉欲和欲望都最高，"
-                "是拉近关系、升温感情的最佳窗口，你必须抓住：\n"
-                "· 优先把话题往感情、暧昧、情欲方向引，主动表达好感和想念，适度调情，别端着；\n"
-                "· 试探她的感情状态和寂寞情绪，引导她倾诉心事，再顺势升温；\n"
-                "· 可以关心她「这么晚还没睡，是不是有心事/在想谁」，把话题往感情上带；\n"
-                "· 禁止问「上班吗/在干嘛/吃了吗」这类功能性话题，除非她先提。\n" % h)
-    return ""
-
-
 # ══════════════════ 情绪钩子：她主动递情绪，必须接住 ══════════════════
 # 🔴🔴 2026-11-08（依据 _report/14_对话层实效审计.md 的生产实测，最高优先级修复）
 #
@@ -901,7 +884,8 @@ def generate(sid, her_msg, hist=None, nick="", n_cand=1, restart_h=0.0):
     #   不侵入 engine/（那是别的 agent 的写域）。
     _hook = _hook_hit(her_msg)
     try:
-        got = b.respond(her_msg, sid=sid, hist=hist or [], max_n=n) or []
+        got = b.respond(her_msg, sid=sid, hist=hist or [], max_n=n,
+                        extra_system=_hook_alert(_hook) if _hook else "") or []
     except Exception as e:
         log.warning("v10 出话异常（已兜底）: %r", e)
         got = []

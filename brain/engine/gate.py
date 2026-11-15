@@ -124,7 +124,7 @@ _COME_NEG_RE = re.compile(r"约|见面|见个|我去|我过来|我来")
 _PAREN_RE = re.compile(r"[（(][^）)]{1,30}[）)]|\*[^*\n]{1,20}\*")
 # ── 模型爱带的前缀/标签 ──
 _LABEL_RE = re.compile(
-    r"^\s*(?:话术\s*\d|回复|答案|候选|第[一二三]句|句子)\s*[:：]\s*")
+    r"^\s*(?:话术\s*\d|回复|答案|候选|第[一二三]句|句子|我|她)\s*[:：]\s*")
 _QUOTE_STRIP = "\"'“”‘’「」『』"
 
 # ── 长度 ──
@@ -159,6 +159,18 @@ def hard_hit(t):
         if w in s:
             return w
     return ""
+
+
+# ── 完整手机号：站外导流最高风险，不分昼夜一律硬拦 ──
+# 2026-11-15（T-09）：她给完整手机号 = 要把对话拉出站外（微信/电话），
+# 账号级风险。微信/QQ 词已软拦（可改写），手机号**必须硬拦**（整条作废）。
+_PHONE_RE = re.compile(r"1[3-9]\d{9}")
+
+
+def phone_hit(t):
+    """返回命中的完整手机号；没命中返回空串。"""
+    m = _PHONE_RE.search(str(t or ""))
+    return m.group(0) if m else ""
 
 
 def soft_hit(t):
@@ -426,6 +438,11 @@ def check(text, recent=None, allow_soft=True):
     w = hard_hit(t)
     if w:
         return False, "红线词(%s)" % w
+    # 🔴 2026-11-15（T-09）：完整手机号 → 站外导流最高风险，无条件硬拦
+    #   （不分昼夜，先于下方 _is_night_now() 判断，任何时段都拦）。
+    ph = phone_hit(t)
+    if ph:
+        return False, "完整手机号(站外导流:%s)" % ph
     # 🔴 2026-11-13：人设漂移（滴酒不沾）。与 persona.py / rules.py 同步的代码硬闸。
     dw = drink_persona_hit(t)
     if dw:
@@ -517,5 +534,6 @@ def to_messages(text, max_n=2):
 __all__ = ["HARD_BAN", "SOFT_BAN", "EXPLICIT_WORDS", "DRINK_PERSONA_WORDS",
            "MAX_CHARS", "IDEAL_MAX",
            "clean", "hard_hit", "soft_hit", "explicit_hit", "drink_persona_hit",
+           "phone_hit",
            "solicit_hit", "promise_hit", "reverse_hit", "invite_hit",
            "commit_hit", "cold_ack_hit", "dup_hit", "check", "to_messages"]

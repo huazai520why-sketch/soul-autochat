@@ -349,6 +349,22 @@ def cmd_voice_send(text, speaker=None, sid=None):
         and n.bounds[0] > 400
     ])
     outcome = "sent" if after > before else "unknown"
+    # 2026-11-15（S8 / §20遗留闭环）：UI 气泡计数只证「界面有新气泡」，
+    #   缺「数据库里真生成本人 msgType=5 语音消息」的外部落地证据。
+    #   带 sid 时回读 chatmsg 末条：sender=本人 且 msgType=5 → 真实落地。
+    voice_db = ""
+    if sid and db is not None:
+        try:
+            _vm, _vsrc = db.latest(sid)
+            if _vm is not None and int(_vm.msg_type) == 5 \
+                    and str(_vm.sender) == str(db.uid):
+                voice_db = "msgType5-confirmed"
+                outcome = "sent"
+            else:
+                voice_db = "msgType5-missing(sender=%s type=%s)" % (
+                    getattr(_vm, "sender", None), getattr(_vm, "msg_type", None))
+        except Exception as _ve:
+            voice_db = "msgType5-err:%r" % (_ve,)
     payload = {
         "outcome": outcome,
         "speaker": result["speaker"],
@@ -356,6 +372,7 @@ def cmd_voice_send(text, speaker=None, sid=None):
         "wav": str(wav),
         "play": hold["play"],
         "style": result["style"],
+        "voice_db": voice_db,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if outcome == "sent" else 5

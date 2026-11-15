@@ -140,7 +140,9 @@ TIMEOUT_RETRY_H = 0.17
 #   用户口径「还是不行就放弃或者跳过」——但台账 key 含她末条文本，
 #   她一发新消息就会自动重新给机会，所以这里只挡「同一句反复撞墙」。
 NO_CUE_H = float(os.environ.get("SOUL_NOCUE_COOL_MIN", "30") or 30) / 60.0
-ENTER_RETRY_H = 0.5
+ENTER_RETRY_H = 0.1   # 2026-11-15（F03③）：进会话失败从30min降到6min再试，减少白烧
+#   原 0.5h 太长，进会话失败后 6 分钟重试，避免 UI 停在 unknown 反复白烧；
+#   已由 flow._enter 前置校验+终判（F03①/②）兜底，短冷却不会误冻真会话。
 # 🔴 2026-11-04（A批提速）：短消息/纯表情 find_row 落空后不搜索，短冷却（30分钟）
 #   她再发新消息（新红点）下一轮 find_row 就能命中，不会永久失联。
 SHORT_RETRY_H = 0.5

@@ -48,16 +48,41 @@ def recent_mine(sid, n=4):
     return out[-n:]
 
 
+def _chat_fallback(msgs, her_msg="", sid="", **kw):
+    """出话调用统一入口：方舟不可用且本地可用时回落本地 Ollama。
+
+    只负责「拿到一条文本」；拿不到返回 None（上层兜底）。
+    回落用 0.9 温度 / 2048 上限（出话侧），与分析侧 0.3/1200 区分。
+    不传 her_msg/sid 给 ollama_chat（它的签名只有 messages/timeout/temperature/max_tokens/model）。
+    """
+    raw = llm.ark_chat(msgs, her_msg=her_msg, sid=sid, **kw)
+    if raw:
+        return raw
+    if not llm.analyze_available():
+        return None
+    try:
+        fb = llm.ollama_chat(msgs, temperature=0.9, max_tokens=2048)
+    except Exception as e:
+        llm.log.warning("出话本地回落异常: %r", e)
+        return None
+    if fb:
+        llm.log.info("出话方舟不可用→本地回落: %r", fb[:80])
+    return fb
+
+
 def _call(system, user, her_msg, sid=""):
     msgs = [{"role": "system", "content": system},
             {"role": "user", "content": user}]
-    return llm.ark_chat(msgs, her_msg=her_msg, sid=sid)
+    return _chat_fallback(msgs, her_msg=her_msg, sid=sid)
 
 
-def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
+def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None,
+           extra_system=""):
     """返回 [要发的句子]（1~max_n 条）；拿不到返回 None。
 
     参数与旧 `brain_reply` 对齐，方便 reply.py 平替。
+    `extra_system` 是**附加强指令**（如回复侧的情绪钩子警报），
+    拼在 system 之后、组装 msgs 前生效，让模型在生成时就得到引导。
     """
     max_n = max_n or MAX_N
     her_msg = (her_msg or "").strip()
@@ -71,6 +96,8 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
         llm.log.warning("prompt 组装失败: %r", e)
         return None
 
+    if extra_system:
+        system = system + "\n\n" + extra_system
     raw = _call(system, user, her_msg, sid)
     if not raw:
         return None
@@ -136,11 +163,12 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None):
                  "别问她会怎么想。"
                  "**注意：不要说「在呢」「刚看到」「嗯嗯，在的」这类零信息应答，"
                  "那是灭火句，会让她觉得我在敷衍。**")
-    msgs = [{"role": "system", "content": system},
+    retry_system = system + "\n\n" + extra_system if extra_system else system
+    msgs = [{"role": "system", "content": retry_system},
             {"role": "user", "content": user},
             {"role": "assistant", "content": raw[:200]},
             {"role": "user", "content": retry}]
-    raw2 = llm.ark_chat(msgs, her_msg=her_msg, sid=sid, temperature=0.8)
+    raw2 = _chat_fallback(msgs, her_msg=her_msg, sid=sid, temperature=0.8)
     if raw2:
         for c in gate.to_messages(raw2, 1):
             ok, why = gate.check(c, recent)
