@@ -111,6 +111,75 @@ def last_switch_ago_min():
     return (time.time() - ts) / 60.0 if ts else 1e9
 
 
+# ---------------- 切号冷却（P1-B7，SWITCH_COOL_H 接线） ----------------
+# 🔴 2026-11-15（P1-B7）：SWITCH_COOL_H=4 原来只在定义处被引用，无任何代码读它
+#   做「切走后 4h 内不切回该号」判定。这里显式实现：
+#     · _note_switch(before, after)：切号成功时记 switch_from / switch_to / switch_ts
+#     · _target_cool_left(uid)：查「目标号 uid 是否在冷却期」，返回剩余分钟（0=不在冷却）
+def _note_switch(before, after):
+    """切号成功后记录「从 before 切到 after」。"""
+    try:
+        d = _load()
+        d["switch_from"] = str(before or "")
+        d["switch_to"] = str(after or "")
+        d["switch_ts"] = time.time()
+        _save(d)
+        log.info("切号冷却记录：%s -> %s（%.0fh 内不切回）",
+                 before, after, SWITCH_COOL_H)
+    except Exception as e:
+        log.debug("记切号冷却异常（不影响切号）: %r", e)
+
+
+def _target_cool_left(uid):
+    """目标号 uid 是否还在「切走后 SWITCH_COOL_H 内不切回」冷却期。
+
+    返回剩余冷却分钟；0 表示不在冷却。冷却对象 = **刚离开的号**（switch_from）：
+    只有目标 uid == 刚离开的号才命中，4h 内阻止切回它（防高频来回切）。
+    """
+    try:
+        d = _load()
+        sf = str(d.get("switch_from") or "")
+        ts = float(d.get("switch_ts") or 0)
+        if not sf or not ts:
+            return 0.0
+        if str(uid) != sf:
+            return 0.0                     # 目标不是刚离开的号 → 不受冷却
+        return max(0.0, SWITCH_COOL_H * 60.0 - (time.time() - ts) / 60.0)
+    except Exception:
+        return 0.0
+
+
+def _switch_cool_blocked(db):
+    """切号入口冷却检查：当前号是否在「刚切走那个号」的 4h 冷却里。
+
+    只有 2 个号时，切号目标 = 刚离开的号（switch_from）。当当前号 == switch_to
+    （刚切到的号）且 switch_from 冷却未到 → 想切回它 → 阻止。
+    返回 (blocked, left_min)。
+    """
+    try:
+        d = _load()
+        sf = str(d.get("switch_from") or "")
+        st_to = str(d.get("switch_to") or "")
+        ts = float(d.get("switch_ts") or 0)
+        if not sf or not ts or not st_to:
+            return False, 0.0
+        # 当前号（db.uid 或台账 cur_uid）
+        _cur = ""
+        try:
+            _cur = str(db.uid)
+        except Exception:
+            _cur = str(d.get("cur_uid") or "")
+        if not _cur:
+            return False, 0.0
+        # 只有当前号 == 刚切到的号，才会想切回刚离开的号
+        if _cur != st_to:
+            return False, 0.0
+        left = max(0.0, SWITCH_COOL_H * 60.0 - (time.time() - ts) / 60.0)
+        return (left > 0), left
+    except Exception:
+        return False, 0.0
+
+
 # ---------------- 三条件评估 ----------------
 def read_quota(actor):
     """读星球页**灵魂匹配**卡片的「今日剩余 N 次」。返回 (剩余, 是否读到)。
@@ -348,6 +417,12 @@ def maybe_switch(actor, dev, db, st, force_quota=False):
     _bo = _switch_backoff_left()
     if _bo > 0:
         return False, "上次切号失败，退避中（剩 %.0f 分钟）" % _bo
+    # 🔴 2026-11-15（P1-B7）：切走后 4h 内不切回该号（SWITCH_COOL_H 接线）。
+    #   只有 2 个号时目标 = 刚离开的号，冷却期内阻止切回，防高频来回切。
+    _cbl, _cmin = _switch_cool_blocked(db)
+    if _cbl:
+        return False, "刚切走那个号还在 %.0f 分钟冷却（SWITCH_COOL_H=%.0fh 内不切回）" % (
+            _cmin, SWITCH_COOL_H)
 
     # 空闲切号的时间基准 + 当前在线时长
     idle_min = (time.time() - float(st.get("last_msg_ts") or 0)) / 60.0
@@ -397,6 +472,12 @@ def maybe_switch(actor, dev, db, st, force_quota=False):
         d["dry_since"] = 0
         d["last_switch_try"] = 0            # 成功 → 清掉失败退避
         _save(d)
+        # 🔴 2026-11-15（P1-B7）：切号成功记录 switch_from/switch_to/switch_ts，
+        #   供 _target_cool_left 做「切走后 4h 不切回该号」判定（maybe/force 同接）。
+        try:
+            _note_switch(d.get("prev_uid"), d.get("cur_uid"))
+        except Exception as _e:
+            log.debug("记切号冷却异常（不影响切号）: %r", _e)
         st["dry_since"] = 0
         st["last_match"] = 0
         st["last_wake"] = 0
@@ -423,6 +504,11 @@ def force_switch_if_due(actor, dev, db, st):
     _bo = _switch_backoff_left()
     if _bo > 0:
         return False, "上次切号失败，退避中（剩 %.0f 分钟）" % _bo
+    # 🔴 2026-11-15（P1-B7）：强制切号也受 4h 冷却约束（切走后 4h 内不切回该号）。
+    _cbl, _cmin = _switch_cool_blocked(db)
+    if _cbl:
+        return False, "刚切走那个号还在 %.0f 分钟冷却（SWITCH_COOL_H=%.0fh 内不切回）" % (
+            _cmin, SWITCH_COOL_H)
     oh = online_hours()
     if oh < FORCE_SWITCH_H:
         return False, "在线 %.1fh（<%.0fh）" % (oh, FORCE_SWITCH_H)
@@ -437,6 +523,12 @@ def force_switch_if_due(actor, dev, db, st):
         d["dry_since"] = 0
         d["last_switch_try"] = 0            # 成功 → 清掉失败退避
         _save(d)
+        # 🔴 2026-11-15（P1-B7）：切号成功记录 switch_from/switch_to/switch_ts，
+        #   供 _target_cool_left 做「切走后 4h 不切回该号」判定（maybe/force 同接）。
+        try:
+            _note_switch(d.get("prev_uid"), d.get("cur_uid"))
+        except Exception as _e:
+            log.debug("记切号冷却异常（不影响切号）: %r", _e)
         st["dry_since"] = 0
         st["last_match"] = 0
         st["last_wake"] = 0

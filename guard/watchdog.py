@@ -60,6 +60,18 @@ def read_pid():
         return 0
 
 
+def clear_pid_file():
+    """删掉 daemon.pid 文件（missing_ok，删除失败吞掉）。
+
+    🔴 2026-11-15（P1-B6）：check() 杀完卡死 daemon 后不清 daemon.pid，
+    下一轮 read_pid() 读到死 pid → daemon_alive() 判「pid 已死」→ 反复拉起失败。
+    """
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        log.debug("删 daemon.pid 失败（不影响拉起）: %r", e)
+
+
 def write_pid(pid):
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(pid), "utf-8")
@@ -102,7 +114,10 @@ def daemon_alive():
     if pid and lock._alive(pid):
         return True, "pid=%s 活着（锁空，疑似未持锁）" % pid
     if pid:
-        return False, "pid=%s 已死" % pid
+        # 🔴 2026-11-15（P1-B6）：读到死 pid（进程已不在）时主动删 pid 文件，
+        #   否则下一轮 check() 反复读到同一死 pid → 判「不在」→ 反复拉起失败。
+        clear_pid_file()
+        return False, "pid=%s 已死（已清 pid 文件）" % pid
     return False, "没有 pid 记录"
 
 
@@ -179,6 +194,9 @@ def check():
                             subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                            capture_output=True, timeout=30, check=False)
                             log.warning("已强杀卡死 daemon pid=%s，下一轮检查会重新拉起", pid)
+                            # 🔴 2026-11-15（P1-B6）：杀完清掉 daemon.pid，
+                            #   避免下一轮 read_pid() 读到这个死 pid 反复判「不在」。
+                            clear_pid_file()
                         except Exception as e:
                             log.error("强杀卡死 daemon 失败: %r", e)
                 try:

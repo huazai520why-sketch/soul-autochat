@@ -296,6 +296,11 @@ def _descend_to_rows(snap, root):
     不再额外要求 scrollable/same_box —— 因为外壳链上 3 层都是普通 ViewGroup/
     RelativeLayout（不可滚动、但 bounds 完全一致），旧判据在这里 break 掉了，
     导致下钻形同虚设。层数上限 6 层足够覆盖实测的 4 层，且能防环。
+
+    🔴 2026-11-15（P2-B10）：转场帧/单行列表时 len(kids)==1，原逻辑直接返回该层
+      直接子节点 → rows() 只拿到 1 行 → 判 unknown → 反复 back/重启死循环。
+      现在若 len(kids)==1 且该唯一子节点仍有子节点（未到底），继续下钻
+      （上限 6 不变），让单行列表也能解析出真正的行容器。
     """
     node = root
     for _ in range(6):
@@ -304,7 +309,11 @@ def _descend_to_rows(snap, root):
             return kids
         if len(kids) != 1:
             break                            # 0 个孩子：到底了
-        node = kids[0]                       # 只有一个孩子 → 继续下钻
+        # 🔴 2026-11-15（P2-B10）：唯一孩子且它还有子节点 → 继续下钻；
+        #   唯一孩子已是叶子（无子节点）→ 它本身就是行容器，返回它。
+        if not _kids_of(snap, kids[0]):
+            return kids
+        node = kids[0]
     return _kids_of(snap, node)
 
 

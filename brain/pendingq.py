@@ -1170,6 +1170,19 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
             continue
 
+        # 🔴 2026-11-15（用户指令2「无回复率高的人纳入冷却」）—— P0-A3：提前到状态机过滤之前。
+        #   设备未读硬放行（上面 continue）已处理；此处对「非设备未读」会话评估 noreply_high。
+        #   放在状态机 AWAITING/FOLLOWING/ARCHIVED 之前，避免这些分支 skip 掉评估机会。
+        #   我方发过消息但她长期没回（reply_state 判据）→ 冷却，等她发新消息（末条文本变 →
+        #   should_skip 自动失效）。
+        if _is_noreply_high(sid) and not should_skip(sid, txt):
+            mark_skip(sid, txt, "noreply_high", hours=NOREPLY_COOL_H)
+            scan_stats["cooldown"] += 1
+            scan_stats["cooldown:noreply_high"] += 1
+            log.info("无回复率高 sid=%s → 冷却 %.1fh（我方最后发完超 %.1fh 她没回，减少白烧）",
+                     sid, NOREPLY_COOL_H, NOREPLY_H)
+            continue
+
         # 🔴 2026-11-10 §104：状态机取代「纯文本 old==cur / L2 末行是我」判定。
         #    11-10 夜班实测：这两句误判「被判已回」142 次、跳过已回会话 1549 次 ——
         #    她再发一句一模一样的「哈哈哈」就被当成回过，永久漏回。
@@ -1208,15 +1221,9 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 continue
 
         # 🔴 2026-11-15（用户指令2「无回复率高的人纳入冷却」）：
-        #   我方发过消息但她长期没回（reply_state 判据），且非设备未读（上面硬放行已处理）。
-        #   这类会话反复白烧，冷却后等她发新消息（末条文本变 → should_skip 自动失效）。
-        if _is_noreply_high(sid) and not should_skip(sid, txt):
-            mark_skip(sid, txt, "noreply_high", hours=NOREPLY_COOL_H)
-            scan_stats["cooldown"] += 1
-            scan_stats["cooldown:noreply_high"] += 1
-            log.info("无回复率高 sid=%s → 冷却 %.1fh（我方最后发完超 %.1fh 她没回，减少白烧）",
-                     sid, NOREPLY_COOL_H, NOREPLY_H)
-            continue
+        #   noreply_high 检查已**提前**到状态机过滤之前（见上方 1172 行前的块）。
+        #   原 1210-1219 的重复块已删除；这里不再评估，避免状态机 AWAITING/FOLLOWING
+        #   分支 skip 掉该评估机会。
 
         if should_skip(sid, txt):
             _r = _LAST_SKIP.get(str(sid)) or {}
@@ -1455,7 +1462,14 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
     publish = sig != _CAND_SCAN_LOG.get("sig") or now - float(_CAND_SCAN_LOG.get("ts") or 0) >= 60
     msg = (
         "候选扫描汇总：源 %d → 有效 %d；归档 %d、状态机 %d、冷却 %d、过期 %d"
-        % (sig[0], sig[1], sig[2], sig[3], sig[4], sig[5])
+        "；系统 %d、我方末条 %d、过旧 %d、非文本 %d、空文本 %d、已回 %d"
+        % (sig[0], sig[1], sig[2], sig[3], sig[4], sig[5],
+           int(scan_stats.get("system", 0) or 0),
+           int(scan_stats.get("mine_last", 0) or 0),
+           int(scan_stats.get("too_old", 0) or 0),
+           int(scan_stats.get("nontext", 0) or 0),
+           int(scan_stats.get("empty", 0) or 0),
+           int(scan_stats.get("replied", 0) or 0))
     )
     (log.info if publish else log.debug)(msg)
     if publish:
@@ -1468,6 +1482,12 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             state_skip=sig[3],
             cooldown=sig[4],
             stale=sig[5],
+            system=int(scan_stats.get("system", 0) or 0),
+            mine_last=int(scan_stats.get("mine_last", 0) or 0),
+            too_old=int(scan_stats.get("too_old", 0) or 0),
+            nontext=int(scan_stats.get("nontext", 0) or 0),
+            empty=int(scan_stats.get("empty", 0) or 0),
+            replied=int(scan_stats.get("replied", 0) or 0),
             cooldown_reasons=reasons,
             returned=min(len(merged), int(limit or 0)),
             uid=str(getattr(db, "uid", "") or ""),

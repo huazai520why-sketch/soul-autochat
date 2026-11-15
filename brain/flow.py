@@ -606,7 +606,7 @@ def fallback_line(her_msg=""):
     return random.choice(FALLBACK_LINES)
 
 
-def _send_lines(actor, lines, nick, page_checked=False, sid=""):
+def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
     """依次发出多条。返回 (成功条数, 错误说明)。
 
     page_checked=True：调用方**刚**用 wait_page 确认过是 chat 页、
@@ -715,8 +715,53 @@ def _send_lines(actor, lines, nick, page_checked=False, sid=""):
                     inp.clear()
                     return sent, "第%d条确认未发出（输入框仍有内容）" % (i + 1)
                 if not _ok:
-                    log.warning("[%s] 第%d条发送确认读不到输入框 → 按已发出记账（防重复）",
-                                nick, i + 1)
+                    # 🔴 2026-11-15（P0-B3）：unknown ≠ 已发出。原来按「已发出记账」，
+                    #   若实际没发出则静默丢失（但 replied 计数+1）。改：查库确认
+                    #   「我这条 text 是否落库」——落库才 sent+=1；未落库 → clear+重试。
+                    #   注意防重复：unknown 可能是真发了只是转场帧，落库校验正好把它
+                    #   从「未落库→重发」里摘出来，避免重复发送。
+                    _landed = False
+                    try:
+                        _needle = (line or "").strip()
+                        if _needle and sid:
+                            # 优先实时查设备库（最新），失败再回落本地 db.last_message。
+                            try:
+                                from data import imdb as _IM2
+                                _uid2 = _IM2.current_uid(actor.dev)
+                                _nm2 = _IM2._db_name_for_uid(actor.dev, _uid2)
+                                if _nm2:
+                                    _raw2 = _IM2._dev_sql(
+                                        actor.dev, _nm2,
+                                        "select ifnull(text,'') from chatmsg where "
+                                        "sessionId='%s' order by localTime desc limit 1"
+                                        % str(sid), timeout=8) or ""
+                                    _ln2 = ""
+                                    for _x in _raw2.replace("\r", "").splitlines():
+                                        if _x.strip():
+                                            _ln2 = _x.strip()
+                                    if _ln2 and _needle in _ln2:
+                                        _landed = True
+                            except Exception as _e2:
+                                log.debug("unknown 实时库校验异常（回落本地库）: %r", _e2)
+                            if not _landed and db is not None:
+                                try:
+                                    _lm = db.last_message(sid)
+                                    if _lm is not None:
+                                        _txt = (_lm.text or "").strip()
+                                        _ct = (_lm.content or "").strip()
+                                        if _needle in _txt or _needle in _ct:
+                                            _landed = True
+                                except Exception as _e3:
+                                    log.debug("unknown 本地库校验异常: %r", _e3)
+                    except Exception as _e:
+                        log.debug("unknown 落库校验异常（按未落库重试）: %r", _e)
+                    if not _landed:
+                        try:
+                            inp.clear()
+                        except Exception:
+                            pass
+                        return sent, "第%d条发送确认未知且库未落库 → 清空重试" % (i + 1)
+                    log.info("[%s] 第%d条unknown但库已落库 → 按已发出记账", nick, i + 1)
                     # 🔴 2026-11-15 上午复查（B-10，P2）：unknown 后页面可能已转场；
                     #   直接灌下一条会对着别的页面灌字（实测「第2条灌字失败(None)」
                     #   成串跟在 unknown 后面）。先确认仍在 chat 再继续。
@@ -903,7 +948,7 @@ def _reply_and_send(actor, db, out, dry_run):
     # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
     # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
     sent_n, err = _send_lines(actor, out.lines, out.nick,
-                              page_checked=not _pic_sent, sid=out.sid or "")
+                              page_checked=not _pic_sent, sid=out.sid or "", db=db)
     if sent_n:
         out.sent = True
         # 2026-11-14 夜审修复（B-04，P1）：flow 红点路径原来不写 replied.json

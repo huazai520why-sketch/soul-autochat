@@ -166,7 +166,12 @@ def count_restart_app(window=LOOP_WINDOW):
 def adb_ok():
     try:
         r = subprocess.run([ADB, "devices"], capture_output=True, timeout=20)
-        return "127.0.0.1:16384\tdevice" in r.stdout.decode("utf-8", "replace")
+        # 🔴 2026-11-15（P2-11）：原来 `"127.0.0.1:16384\tdevice" in stdout` 要求
+        #   严格 tab，adbf 输出含 \r 或把 tab 换成空格/多空格时判 False → 误判掉线
+        #   → 反复 adb connect。改用正则：IP 与 device 之间容忍空格/tab（\s+），
+        #   且忽略行尾 \r。
+        _out = r.stdout.decode("utf-8", "replace")
+        return re.search(r"127\.0\.0\.1:16384\s+device", _out) is not None
     except Exception:
         return False
 

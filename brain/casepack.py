@@ -160,20 +160,29 @@ def find_sid(db, text, device=None, tries=3):
       ② 曾经「反查不到就退化为 session 表最新一条」—— 结果第 2 轮的新消息还没
          入库时拿到了第 1 轮的会话，把 B 的资料写进 A 的案情包（串号）。
          **案情包写错人比不写更糟**，所以只接受唯一文本命中。
+
+    🔴 2026-11-15（P2-5）：原实现 L170-176 仅在 `device is not None and i>0` 时
+      强拉库 —— 调用方若传 device=None（很多调用点），3 次重试全用同一份旧镜像，
+      刚发的开场白永远查不到 → 建档失败。现在**强制** find_sid 内部在每次重试
+      （i>0）自行 open_account(device, force=True)，不依赖调用方传 device。
     """
     import time
 
     kw = (text or "").strip()[:14]
     if len(kw) < 4:
         return None
+    # 🔴 2026-11-15（P2-5）：调用方可能传 device=None（很多调用点），此时原逻辑
+    #   `if device is not None and i>0` 永不成立 → 3 次重试用同一份旧镜像。
+    #   统一取 `_dev = device or getattr(db, "dev", None)`：IMDB 已挂载 .dev 属性，
+    #   即使调用方不传也能拿到设备做强制重拉。
+    _dev = device or getattr(db, "dev", None)
     for i in range(tries):
-        if device is not None and i > 0:
+        if _dev is not None and i > 0:
             try:
                 from data import imdb
-                # 🔴 2026-11-15 上午复查（C09，P1）：重试原来不带 force，open_account
-                #   走 300s 缓存 → 3 次重试看到同一份旧镜像，刚发的开场白永远查不到
-                #   （凌晨实证 8/11 条反查失败丢档案）。改为每次重试强制重拉。
-                db = imdb.open_account(device, force=True)
+                # 🔴 2026-11-15（P2-5）：每次重试都强制重拉（force=True），
+                #   不依赖调用方传 device；db.dev 兜底取设备。
+                db = imdb.open_account(_dev, force=True)
             except Exception as e:
                 log.warning("重新拉库失败: %r", e)
         try:

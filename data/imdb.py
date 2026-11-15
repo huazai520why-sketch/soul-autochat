@@ -915,6 +915,8 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
     # 简单清理：只留最近 keep 份库（按 mtime）
     files = sorted(dest_dir.glob("*.db*"), key=lambda p: p.stat().st_mtime, reverse=True)
     for p in files[keep * 3:]:
+        if p.name.endswith(".keep"):
+            continue
         try:
             p.unlink()
         except OSError:
@@ -1054,7 +1056,7 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
         try:
             healthy = _clean(device.text(
                 'sqlite3 "%s/%s" "select 1" 2>&1'
-                % (DB_DIR_ANDROID, dbname, sql), timeout=timeout))
+                % (DB_DIR_ANDROID, dbname), timeout=timeout))
             if healthy.strip() == "1":
                 _mark(True)
                 return out          # 真的是 0 行，原样返回 ""（带 ok=True）
@@ -1064,8 +1066,8 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
         pass
     # ② 退回 su -c（兼容非 root adb 环境）
     try:
-        raw2 = device.text('su -c \'sqlite3 "%s/%s" "%s"\' 2>&1'
-                           % (DB_DIR_ANDROID, dbname, sql), timeout=timeout)
+        raw2 = device.text('su -c \'sqlite3 "%s/%s" "select 1"\' 2>&1'
+                           % (DB_DIR_ANDROID, dbname), timeout=timeout)
         out2 = _clean(raw2)
         if out2:
             _mark(True)

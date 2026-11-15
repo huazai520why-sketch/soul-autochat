@@ -83,7 +83,12 @@ def allow(
         #   ts<=old 保护，旧消息不会误清），不会误伤。
         if not my_last_ts_ms and _sends:
             try:
-                my_last_ts_ms = max(float(x) for x in _sends) * 1000.0
+                # 🔴 2026-11-15（P1-7）：sends 台账可能含 0 值（占位/异常写入），
+                #   max() 会把 0 当真实发送时刻 → my_last_ts=0 → AWAITING 判据误判
+                #   （0 远早于 her_ts，反而认为我没回过）。过滤 >0 再取 max。
+                _pos = [float(x) for x in _sends if float(x) > 0]
+                if _pos:
+                    my_last_ts_ms = max(_pos) * 1000.0
             except Exception:
                 pass
         if _her <= 0:

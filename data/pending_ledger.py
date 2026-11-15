@@ -101,9 +101,36 @@ def load_replied():
     return out
 
 
+def _expire_replied(data, now=None):
+    """对 `_REPLIED` 做一次过期收缩（复用 load_replied 同款 7 天 / REPLIED_GAP*4 规则）。
+
+    只删过期条目，不动未过期条目；返回收缩后的 dict，并同步更新传入的 dict 本身，
+    保证同进程内 recently_replied() 读到的仍是同一份（一致性不被破坏）。
+    """
+    now = time.time() if now is None else float(now)
+    out = {}
+    for k, v in (data or {}).items():
+        try:
+            if isinstance(v, dict):
+                ts = float(v.get("ts") or 0)
+                if ts and now - ts < 7 * 86400:
+                    out[str(k)] = v
+            else:
+                ts = float(v)
+                if now - ts < REPLIED_GAP * 4:
+                    out[str(k)] = {"text": "", "ts": ts}
+        except Exception:
+            continue
+    if out is not data:
+        data.clear()
+        data.update(out)
+    return data
+
+
 def mark_replied(uid, sid=None, text=None):
     key = str(sid) if sid else str(uid)
     _REPLIED[key] = {"text": (text or "")[:120], "ts": time.time()}
+    _expire_replied(_REPLIED)          # 🔴 P1-A5：落盘前收缩过期条目，台账不无限增长
     save_replied(_REPLIED)
 
 

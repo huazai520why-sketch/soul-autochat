@@ -101,8 +101,11 @@ def _lib_unread_sids(db):
         from data import pending as _P
         return _P.unread_sids(db)
     except Exception as e:
-        log.debug("库未读清单不可用: %r", e)
-        return []
+        # 🔴 2026-11-15（P0-B1）：库确实无未读（返回 []）与库不可用（返回 None）
+        #   必须区分。原来异常静默返回 [] → sweep 退回屏幕 dots()（恒空）→
+        #   「没目标 + 角标 0」必然判假红点 → 冷却 15 分钟漏回。None = 库挂了。
+        log.warning("库未读清单不可用（返回 None，本轮跳过，不退回屏幕）: %r", e)
+        return None
 
 
 def pending_summary(db):
@@ -555,11 +558,18 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
     #   现在：库给 sid 清单（0.05s），屏幕只负责「把这行找到并点进去」。
     #   屏幕红点仍保留做**兜底**（万一某天 res-id 回来了，也不会漏）。
     lib_sids = _lib_unread_sids(db)
+    if lib_sids is None:
+        # 🔴 2026-11-15（P0-B1）：库挂了 ≠ 没目标。跳过本轮（不退回屏幕 dots()），
+        #   避免误判假红点 + 冷却 15 分钟。屏幕红点判据此时也不可信。
+        log.warning("库未读清单不可用（None）→ 本轮清红点跳过，等下轮重试")
+        out["left"] = -1
+        out["skip_lib_down"] = True
+        return out
     if lib_sids:
         log.info("清红点目标来自库：%d 个未读会话（屏幕红点数=%d）",
                  len(lib_sids), len(dots(snap)))
     else:
-        log.info("库未读清单为空/不可用 → 退回屏幕红点判据（实测多半也是 0）")
+        log.info("库确认无未读会话（空 list）→ 无清红点目标，本轮收工")
 
     while out["entered"] < max_enter:
         if time.monotonic() - t_budget > budget_s and out["entered"] > 0:
@@ -821,10 +831,13 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
     #    聊天 tab 完全无角标）。于是「进了人、没发话」必然被判「假红点」→ 冷却 15 分钟
     #    → 而这 15 分钟里库里可能还有 27 个人在等。加库判定：库说还有人等，就**不许**
     #    判假红点（冷却会把真待回一起冻住）。
+    # 🔴 2026-11-15（P0-B2）：_pend == -1 是库异常哨兵，≠「库确认 0 待回」。
+    #   原来 `_pend <= 0` 把 -1 也判成假红点 → 冷却 15 分钟漏回。
+    #   现在只有 _pend == 0（库明确说没人等）才判假红点；-1 交回上层下轮重试。
     _pend = out.get("pending", -1)
     if (out["entered"] > 0 and out["replied"] == 0 and her_stuck == 0
             and not interrupted and (out["left"] or 0) <= 0
-            and _pend <= 0):
+            and _pend == 0):
         _FAKE_DOT["until"] = time.time() + FAKE_DOT_COOL_S
         log.warning("进了 %d 人一条没发、角标=0、库无待回 → 判定假红点，清红点冷却 %.0f 分钟",
                     out["entered"], FAKE_DOT_COOL_S / 60.0)

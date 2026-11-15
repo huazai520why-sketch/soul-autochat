@@ -629,8 +629,17 @@ def send_wake(actor, dev, cand, text, db=None):
                 #   ① 记失败台账（含 24h 冷却 + 放弃计数），今天不再找他；
                 #   ② 确保回到会话列表（back 一次 + nav.to_chatlist 兜底），
                 #      绝不停在会话页让下一轮从错误页面起手。
-                # 闸之前已完成导航/进会话（见上方 S.search / _enter），
-                # 先按成功路径同款 back 退一层；异常吞掉不改变返回值语义。
+                # 🔴 2026-11-15（P1-B9）：上面 HY-08 的注释说「记失败台账」，
+                #   但实际拦截分支（SG.allow 拦截）**并没有**调用 mark_woke(failed=True)
+                #   → 20min 短冷却没记 → 同人反复 选中→拦截→返回（白烧）。
+                #   这里补记 mark_woke(cand.uid, failed=True)：20min 短冷却、
+                #   不增放弃计数（failed=True 不累加 c<uid>，正合 F-02 语义）。
+                #   闸之前已完成导航/进会话（见上方 S.search / _enter），
+                #   先按成功路径同款 back 退一层；异常吞掉不改变返回值语义。
+                try:
+                    mark_woke(cand.uid, failed=True)
+                except Exception as _mw:
+                    log.debug("拦截记失败冷却异常（不影响返回）: %r", _mw)
                 try:
                     actor.hand.back(settle=1.2)
                 except Exception:

@@ -285,7 +285,7 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
         _dev = getattr(db, "dev", None)
         if _dev is not None:
             _live = _IM.device_live_uids(_dev, db.uid)
-            if _live:
+            if _live is not None:
                 _before = len(rows)
                 rows = [r for r in rows if str(r["toUserId"] or "") in _live]
                 if _before != len(rows):

@@ -595,7 +595,13 @@ def cycle(a, dev, db, st, dry_run=False):
         #   用户口径是「消息必回」优先、匹配只是带来新会话，不能拿它换掉回复。
         #   本轮已经跑过 sweep、且**真的发出话**（replied_any）→ 回复通道健康、
         #   红点已处理一轮，剩下的是这期间新到的，交给下一轮；本轮放行匹配。
-        dot_blocks = bool(left != 0 and (ndots > 0 or entered > 0) and not replied_any)
+        # 🔴 2026-11-15（P0-B5）：原来 `left != 0 and ...`，而 left 是底栏
+        #   「聊天」角标 —— 实测该角标**恒为 0**（lead 复现：badges={'广场': 7}，
+        #   聊天 tab 完全无角标）。于是 `left != 0` 恒 False → dot_blocks 恒 False
+        #   → 红点/进人从未正确挡过后续流程，虚高分支也不触发。去掉对 left 依赖：
+        #   以**屏上真实行内红点（ndots>0）**或**确实进了人且本轮没发出话
+        #   （entered>0 and not replied_any）**为准 —— 即「红点优先、已回一轮就放行」。
+        dot_blocks = bool(ndots > 0 or (entered > 0 and not replied_any))
         if left != 0 and not dot_blocks:
             log.info("角标=%s 但屏上无行内红点、也没进到人 → 判为虚高，不挡后续流程", left)
             try:

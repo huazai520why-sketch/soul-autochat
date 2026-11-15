@@ -731,9 +731,40 @@ def quota_out(snap):
     🔴 2026-11-02 实测：额度 50/50 用完后，点「开始匹配」只会从底部升起这个
        半屏弹层（卖次数卡 + 做任务），**页面永远进不到会话页**。原来的实现
        一路等到 25~50 秒超时，每次白烧半分钟（用户看到的「匹配空烧」）。
+
+    🔴 2026-11-15（P0-B4）：原来用子串 `QUOTA_HINT` 匹配整屏 → 促销/活动弹层
+       若含「匹配机会已用完」会误命中 → 当天不再匹配。收紧为：
+        ① 文案模式 `今日.*用完`（比纯子串更严，排除无关促销文案）
+        ② 含「用完」文本的节点必须落在下半屏弹层区域（y>1000）
+       「含关闭控件」**不作硬条件**：实测真实额度弹层上**没有**任何可点关闭
+       文案（2026-11-14 C01，Codex 版因此删了 back 兜底），若当硬条件反而
+       误杀真实额度弹层、回到匹配空烧。关闭控件存在只作加分日志，缺失时仍
+       靠 _dismiss_quota 的 back 兜底关掉。
     """
     try:
-        return QUOTA_HINT in " ".join(snap.texts())
+        _texts = " ".join(snap.texts())
+        if QUOTA_HINT not in _texts:
+            return False
+        if not re.search(r"今日.*用完", _texts):
+            return False
+        # 弹层区域：含「用完」的节点必须在下半屏（弹层从底部升起）
+        _in_region = False
+        for n in snap.nodes:
+            if not n.visible or n.bounds[1] <= 1000:
+                continue
+            _lb = (n.text or n.desc or "").strip()
+            if "用完" in _lb or "匹配机会" in _lb:
+                _in_region = True
+                break
+        if not _in_region:
+            return False
+        _has_close = any(
+            n.visible and n.bounds[1] > 1000 and n.clickable
+            and ((n.text or "").strip() in ("关闭", "知道了", "我知道了", "取消")
+                 or "关闭" in (n.text or ""))
+            for n in snap.nodes)
+        log.debug("quota_out 命中弹层（下半屏，含关闭控件=%s）", _has_close)
+        return True
     except Exception:
         return False
 
@@ -861,6 +892,20 @@ def run_once(actor, dev, db, dry_run=False, preempt=None):
             log.info("建档未回主页但仍在会话页 → 继续发开场白")
     except Exception as e:
         log.warning("主页建档异常（继续发开场白）: %r", e)
+        # 🔴 2026-11-15（P1-B8）：建档异常时 visit_profile 未赋值 pok，原版直接
+        #   落 _local_opener，跳过「建档未闭环」校验 → 页面可能已离开 chat 仍盲发
+        #   （已扣费卡 0 产出）。except 分支同样检查落点，不在 chat 一律返回不发送。
+        try:
+            _s3 = actor.snap(force=True)
+            if detect(_s3) != "chat" or not has_card(_s3):
+                out["err"] = "建档异常且落点非本会话页（不盲发）"
+                log.warning("建档异常后页面=%s → 本卡不发送", detect(_s3))
+                return out
+            log.info("建档异常后仍在会话页 → 继续发开场白")
+        except Exception as _e:
+            log.warning("建档异常后落点校验失败（不盲发，避免已扣费卡0产出）: %r", _e)
+            out["err"] = "建档异常且落点校验失败（不盲发）"
+            return out
 
     # ② 发开场白（用户 2026-11-04 定：本地模型生成，废弃固定池子）
     text = _local_opener(card)
