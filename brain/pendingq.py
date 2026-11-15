@@ -154,6 +154,14 @@ SHORT_RETRY_H = 0.5
 #   （末条文本变了 → should_skip 自动失效 → 重新给机会）。
 IDFAIL_MAX_TRIES = 4
 IDFAIL_GIVEUP_H = 2.0
+# 🔴 2026-11-15（用户指令2「无回复率高的人纳入冷却」）：我方发过消息但对方长期没回。
+#   这类会话反复消耗触达预算（实测 273 个 sid 我方最后发送后超 24h 她没回）。
+#   判据：reply_state 里我方有 sends、且 her_ts 早于我最后一条 send 超过 NOREPLY_H 小时。
+#   命中 → mark_skip(sid, txt, "noreply_high", hours=NOREPLY_COOL_H)，减少白烧。
+#   只对非设备未读的会话生效（设备未读=真有人等，不因本地台账冷杀掉）。
+#   she 发新消息（末条文本变）→ should_skip 按 (sid,txt) 匹配自动失效 → 重新给机会。
+NOREPLY_H = float(os.environ.get("SOUL_NOREPLY_H", "24") or 24)     # 我方最后发完超 24h 她没回
+NOREPLY_COOL_H = float(os.environ.get("SOUL_NOREPLY_COOL_H", "24") or 24)  # 冷却 24h，等她新消息
 SKIP_FILE = PL.SKIP_FILE
 
 # 🔴 2026-11-14（A3 P0）：设备未读对账补入封顶改可配（默认仍 8，保持 DS-13 行为）。
@@ -407,6 +415,35 @@ def _my_last_ts_ms(db, sid):
         return last_my
     except Exception:
         return 0
+
+
+def _is_noreply_high(sid):
+    """我方发过消息但她长期没回（无回复率高）？
+
+    判据（2026-11-15 用户指令2）：
+      · reply_state 里该 sid 有 sends（我方确实发过）
+      · 且 her_ts_ms 早于我最后一条 send 超过 NOREPLY_H 小时（她一直没回）
+      · 且没有设备未读（设备未读=真有人等，由调用方在硬放行前判断，不在这里拦）
+
+    Returns:
+        True = 应冷却；False = 不该冷却（她最近回过 / 我方没发过 / 台账读不到）。
+    """
+    try:
+        from data import reply_state as _RSn
+        rec = _RSn.get(str(sid))
+        sends = [float(t) for t in (rec.get("sends") or []) if t]
+        if not sends:
+            return False                       # 我方没发过 → 不是无回复浪费
+        her_ts = float(rec.get("her_ts_ms") or 0)
+        if her_ts <= 0:
+            return False                       # 她没记录 → 保守放行
+        last_send = max(sends)
+        # 她最后一条真人消息（毫秒）早于我最后一条发送（秒*1000）超 NOREPLY_H 小时
+        if her_ts / 1000.0 < last_send - NOREPLY_H * 3600.0:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 # 🔴 2026-11-04（用户口径）：进会话后核对身份，最硬的证据是 **sid**。
@@ -1169,6 +1206,17 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 log.debug("跳过已回会话 uid=%s（台账/ L2 末行是我且不早于她最新消息）", to_uid)
                 _sla_warn(sid, to_uid, last.ts, "被判已回")
                 continue
+
+        # 🔴 2026-11-15（用户指令2「无回复率高的人纳入冷却」）：
+        #   我方发过消息但她长期没回（reply_state 判据），且非设备未读（上面硬放行已处理）。
+        #   这类会话反复白烧，冷却后等她发新消息（末条文本变 → should_skip 自动失效）。
+        if _is_noreply_high(sid) and not should_skip(sid, txt):
+            mark_skip(sid, txt, "noreply_high", hours=NOREPLY_COOL_H)
+            scan_stats["cooldown"] += 1
+            scan_stats["cooldown:noreply_high"] += 1
+            log.info("无回复率高 sid=%s → 冷却 %.1fh（我方最后发完超 %.1fh 她没回，减少白烧）",
+                     sid, NOREPLY_COOL_H, NOREPLY_H)
+            continue
 
         if should_skip(sid, txt):
             _r = _LAST_SKIP.get(str(sid)) or {}
