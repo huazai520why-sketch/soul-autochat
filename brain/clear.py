@@ -402,11 +402,23 @@ def ensure_fresh(actor, db, rounds=1):
     """
     if db is None:
         return actor.snap()
+    # 🔴 2026-11-16（修法2, report_dot §4）：与 sweep 目标源 unread_sids() 同口径
+    #   （toUserId>0 + 号段过滤 + 设备存活校验）。原 db.sessions(unread_only=True)
+    #   无任何身份过滤 → 4~8 个幽灵未读永不命中屏幕 → 每轮误判「列表比库旧」→
+    #   无效下拉刷新 434 次/24h（另有 176 次「缺最新」误报被同源放大）。
     try:
-        unread = [s for s in db.sessions(unread_only=True, include_official=False)
-                  if (s.last_text or "").strip()][:8]
-        newest = [s for s in db.sessions(limit=3, include_official=False)
-                  if (s.last_text or "").strip()][:1]
+        from data.pending import unread_sids as _us
+        _sids = _us(db) or []
+        unread = []
+        for _sid in _sids[:8]:
+            try:
+                _dig = db.session_digest(_sid) or {}
+                _t = (_dig.get("text") or "").strip()
+                if _t:
+                    unread.append(type("S", (), {"last_text": _t})())
+            except Exception:
+                pass
+        newest = list(unread[:1])
     except Exception:
         return actor.snap()
     if not unread and not newest:
@@ -517,6 +529,16 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
     if detect(snap) != "chatlist":
         log.warning("回不到会话列表，跳过清红点")
         out["left"] = -1
+        return out
+    # 🔴 2026-11-16（修法1, _audit_20261116/report_dot §4）：库判空前置——原在
+    #   _to_top/ensure_fresh（多次 3-4s dump + 下拉刷新）之后才查库；镜像里 4~8 个
+    #   「幽灵未读」（toUserId=0 / 营销号段 / 死会话）造成 ensure_fresh 每轮
+    #   「比库旧 → 下拉刷新」空转 288 轮/24h（累计 1.9h）。库空时直接收工，
+    #   空转段 ~24s → <1s。None（库挂）语义保持原位不动（P0-B1）。
+    _lib_early = _lib_unread_sids(db)
+    if _lib_early is not None and not _lib_early:
+        log.info("库确认无未读会话（前置判空）→ 无清红点目标，本轮收工")
+        out["left"] = 0
         return out
     # 🔴 2026-11-04：列表 UI 会落后于库（实测落后 2.5h）→ 红点/行定位全失灵。
     #    对不上就下拉刷新一次，不额外增加手势开销。
