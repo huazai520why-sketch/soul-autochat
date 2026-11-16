@@ -104,10 +104,12 @@ def send_voice_reply(actor, db, sid, lines, kind="voice", nick=""):
     from data import watch as W
     from eyes.page import detect
     from hands import audioout as AO
+    from hands.input import Input
     from hands import tts as T
     from hands import voice as HV
 
-    if detect(actor.snap(force=True)) != "chat":
+    snap = actor.snap(force=True)
+    if detect(snap) != "chat" and Input.box(snap) is None:
         result["err"] = "当前不在 chat 页"
         return result
     try:
