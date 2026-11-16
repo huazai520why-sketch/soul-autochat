@@ -541,6 +541,36 @@ def send(actor, dev, text, sid=""):
     _why = getattr(inp, "last_reason", "") or ""
     if (not _ok) and _why == "residual":
         return False, "发送后输入框未清空(残留)"
+    # 🔴 2026-11-16（FLOW-02，P1）：unknown ≠ 已发出。原来 unknown 一律按「已发」
+    #   记账（SG.note_sent + 返回已发送），若实际没发出则静默丢账。与 flow.py:722-768
+    #   同口径加落库校验：查末条是否是我方刚发的 text，未落库则不记账、返回失败。
+    #   sid 为空（新会话开场白，库里还没有该会话）保留「unknown=已发」兜底。
+    if not _ok and _why != "residual":
+        _landed = False
+        _needle = (text or "").strip()
+        if _needle and sid:
+            try:
+                from data import imdb as _IM
+                _uid = _IM.current_uid(dev)
+                _nm = _IM._db_name_for_uid(dev, _uid)
+                if _nm:
+                    _raw = _IM._dev_sql(
+                        dev, _nm,
+                        "select ifnull(text,'') from chatmsg where "
+                        "sessionId='%s' order by localTime desc limit 1"
+                        % str(sid), timeout=8) or ""
+                    _ln = ""
+                    for _x in _raw.replace("\r", "").splitlines():
+                        if _x.strip():
+                            _ln = _x.strip()
+                    if _ln and _needle in _ln:
+                        _landed = True
+            except Exception as _e:
+                log.debug("match.send unknown 落库校验异常（按已发兜底）: %r", _e)
+        if not _landed and sid:
+            log.warning("match.send unknown 且库未落库 sid=%s → 不记账、返回失败", sid)
+            return False, "unknown_not_in_db"
+        # sid 为空（开场白）或已确认落库 → 按已发记账
     # ok 或 unknown（大概率已发）→ 按已发记账
     # 开场白也是自己写的库变化，必须抑制（否则匹配刚发完就被自己的写入打断）
     try:

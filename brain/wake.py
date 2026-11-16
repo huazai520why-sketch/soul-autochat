@@ -684,6 +684,48 @@ def send_wake(actor, dev, cand, text, db=None):
         actor.hand.back(settle=1.0)
         _bump_miss(cand.uid, "发送后输入框未清空(残留)")
         return False, "发送后输入框未清空(残留)"
+    # 🔴 2026-11-16（FLOW-03，P1）：unknown ≠ 已发出。原来 unknown 一律「按已发记账」
+    #   并 mark_woke(cand.uid)，若实际没发出则次日重复唤醒/重复发消息。与 flow.py:722-768
+    #   同口径加落库校验：查末条是否是我方刚发的 text，未落库 → 不 mark_woke、不记成功，
+    #   返回失败让下轮重试（不递增放弃计数）。sid 为空保留「unknown=已发」兜底。
+    if not _ok and _why != "residual":
+        _landed = False
+        _needle = (text or "").strip()
+        if _needle and getattr(cand, "sid", ""):
+            _sid = str(cand.sid)
+            try:
+                from data import imdb as _IM
+                _uid = _IM.current_uid(dev)
+                _nm = _IM._db_name_for_uid(dev, _uid)
+                if _nm:
+                    _raw = _IM._dev_sql(
+                        dev, _nm,
+                        "select ifnull(text,'') from chatmsg where "
+                        "sessionId='%s' order by localTime desc limit 1"
+                        % _sid, timeout=8) or ""
+                    _ln = ""
+                    for _x in _raw.replace("\r", "").splitlines():
+                        if _x.strip():
+                            _ln = _x.strip()
+                    if _ln and _needle in _ln:
+                        _landed = True
+            except Exception as _e:
+                log.debug("wake unknown 实时库校验异常（回落本地库）: %r", _e)
+            if not _landed and db is not None:
+                try:
+                    _lm = db.last_message(_sid)
+                    if _lm is not None:
+                        _txt = (_lm.text or "").strip()
+                        if _needle in _txt:
+                            _landed = True
+                except Exception as _e3:
+                    log.debug("wake unknown 本地库校验异常: %r", _e3)
+        if not _landed and getattr(cand, "sid", ""):
+            log.warning("wake unknown 且库未落库 uid=%s sid=%s → 不 mark_woke，下轮重试",
+                        cand.uid, getattr(cand, "sid", "?"))
+            actor.hand.back(settle=1.0)
+            return False, "unknown_not_in_db"
+        # sid 为空（无会话）或已确认落库 → 按已发记账
     # ok 或 unknown（大概率已发）→ 按已发记账
 
     # 🔴 自己发消息也会写库 → 不抑制的话，唤醒循环里「库有变化」立刻中断，

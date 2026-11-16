@@ -484,9 +484,13 @@ def _device_unread_sids(db):
        设备库未读是「她发了且从未进会话读过」的强真值，用它兜底放行。
        一轮内 candidates() 会被调 6+ 次，故加 60s 缓存避免重复 adb。
     """
+    # 🔴 2026-11-16（DATA-02 P0）：真 TTL 过期。原来只靠 invalidate_unread_cache()
+    #   清缓存，函数内 60s 判断形同虚设（docstring 写了 TTL 但从未据此失效）。
+    #   与 _device_live_uids 同款结构：非空 + 未过 60s 才复用，否则重扫设备库。
     now = time.time()
-    if now - _UNREAD_CACHE["ts"] < 60.0:
-        return _UNREAD_CACHE["sids"]
+    if _UNREAD_CACHE and now - float(_UNREAD_CACHE.get('ts', 0)) < 60.0 \
+            and _UNREAD_CACHE.get('sids') is not None:
+        return _UNREAD_CACHE['sids']
     out = set()
     try:
         from data import imdb as _IM
@@ -1202,8 +1206,21 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             from brain import verdict as _VD
             # 🔴🔴 2026-11-12（DS-05）：补传 my_last_ts_ms —— 否则 verdict 的
             #   「我方末条晚于她末条 → AWAITING」分支恒不触发（默认 0）。
+            # 🔴 2026-11-16（DATA-07 P1）：_my_last_ts_ms 在镜像滞后（约 300s）时返回 0，
+            #   会让「我方刚回完」的会话拿不到 AWAITING 判定 → 反复入队。加兜底：
+            #   主取值返回 0 时，从 reply_state.sends 里取最后一次成功发送的时间戳顶上。
+            _my_ts_raw = _my_last_ts_ms(db, str(sid))
+            if not _my_ts_raw:
+                try:
+                    from data import reply_state as _RSx
+                    _recx = _RSx.get(str(sid))
+                    _posx = [float(x) for x in (_recx.get('sends') or []) if float(x) > 0]
+                    if _posx:
+                        _my_ts_raw = max(_posx)
+                except Exception:
+                    pass
             _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True,
-                                my_last_ts_ms=_my_last_ts_ms(db, str(sid)))
+                                my_last_ts_ms=_my_ts_raw * 1000.0 if _my_ts_raw else 0.0)
             if _vd.state == _VD.ARCHIVED:
                 try:
                     from data import reply_state as _RSa
@@ -1326,6 +1343,29 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 continue
             if _t in SYS_TEXTS:
                 log.info("设备未读对账：sid=%s 末条是系统文本 %r → 不补", _s, _t[:16])
+                continue
+            # 🔴 2026-11-16（DATA-04 P1）：对账补入块此前完全没过 noreply_high 闸 ——
+            #   主循环 1186 行已把「我方发完她长期不回」的人纳入冷却，但设备未读对账
+            #   会无条件绕过上游全部过滤强制补入，导致这批人被反复唤醒白烧。
+            #   补入前同款判据再卡一道：命中 noreply_high → 本轮不补（等她真发新话）。
+            if _is_noreply_high(_s):
+                log.info("设备未读对账：sid=%s 命中 noreply_high → 不补入（避免反复白烧）", _s)
+                continue
+            # 🔴 2026-11-16（DATA-01 P0）：对账块绕过了主循环 1039-1049 那道「镜像滞后」闸。
+            #   摘要文本很可能就是我方刚发出的原句（发送后 App 立刻更新 session.lastMsgText，
+            #   镜像 chatmsg 未同步 → latest() 判「末条是我」），对账却把它当「她新话」硬入队。
+            #   与主循环同款交叉验证：末条是我发的且文本与摘要一致 → 视为镜像未拉到我方回复，
+            #   直接跳过，不入队、不清额度。
+            try:
+                _last_chk, _src_chk = db.latest(_s)
+            except Exception:
+                _last_chk, _src_chk = None, ""
+            if _last_chk is not None \
+                    and str(getattr(_last_chk, "sender", "")) == str(db.uid) \
+                    and (getattr(_last_chk, "text", "") or "").strip() == _t.strip():
+                scan_stats["mine_last"] += 1
+                log.info("设备未读对账·镜像滞后 sid=%s 摘要=%r 是我方刚发的原句 → 跳过"
+                         "（不入队、不清额度）", _s, _t[:16])
                 continue
             log.warning("设备未读对账：sid=%s uid=%s 设备说未读却没进队列 "
                         "（被上游过滤漏掉）→ 强制补入，末条=%r",

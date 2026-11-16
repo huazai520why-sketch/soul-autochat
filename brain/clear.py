@@ -778,9 +778,24 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                 log.warning("[%s] 末条是她但没发出话（第 %d 次）→ 不判假红点，留给已读未回",
                             getattr(res, "nick", "?") or "?", her_stuck)
                 if her_stuck >= 3:
-                    log.warning("连续 %d 次「末条是她但发不出」→ 本轮先停，交给已读未回",
+                    # 🔴 2026-11-16（FLOW-01，P1）：原来直接 break 弃掉本轮剩余红点。
+                    #   handled/handled_sids 是 sweep() 每次调用的局部变量，下一轮清空后
+                    #   lib_sids 仍按同序返回同样前 3 个 → 再次进同样 3 人 → 再次 break，
+                    #   形成「前 3 人饥饿空转」，24h 日志 67 次「末条是她但没发出话」。
+                    #   改：给当前这个 her_stuck 的 sid 记短冷却（复用 flow 的 enter_fail
+                    #   口径，hours=0.1 即 6 分钟），然后 continue 到下一个候选 —— 这样
+                    #   每轮能推进到第 4 个及以后的真待回，不再卡死在前 3 人。
+                    log.warning("连续 %d 次「末条是她但发不出」→ 给该 sid 记短冷却，继续下一个",
                                 her_stuck)
-                    break
+                    _hs_sid = _sid_hint or (list(handled_sids)[-1] if handled_sids else None)
+                    if _hs_sid:
+                        try:
+                            from brain.pendingq import mark_skip as _ms
+                            _ms(str(_hs_sid), '', 'her_stuck', hours=0.1)
+                        except Exception as _e_hs:
+                            log.debug("her_stuck 短冷却记台账异常（不影响继续）: %r", _e_hs)
+                    her_stuck = 0  # 重置计数，继续处理下一个候选
+                    continue
             else:
                 idle += 1
                 if idle >= 2:

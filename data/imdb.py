@@ -665,11 +665,25 @@ def _merge_device_into_mirror(device, name, local, dest_dir):
         if s_use and "sessionId" in s_use:
             upd = [c for c in s_use if c != "sessionId"]
             before2 = con.total_changes
+            # 🔴 2026-11-16 修复 DATA-03（P1 session UPSERT 缩水合并空转）：
+            #   原来 DO UPDATE 无 WHERE 条件，SQLite 对**每个**设备 session 行都执行
+            #   一次更新（即使所有列值都没变），total_changes 把它们全算成变更。
+            #   于是日志每次缩水合并都固定报「更新会话 542 个 / 377 个」，
+            #   536 次/24h、其中 64.6% 的新增消息为 0 —— 全是空转（无意义写放大，
+            #   且让上层误以为有真实变更）。
+            #   修法：给 DO UPDATE 加 WHERE，只在**真正被更新的列至少有一列变化**时
+            #   才更新。用 `IS NOT`（而非 `<>`）以正确处理 NULL：NULL IS NOT NULL → 假，
+            #   即两边同为 NULL 视为「未变化」，不会因为 NULL 比较而误更新。
+            #   WHERE 覆盖所有被更新的列（upd = s_use 去掉 sessionId），保证
+            #   任何一列变化都会触发更新，无一漏更新。
+            _chg = " OR ".join(
+                "%s IS NOT excluded.%s" % (c, c) for c in upd)
             con.execute(
                 "INSERT INTO main.session (%s) SELECT %s FROM dev.session WHERE 1 "
-                "ON CONFLICT(sessionId) DO UPDATE SET %s"
+                "ON CONFLICT(sessionId) DO UPDATE SET %s WHERE %s"
                 % (", ".join(s_use), ", ".join(s_use),
-                   ", ".join("%s=excluded.%s" % (c, c) for c in upd)))
+                   ", ".join("%s=excluded.%s" % (c, c) for c in upd),
+                   _chg))
             touched = con.total_changes - before2
         con.commit()
         try:
@@ -1436,8 +1450,42 @@ def open_account(device, name=None, uid=None, max_age=REFRESH_S, force=False):
     #     同时把本地镜像另存一份 `.keep`，保证人工随时能找回。
     #
     #   注意：正常增量同步（设备库更大）不受影响。
+    # 🔴 DATA-05：先一次性反推 want 对应的设备库文件名，供循环里做「非当前账号
+    #   库保护」判断（避免在循环里重复查询设备）。反推失败（None）时无法确定
+    #   哪个是非当前账号库，保护退化为不生效（仍走原 sync 流程），与旧行为一致。
+    _want_nm = None
+    try:
+        _want_nm = _db_name_for_uid(device, want)
+    except Exception as _e:
+        log.debug("DATA-05 反推 want 库名失败（保护退化为不生效）: %r", _e)
+
     _skipped = []
     for n in names:
+        # 🔴 2026-11-16 修复 DATA-05（P1 open_account 可能覆盖已登出账号库）：
+        #   本循环会把设备上所有 -DATA.db 都 sync 一遍直到匹配 want。
+        #   sync() 的「缩水保护」只在 _loc_sz > 2MB 时才触发，< 2MB 的本地镜像
+        #   **毫无保护**：只要设备侧该库被 Soul 清空（登出后实测会清），sync 就会
+        #   用一个几 KB 的空库覆盖本地 < 2MB 但含历史消息的镜像 → 数据不可恢复。
+        #   修法：在调用 sync 之前先加一道**独立于大小阈值**的保护——
+        #     · n == want 对应的库：**正常 sync**（当前账号必须实时拉）。
+        #     · n != want（非当前账号）：若其本地镜像已存在且 > 500KB，
+        #       说明这是一份有内容的历史快照，**跳过 sync**（不 pull、不删、不覆盖），
+        #       打 INFO 说明跳过原因；< 500KB 视为近空镜像，不构成有效保护，仍 sync。
+        #   这里用 500KB 而非 2MB：目的是在 sync 自身阈值之下再兜一层，
+        #   专门覆盖「历史镜像 < 2MB 但设备已被清空」的真实风险窗口。
+        if n != want and _want_nm and n != _want_nm:
+            _mirror = (CACHE / n.replace("-DATA.db", "") / n)
+            try:
+                _msz = _mirror.stat().st_size if _mirror.exists() else 0
+            except OSError:
+                _msz = 0
+            if _msz > 500 * 1024:
+                log.info(
+                    "跳过 sync 非当前账号库 %s（uid=%s）：本地镜像 %s 已存在 "
+                    "(%.1fKB>500KB)，不 pull 不覆盖，避免登出后被清空库覆盖历史",
+                    n[:28], want, _mirror.name, _msz / 1024.0)
+                _skipped.append(n)
+                continue
         try:
             p = sync(device, n)
         except RuntimeError as _e:
