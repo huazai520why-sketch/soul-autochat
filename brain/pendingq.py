@@ -338,6 +338,82 @@ def _idfail_clear(sid, txt):
 _IDFAIL = _load_idfail()
 
 
+# ══════════ 定位失败计数（落盘）：用户 2026-11-17「找不到人那种就放弃」 ══════════
+#   背景：`STALE_GIVEUP_H=72` 只挡 72h+ 的老会话；12~72h 的会话如果翻屏翻不到、
+#   搜索也搜不到，会每轮回来再烧 40~50s（实测 02:09 起的 41h/43h 两个候选，
+#   翻 6 屏 + 搜索各烧 32s，一条没回成）。用户口径：定位不到人就别死磕。
+#   判据分级（依据 2026-11-08 全量回出率实测：0-1h 49.2%、24h+ 仅 0.8%）：
+#     · age ≥ 24h 的老会话：累计 2 次定位失败 → 直接放弃
+#     · 其余（新鲜会话）：累计 4 次 → 放弃
+#   放弃 = `reply_state.set_archived(True)`（不回、不唤醒、不计待回、不再翻屏）。
+#   **不是拉黑**：她再发新的人话，C4 复活逻辑会解除归档、重新回到队列。
+LOCFAIL_FILE = STATE / "loc_fail.json"
+LOC_GIVEUP_N = int(os.environ.get("SOUL_LOC_GIVEUP_N", "4") or 4)
+LOC_GIVEUP_N_OLD = int(os.environ.get("SOUL_LOC_GIVEUP_N_OLD", "2") or 2)
+
+
+def _load_locfail():
+    """读定位失败计数；只保留 24h 内的（过期自动忘，别把活人永久降级）。"""
+    try:
+        d = json.loads(LOCFAIL_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        out = {}
+        for k, v in (d or {}).items():
+            try:
+                item = v if isinstance(v, dict) else {"n": int(v), "t": now}
+                t = float(item.get("t", now))
+                if now - t < 86400:
+                    out[str(k)] = {"n": int(item.get("n", 0)), "t": t}
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def _save_locfail():
+    try:
+        LOCFAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = LOCFAIL_FILE.with_name(LOCFAIL_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(_LOCFAIL, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(_tmp), str(LOCFAIL_FILE))
+    except Exception as e:
+        log.debug("存 locfail 失败: %r", e)
+
+
+def _locfail_bump(sid):
+    n = int((_LOCFAIL.get(str(sid)) or {}).get("n", 0)) + 1
+    _LOCFAIL[str(sid)] = {"n": n, "t": time.time()}
+    _save_locfail()
+    return n
+
+
+def _locfail_clear(sid):
+    if _LOCFAIL.pop(str(sid), None) is not None:
+        _save_locfail()
+
+
+def _loc_giveup(sid, to_uid, why, age_h):
+    """定位失败累计到阈值 → 归档放弃。返回 True 表示已放弃。"""
+    n = _locfail_bump(sid)
+    limit = LOC_GIVEUP_N_OLD if float(age_h or 0) >= 24.0 else LOC_GIVEUP_N
+    if n < limit:
+        log.info("定位失败第 %d/%d 次（%s，age %.1fh）→ 仍留队列，冷却后重试 uid=%s",
+                 n, limit, why, float(age_h or 0), to_uid)
+        return False
+    try:
+        from data import reply_state as _RSg
+        _RSg.set_archived(str(sid), True)
+    except Exception as _e_g:
+        log.debug("归档失败 sid=%s: %r", sid, _e_g)
+    log.warning("定位失败累计 %d 次（%s，age %.1fh）→ 放弃该会话并归档 uid=%s sid=%s"
+                "（她再发新人话会自动复活）", n, why, float(age_h or 0), to_uid, sid)
+    _locfail_clear(sid)
+    return True
+
+
+_LOCFAIL = _load_locfail()
+
 
 def _l2_last_is_me(sid, her_ts_ms=None):
     """L2 最后一行是不是「我」说的，且时间不早于她最新一条消息。
@@ -1063,6 +1139,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 log.debug("跳过末条是我 sid=%s uid=%s（设备说未读，但摘要也证明是我说的"
                           "或取不到摘要：%r）", sid, to_uid, _d_txt[:20])
             else:
+                # 🔴 2026-11-17：原来这条分支**没有计数**，导致汇总行永远对不上账
+                #   （实测「源 300 → 有效 0；归档 0、状态机 50、冷却 0、过期 0；
+                #   系统 0、我方末条 0…」少了 249 个，全是「末条是我」被静默吃掉）。
+                scan_stats["mine_last"] += 1
                 log.debug("跳过末条是我 sid=%s uid=%s（设备未读集合里没有 → 真·无需回）",
                           sid, to_uid)
             continue
@@ -1209,18 +1289,25 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             # 🔴 2026-11-16（DATA-07 P1）：_my_last_ts_ms 在镜像滞后（约 300s）时返回 0，
             #   会让「我方刚回完」的会话拿不到 AWAITING 判定 → 反复入队。加兜底：
             #   主取值返回 0 时，从 reply_state.sends 里取最后一次成功发送的时间戳顶上。
-            _my_ts_raw = _my_last_ts_ms(db, str(sid))
-            if not _my_ts_raw:
+            # 🔴🔴 2026-11-17 02:1x（P0，实测）：单位串了 —— `_my_last_ts_ms()` 返回**毫秒**，
+            #   而兜底用的 `reply_state.sends` 是**秒**。原代码对两者统一再乘 1000 →
+            #   毫秒值被放大 1000 倍（≈1.7e15），verdict 里 `my_s > her_s` **恒真** →
+            #   只要我方在该会话发过话就判 AWAITING，已读未回**全线漏回**。
+            #   实测：300 会话中「她末条」50 个，47 个被误判 AWAITING（含 01:48
+            #   「和你聊天感觉不像一个人呢」一直没人回）；40 分钟内源 300 → 有效 0。
+            #   修法：变量名带单位，毫秒就是毫秒，秒才乘 1000，绝不二次换算。
+            _my_ts_ms = float(_my_last_ts_ms(db, str(sid)) or 0.0)      # 毫秒
+            if not _my_ts_ms:
                 try:
                     from data import reply_state as _RSx
                     _recx = _RSx.get(str(sid))
                     _posx = [float(x) for x in (_recx.get('sends') or []) if float(x) > 0]
                     if _posx:
-                        _my_ts_raw = max(_posx)
+                        _my_ts_ms = max(_posx) * 1000.0                  # 秒 → 毫秒
                 except Exception:
                     pass
             _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True,
-                                my_last_ts_ms=_my_ts_raw * 1000.0 if _my_ts_raw else 0.0)
+                                my_last_ts_ms=_my_ts_ms)
             if _vd.state == _VD.ARCHIVED:
                 try:
                     from data import reply_state as _RSa
@@ -2740,6 +2827,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                         log.info("搜索无结果（第 %d 次/30min）→ %.0f 分钟后重试，不冻结 3 小时 sid=%s",
                                  _nf, _cool2 * 60, sid)
                         mark_skip(sid, txt, "notfound", hours=_cool2)
+                # 🔴 2026-11-17（用户「找不到人那种就放弃」）：翻 6 屏 + 搜索都没定位到
+                #   → 计入定位失败台账；老会话 2 次、新会话 4 次即归档止损
+                #   （实测每个这样的候选白烧 40~50s，且 24h+ 会话回出率仅 0.8%）。
+                _loc_giveup(sid, to_uid, _why, age_h)
                 S.leave(actor)
                 out["skipped"] += 1
                 continue
@@ -2756,6 +2847,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         if pg2 != "chat":
             log.info("没进会话（%s），记台账后跳过", pg2)
             mark_skip(sid, txt, "enter_fail", hours=ENTER_RETRY_H)
+            # 🔴 2026-11-17：进不去也算「找不到人」，同样计入放弃台账。
+            _loc_giveup(sid, to_uid, "enter_fail", age_h)
             if row is None:
                 S.leave(actor)
             out["skipped"] += 1
@@ -3040,6 +3133,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
 
             if sent_n:
+                # 发成功即清「定位失败」计数：这个人定位得到，不该被计入放弃。
+                _locfail_clear(sid)
                 # 🔴 §104：按**实际发出条数**落账，不等实时库 pull（5 分钟延迟会重复发）。
                 try:
                     if voice_result is None:
