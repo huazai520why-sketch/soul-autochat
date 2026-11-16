@@ -27,11 +27,12 @@ log = get_logger("brain.flow")
 
 class Outcome(object):
     __slots__ = ("nick", "last_text", "side", "sid", "reply", "sent", "err", "kind",
-                 "burst", "lines", "image_desc")
+                 "burst", "lines", "image_desc", "voice_input")
 
     def __init__(self):
         self.nick = ""
         self.kind = "text"      # text / voice / image / emoji / other / tip
+        self.voice_input = False
         self.last_text = ""     # 合并后的「她这轮说的话」（可能含多条）
         self.burst = []         # 她连发的原文列表（单条时为长度 1）
         self.lines = []         # 我这次实际发出的几条
@@ -323,6 +324,7 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
     #    402857053 号入向不落 chatmsg 时，只读 chatmsg 会把「她刚说的话」当空气。
     db_last, _src = db.latest(sid_fast) if sid_fast else (None, "")
     if sid_fast and db_last is not None:
+        out.voice_input = V.is_voice(db_last)
         out.sid = sid_fast
         if out.nick:
             try:
@@ -348,6 +350,7 @@ def handle_one(actor, db, row, dry_run=True, nick=""):
             _real = her_last_real(db, out.sid, db.uid)
             _rt, _rh = (V.her_msg_of(_real, db=db, sid=out.sid)
                         if _real is not None else ("", "tip"))
+            out.voice_input = bool(_real is not None and V.is_voice(_real))
             if _rh != "text" or not _rt:
                 log.info("[%s] 末条是系统卡片，前面是 %s → 不在此处理", out.nick, _rh or "无")
                 actor.hand.back(settle=0.9)
@@ -490,6 +493,7 @@ def _slow_path(actor, db, out, dry_run):
     db_last, _src = db.latest(out.sid) if out.sid else (None, "")
     forced_her = False
     if db_last is not None:
+        out.voice_input = V.is_voice(db_last)
         db_side = "me" if str(db_last.sender) == str(db.uid) else "her"
         if db_side != out.side and out.side != "?":
             mode = os.environ.get("SOUL_OCR_CONFLICT", "her")
@@ -932,7 +936,7 @@ def _reply_and_send(actor, db, out, dry_run):
 
     if dry_run:
         from brain import auto_voice as AV
-        if AV.should_reply(out.kind, out.sid):
+        if AV.should_reply("voice" if out.voice_input else out.kind, out.sid):
             log.info("[%s] DRY 将自动语音回复: %r", out.nick, AV.voice_text(out.lines))
         else:
             log.info("[%s] DRY 将回复 %d 条: %r", out.nick, len(lines), out.lines)
@@ -952,9 +956,10 @@ def _reply_and_send(actor, db, out, dry_run):
     # 对方发语音且开关打开时，本轮回复只发一条自动语音。
     voice_result = None
     from brain import auto_voice as AV
-    if AV.should_reply(out.kind, out.sid or ""):
+    if AV.should_reply("voice" if out.voice_input else out.kind, out.sid or ""):
         voice_result = AV.send_voice_reply(
-            actor, db, out.sid, out.lines, kind=out.kind, nick=out.nick)
+            actor, db, out.sid, out.lines,
+            kind="voice" if out.voice_input else out.kind, nick=out.nick)
         if voice_result["sent"]:
             out.lines = [voice_result["text"]]
             out.reply = voice_result["text"]

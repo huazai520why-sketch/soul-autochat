@@ -8,6 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from brain import auto_voice as AV  # noqa: E402
+from brain.flow import Outcome  # noqa: E402
 from eyes.uitree import Node  # noqa: E402
 
 
@@ -38,6 +39,10 @@ def test_gate_and_text():
         assert AV.should_reply("voice", "123")
         assert not AV.should_reply("text", "123")
         assert AV.voice_text(["第一句", "第二句"]) == "第一句，第二句"
+        out = Outcome()
+        out.kind = "asr"
+        out.voice_input = True
+        assert AV.should_reply("voice" if out.voice_input else out.kind, "123")
 
     with mock.patch.dict(os.environ, {"SOUL_AUTO_VOICE_REPLY": "0"}, clear=False):
         assert not AV.enabled()
