@@ -193,6 +193,35 @@ def find_sid(db, text, device=None, tries=3):
         if len(hit) == 1:
             return hit[0][0]
         if len(hit) > 1:
+            # 🔴 2026-11-16（P1）：模板开场白同时命中多个「她一直没回」的会话
+            #   （那些 session 的 lastMsgText 都停在同句模板）→ 原逻辑一律放弃，
+            #   实测窗口内 45 条 6~14 命中全弃 → 新匹配全部无档案。
+            #   收窄：取「最后活动时间」最新的命中；当它比次新至少新 300s 且其
+            #   lastMsgText 精确等于关键词 → 判定为刚发出去的那条。否则维持放弃
+            #   （宁缺毋错——2026-11-02 串号教训：案情包写错人比不写更糟）。
+            _best = None
+            try:
+                _ids = [h[0] for h in hit]
+                _ph = ",".join("?" for _ in _ids)
+                _rows = db.con.execute(
+                    "SELECT sessionId, timestamp, lastMsgText FROM session "
+                    "WHERE sessionId IN (%s)" % _ph, _ids).fetchall()
+                _by = {str(r["sessionId"]): (int(r["timestamp"] or 0),
+                                             str(r["lastMsgText"] or ""))
+                       for r in _rows}
+                _rank = sorted(_ids, key=lambda s: -_by.get(str(s), (0, ""))[0])
+                if len(_rank) >= 2:
+                    _t0, _tx0 = _by.get(str(_rank[0]), (0, ""))
+                    _t1 = _by.get(str(_rank[1]), (0, ""))[0]
+                    if (_t0 - _t1 >= 300000
+                            and _tx0.strip() == (text or "").strip()):
+                        _best = _rank[0]
+            except Exception as _e:
+                log.debug("反查多命中收窄异常: %r", _e)
+            if _best:
+                log.info("反查 %r 多命中 %d 个 → 按最新活动收窄 sid=%s",
+                         kw, len(hit), _best)
+                return _best
             log.warning("反查 %r 命中 %d 个会话，无法确定，放弃建档", kw, len(hit))
             return None
         time.sleep(2.0)

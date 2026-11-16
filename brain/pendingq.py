@@ -253,6 +253,14 @@ REPLIED_FILE = PL.REPLIED_FILE
 IDFAIL_FILE = STATE / "idfail.json"
 _IDFAIL = {}
 
+# 🔴 2026-11-16（P0 止血, B 轮升级, 依 _audit_20261116/report_send+report_watch）：
+#   平台对个别会话**静默拒发**（App 客户端级：127/127 轮全败, 同坐标其他会话成功
+#   16 次, 她 11-02 起从未成功）→ 与具体文本无关 → key=sid、txt 变化也续计；
+#   连续 ≥3 → mark_skip 冷却 2h。她再发新消息 → 末条 txt 变 → should_skip 的
+#   key 变化自动绕过（与 noreply_high 同机制），不漏回真人新消息。
+_RESID_N = {}
+_PREEMPT_STREAK = {}   # sid -> 连续让路次数（修A：同 sid ≥2 次让路后豁免一次）
+
 
 def _load_replied():
     """读台账 {sid: {"text": 我回的那一句, "ts": 回复时刻}}；兼容旧的 {uid: ts}。"""
@@ -2269,6 +2277,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
 
     for cand in cands:
         sid, to_uid, txt, her_ts = cand
+        # 🔴 2026-11-16（修D''）：设备未读硬放行会绕过 candidates() 的冷却过滤，
+        #   residual_loop（平台级拒发熔断）必须在此再挡一道，否则熔断被穿透。
+        try:
+            if should_skip(str(sid), str(txt or "")):
+                log.info("候选 sid 尾 %s 该句仍在失败冷却中（含 residual_loop）→ 跳过",
+                         str(sid)[-9:])
+                out["skipped"] += 1
+                continue
+        except Exception:
+            pass
         # A voice conversation already survived normal preemption twice in the
         # last few minutes. Once it starts locating, keep its bounded search
         # window atomic; otherwise steady traffic can starve it indefinitely.
@@ -2281,10 +2299,23 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         try:
             from data import watch as _W
             if _new_msg_urgent():
-                log.info("⚡ 积压处理途中检测到新消息 → 中止本轮积压，优先回去处理新消息")
-                _W.consume()
-                out["aborted"] = "preempted"
-                break
+                # 🔴 2026-11-16（修A, report_watch §5）：同 sid 连续 ≥2 次让路 →
+                #   豁免一次, 把这个候选的发送闭环做完——防「同一活跃会话反复打断
+                #   自己」（run1 型 168 连轮 / 小野猫型 127 次, top2 占让路总量 81%,
+                #   让路回去的红点段 0 进 0 回）。第 1、2 次让路照旧, 2026-11-04
+                #   「新消息不能被积压挤住」口径无损; 豁免期间她再来消息, dirty
+                #   留存, 下一个候选边界/下一轮开头立即响应（最坏延迟≈一个候选）。
+                _k_sid = str(sid)
+                if _PREEMPT_STREAK.get(_k_sid, 0) >= 2:
+                    _PREEMPT_STREAK[_k_sid] = 0
+                    log.info("⚡ 同 sid=…%s 连续让路 → 豁免一次，先做完这个候选（防自我打断）",
+                             _k_sid[-6:])
+                else:
+                    log.info("⚡ 积压处理途中检测到新消息 → 中止本轮积压，优先回去处理新消息")
+                    _W.consume()
+                    _PREEMPT_STREAK[_k_sid] = _PREEMPT_STREAK.get(_k_sid, 0) + 1
+                    out["aborted"] = "preempted"
+                    break
         except Exception:
             pass
         # 🔔 奇遇铃抢占一切（用户 2026-11-09 定链：铃 > 新消息 > 红点 > 已读未回）：
@@ -2514,6 +2545,15 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("第 %d 次点列表行后仍是 %s → 重新定位再点", _try, pg2)
                 actor.hand.tap_node(row2.node, settle=1.8)
                 s2, pg2 = actor.wait_page(("chat",), timeout=5)
+            if pg2 == "chat":
+                # 🔴 2026-11-16（修B, report_watch §5）：进会话 → App 标已读写库是
+                #   我方触发的写入; 不 mark 的话 watch 置 dirty → 下个候选边界必让路
+                #   → run1 型 168 连轮自我打断（她 37h 无新消息仍循环）。
+                try:
+                    from data import watch as _We
+                    _We.mark_self_write(8.0)
+                except Exception:
+                    pass
         else:
             # 🔴 2026-11-04（A批提速·短消息快弃）：短消息/纯表情 find_row 4 层落空后，
             #   走搜索大概率「未找到/歧义」（实测 18:41 一轮 9 候选只回成 1 个，8 个
@@ -2810,9 +2850,72 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 _why = getattr(inp, "last_reason", "") or ""
                 if (not _ok) and _why == "residual":
                     log.warning("第%d条确认未发出（输入框仍有内容）→ 不记账，下轮重试", i + 1)
+                    # 🔴 2026-11-16（修D'）：per-sid 熔断——txt 变化也续计（平台拒绝
+                    #   与会话状态绑定）；连续 ≥3 → 冷却 2h。她发新消息（txt 变）→
+                    #   should_skip key 变化自动绕过，不漏回真人新消息。
+                    _rn = int((_RESID_N.get(str(sid)) or 0) + 1)
+                    if _rn >= 3:
+                        log.warning("residual 连续 %d 次（sid 尾 %s，平台级拒发特征）→ 冷却 2h（residual_loop）",
+                                    _rn, str(sid)[-9:])
+                        mark_skip(sid, txt, "residual_loop", hours=2.0)
+                        _RESID_N[str(sid)] = 0
+                    else:
+                        _RESID_N[str(sid)] = _rn
+                    if getattr(inp, "last_diag", None):
+                        log.warning("[residual-取证] %s", inp.last_diag)
+                    # 修C：residual 期间 App 的输入中/心跳写库别拖垮下一个候选
+                    try:
+                        from data import watch as _Wf
+                        _Wf.mark_self_write(6.0)
+                    except Exception:
+                        pass
                     inp.clear()
                     break
+                if (not _ok) and _why == "unknown":
+                    # 🔴 2026-11-16（P1, 平移 flow.py P0-B3）：unknown ≠ 已发出。
+                    #   实时查设备库确认这条文本是否落库; 未落库 → 不记账、清空重试。
+                    _landed = False
+                    try:
+                        _needle = (r or "").strip()
+                        if _needle and sid:
+                            try:
+                                from data import imdb as _IM2
+                                _uid2 = _IM2.current_uid(dev)
+                                _nm2 = _IM2._db_name_for_uid(dev, _uid2)
+                                if _nm2:
+                                    _raw2 = _IM2._dev_sql(
+                                        dev, _nm2,
+                                        "select ifnull(text,'') from chatmsg where "
+                                        "sessionId='%s' order by localTime desc limit 1"
+                                        % str(sid), timeout=8) or ""
+                                    _ln2 = ""
+                                    for _x in _raw2.replace("\r", "").splitlines():
+                                        if _x.strip():
+                                            _ln2 = _x.strip()
+                                    if _ln2 and _needle in _ln2:
+                                        _landed = True
+                            except Exception as _e2:
+                                log.debug("unknown 实时库校验异常: %r", _e2)
+                            if not _landed:
+                                try:
+                                    _lm = db.last_message(sid)
+                                    if _lm is not None:
+                                        _tx2 = (_lm.text or "").strip()
+                                        _ct2 = (_lm.content or "").strip()
+                                        if _needle in _tx2 or _needle in _ct2:
+                                            _landed = True
+                                except Exception as _e3:
+                                    log.debug("unknown 本地库校验异常: %r", _e3)
+                    except Exception as _e:
+                        log.debug("unknown 落库校验异常（按未落库重试）: %r", _e)
+                    if not _landed:
+                        log.warning("第%d条 unknown 且库未落库 → 不记账、清空重试（防没发出却记账）",
+                                    i + 1)
+                        inp.clear()
+                        break
+                    log.info("第%d条 unknown 但库已落库 → 按已发出记账", i + 1)
                 _mark_replied(to_uid, sid=sid, text=txt)
+                _RESID_N.pop(str(sid), None)   # 成功发出（或确认落库）→ 清熔断计数
                 sent_n += 1
                 try:
                     from data import watch as _W
@@ -2825,7 +2928,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 except Exception:
                     pass
                 if not _ok:
-                    log.warning("第%d条发送确认读不到输入框（按已发出记账，不再重发）", i + 1)
+                    log.warning("第%d条发送确认读不到输入框（unknown 已落库，按已发出记账）", i + 1)
                 log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
 
             if sent_n:

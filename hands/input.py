@@ -158,6 +158,7 @@ class Input(object):
             log.warning("找不到发送按钮（三次 dump 均无；输入框文本=%r）", got)
             return False
         log.info("点发送 %s", btn.bounds)
+        self._last_btn = str(btn.bounds)   # 2026-11-16（取证）：residual 诊断用
         actor.hand.tap_node(btn, settle=settle)
         self._snap = None
         return True
@@ -186,6 +187,7 @@ class Input(object):
         之前上层只当布尔用 → 「输入框还有字=真没发」也被记成已回 = 永久漏回。
         """
         self.last_reason = "unknown"
+        self.last_diag = None
         time.sleep(0.7)
         got = self.box_text(actor.snap(force=True))
         if got == "":
@@ -216,4 +218,11 @@ class Input(object):
         if _last_seen is None:
             self.last_reason = "unknown"
             log.warning("发送校验：超时时输入框已不在 → unknown（按已发记账防重复）")
+            return False
+        # 🔴 2026-11-16（取证）：residual=明确没发出，但为什么没发出？
+        #   记录框内容/最近点过的发送按钮，供上层 residual 分支打出。
+        self.last_diag = {"box": repr(_got)[:80],
+                          "btn": getattr(self, "_last_btn", "?"),
+                          "expect": repr((text or ""))[:40]}
+        log.warning("[residual-取证] %s", self.last_diag)
         return False
