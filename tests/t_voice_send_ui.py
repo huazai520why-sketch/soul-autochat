@@ -63,6 +63,7 @@ def main():
 
     mode = _Snap([
         _n("cn.soulapp.android:id/audio_mode_container"),
+        _n("cn.soulapp.android:id/tv_press_to_speak", (200, 300, 300, 400)),
         _n("cn.soulapp.android:id/audio_record_view_optimize", (200, 300, 300, 400)),
     ])
     actor = _Actor(mode)

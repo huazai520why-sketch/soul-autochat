@@ -118,15 +118,18 @@ def review_controls(snap):
     }
 
 
-def record_and_release(actor, speech_seconds, play=None, lead=0.35):
-    """按住“录音”按钮，播完音频后松开；新版 UI 松开自动发送。
+def record_and_release(actor, speech_seconds, play=None, lead=0.35,
+                       control=PRESS_TO_SPEAK):
+    """按住“按住说话”按钮，播完音频后松开；新版 UI 松开自动发送。
 
     `play` 是同步可调用对象，会在线程里启动，避免阻塞长按。
+    右下角“录音”会进入持续录音层，不能用于松手发送；默认目标是左侧
+    `tv_press_to_speak`。
     """
     snap, _ = ensure_voice_mode(actor)
-    rec = _node(snap, RECORD)
+    rec = _node(snap, control)
     if rec is None:
-        raise VoiceSendUnconfirmed("语音模式里没有 audio_record_view_optimize")
+        raise VoiceSendUnconfirmed("语音模式里没有按住说话控件 %s" % control)
     hold_s = max(1.0, float(speech_seconds or 0) + float(lead) + 0.45)
     result = {"play": None, "error": None}
 
