@@ -21,6 +21,18 @@ BOX_RES = "et_sendmessage"
 SEND_RES = "btn_send"
 PLACEHOLDER = "文明聊天，友善交友~"
 
+# 🔴 2026-11-16 13:1x（P0 反转修正, 取证日志实锤）：她热聊/暧昧话题时 App 会在
+#   输入框区域显示「对话由AI生成，非Soul立场」AI 免责声明条——box_text 把它
+#   读成「输入框残留」→ 消息其实已发出（该会话 159 条/24h 全部落库 st3）→
+#   误判 residual → 不记账重发（同话题 6 连发轰炸）+ per-sid 熔断锁死热聊会话 2h。
+AI_BANNER_TEXTS = ("对话由AI生成",)
+
+
+def _ai_banner(t):
+    """命中 AI 免责声明条 → 输入框本身已清空（视为发送成功）。"""
+    t = (t or "").strip()
+    return bool(t) and any(k in t for k in AI_BANNER_TEXTS)
+
 
 class Input(object):
     def __init__(self, device):
@@ -190,6 +202,8 @@ class Input(object):
         self.last_diag = None
         time.sleep(0.7)
         got = self.box_text(actor.snap(force=True))
+        if _ai_banner(got):
+            got = ""    # AI 声明条 ≠ 输入框残留（2026-11-16 实证）
         if got == "":
             self.last_reason = "ok"
             return True
@@ -197,6 +211,8 @@ class Input(object):
             # 再给一帧机会：发送瞬间的转场帧常常读不到输入框
             time.sleep(0.8)
             got = self.box_text(actor.snap(force=True))
+            if _ai_banner(got):
+                got = ""
             if got == "":
                 self.last_reason = "ok"
                 return True
@@ -210,6 +226,8 @@ class Input(object):
         while time.time() - t0 < timeout:
             time.sleep(0.6)
             _got = self.box_text(actor.snap(force=True))
+            if _ai_banner(_got):
+                _got = ""
             if _got == "":
                 self.last_reason = "ok"
                 return True

@@ -2853,9 +2853,58 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     # 🔴 2026-11-16（修D'）：per-sid 熔断——txt 变化也续计（平台拒绝
                     #   与会话状态绑定）；连续 ≥3 → 冷却 2h。她发新消息（txt 变）→
                     #   should_skip key 变化自动绕过，不漏回真人新消息。
+                    # 🔴 2026-11-16 13:1x（B 轮反转修正）：residual 先落库交叉验证——
+                    #   '小野猫' 159 条/24h 全部落库, residual 全是 AI 声明条误读
+                    #   （hands/input.py 已加 banner 过滤, 此处兜底 banner 文案变化）。
+                    #   落库=已发出 → 按已发记账, 不熔断、不重发（防同话题轰炸）。
+                    _landed_r = False
+                    try:
+                        _needle_r = (r or "").strip()
+                        if _needle_r and sid:
+                            try:
+                                from data import imdb as _IM3
+                                _uid3 = _IM3.current_uid(dev)
+                                _nm3 = _IM3._db_name_for_uid(dev, _uid3)
+                                if _nm3:
+                                    _raw3 = _IM3._dev_sql(
+                                        dev, _nm3,
+                                        "select ifnull(text,'') from chatmsg where "
+                                        "sessionId='%s' order by localTime desc limit 1"
+                                        % str(sid), timeout=8) or ""
+                                    _ln3 = ""
+                                    for _x in _raw3.replace("\r", "").splitlines():
+                                        if _x.strip():
+                                            _ln3 = _x.strip()
+                                    if _ln3 and _needle_r in _ln3:
+                                        _landed_r = True
+                            except Exception as _e4:
+                                log.debug("residual 实时库校验异常: %r", _e4)
+                            if not _landed_r:
+                                try:
+                                    _lm2 = db.last_message(sid)
+                                    if _lm2 is not None:
+                                        _tx3 = (_lm2.text or "").strip()
+                                        _ct3 = (_lm2.content or "").strip()
+                                        if _needle_r in _tx3 or _needle_r in _ct3:
+                                            _landed_r = True
+                                except Exception as _e5:
+                                    log.debug("residual 本地库校验异常: %r", _e5)
+                    except Exception as _e6:
+                        log.debug("residual 落库校验异常: %r", _e6)
+                    if _landed_r:
+                        log.info("第%d条 residual 但库已落库 → 按已发出记账（AI 声明条误读）", i + 1)
+                        _mark_replied(to_uid, sid=sid, text=txt)
+                        _RESID_N.pop(str(sid), None)
+                        sent_n += 1
+                        try:
+                            from data import watch as _Wg
+                            _Wg.mark_self_write(6.0)
+                        except Exception:
+                            pass
+                        continue
                     _rn = int((_RESID_N.get(str(sid)) or 0) + 1)
                     if _rn >= 3:
-                        log.warning("residual 连续 %d 次（sid 尾 %s，平台级拒发特征）→ 冷却 2h（residual_loop）",
+                        log.warning("residual 连续 %d 次（sid 尾 %s，真·发送失败特征）→ 冷却 2h（residual_loop）",
                                     _rn, str(sid)[-9:])
                         mark_skip(sid, txt, "residual_loop", hours=2.0)
                         _RESID_N[str(sid)] = 0
