@@ -2830,7 +2830,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 # 🔴 2026-11-17（用户「找不到人那种就放弃」）：翻 6 屏 + 搜索都没定位到
                 #   → 计入定位失败台账；老会话 2 次、新会话 4 次即归档止损
                 #   （实测每个这样的候选白烧 40~50s，且 24h+ 会话回出率仅 0.8%）。
-                _loc_giveup(sid, to_uid, _why, age_h)
+                # ⚠️ 但 `timeout` **不等于找不到人**（代码原注释的立场是对的）：
+                #   实测 02:17~02:21 连续 5 个候选全是「搜索超时」，属通道整体变慢。
+                #   若把超时也算进放弃，一次通道抖动就会把 22 个真人全归档。
+                #   ⇒ 超时只在 age≥24h 时计数（这类本来就几乎注定搜不到），
+                #     新会话超时只冷却、不计数，避免误杀。
+                if _why != "timeout" or float(age_h or 0) >= 24.0:
+                    _loc_giveup(sid, to_uid, _why, age_h)
+                else:
+                    log.info("搜索超时（age %.1fh < 24h，不算「找不到人」）→ 只冷却不计数 uid=%s",
+                             float(age_h or 0), to_uid)
                 S.leave(actor)
                 out["skipped"] += 1
                 continue
