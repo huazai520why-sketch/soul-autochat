@@ -931,7 +931,11 @@ def _reply_and_send(actor, db, out, dry_run):
     out.reply = " | ".join(lines)
 
     if dry_run:
-        log.info("[%s] DRY 将回复 %d 条: %r", out.nick, len(lines), out.lines)
+        from brain import auto_voice as AV
+        if AV.should_reply(out.kind, out.sid):
+            log.info("[%s] DRY 将自动语音回复: %r", out.nick, AV.voice_text(out.lines))
+        else:
+            log.info("[%s] DRY 将回复 %d 条: %r", out.nick, len(lines), out.lines)
         actor.hand.back(settle=0.9)
         return out
 
@@ -945,10 +949,26 @@ def _reply_and_send(actor, db, out, dry_run):
     except Exception as _e:
         log.warning("发图判断异常（继续发文字）: %r", _e)
 
-    # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
-    # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
-    sent_n, err = _send_lines(actor, out.lines, out.nick,
-                              page_checked=not _pic_sent, sid=out.sid or "", db=db)
+    # 对方发语音且开关打开时，本轮回复只发一条自动语音。
+    voice_result = None
+    from brain import auto_voice as AV
+    if AV.should_reply(out.kind, out.sid or ""):
+        voice_result = AV.send_voice_reply(
+            actor, db, out.sid, out.lines, kind=out.kind, nick=out.nick)
+        if voice_result["sent"]:
+            out.lines = [voice_result["text"]]
+            out.reply = voice_result["text"]
+
+    if voice_result is not None and voice_result["sent"]:
+        sent_n, err = 1, ""
+    elif voice_result is not None:
+        # 录音手势后若无法确认落库，不补发文字，避免同一句语音+文字重复。
+        sent_n, err = 0, voice_result.get("err") or "自动语音发送失败"
+    else:
+        # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
+        # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
+        sent_n, err = _send_lines(actor, out.lines, out.nick,
+                                  page_checked=not _pic_sent, sid=out.sid or "", db=db)
     if sent_n:
         out.sent = True
         # 2026-11-14 夜审修复（B-04，P1）：flow 红点路径原来不写 replied.json

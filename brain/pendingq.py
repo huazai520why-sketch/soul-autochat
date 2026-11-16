@@ -2817,174 +2817,194 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             log.info("发送闸裁剪：本轮最多发 %d 条（额度）", _gate_n)
 
         if dry_run:
-            log.info("[dry] 会回 %d 条: %r", len(lines), lines)
+            from brain import auto_voice as AV
+            if AV.should_reply("voice" if str(sid) in _VOICE_SIDS else "text", str(sid)):
+                log.info("[dry] 会自动语音回复: %r", AV.voice_text(lines))
+            else:
+                log.info("[dry] 会回 %d 条: %r", len(lines), lines)
         else:
+            from brain import auto_voice as AV
+            voice_result = None
+            if AV.should_reply("voice" if str(sid) in _VOICE_SIDS else "text", str(sid)):
+                voice_result = AV.send_voice_reply(
+                    actor, db, str(sid), lines,
+                    kind="voice" if str(sid) in _VOICE_SIDS else "text")
+                if voice_result["sent"]:
+                    sent_n = 1
+                    lines = [voice_result["text"]]
+                    _mark_replied(to_uid, sid=sid, text=txt)
+                    _RESID_N.pop(str(sid), None)
+                else:
+                    log.warning("自动语音回复未确认：%s", voice_result.get("err"))
+
             # 🔴 2026-11-04（提速）：这里原来再 dump 一次确认在 chat 页 —— 但
             #   `_session_matches()` 刚用「未读清零差分 / 会话内气泡」确认过当前
             #   会话身份（通过的瞬间必然在 chat 页），之后只有库读写与模型调用，
             #   没有任何 UI 动作 → 这次 dump(3~4s) 纯重复。
             #   安全网仍在：真不在 chat 页时 type_and_verify 找不到输入框会直接失败，
             #   不会把话灌进搜索框。
-            inp = Input(dev)
-            sent_n = 0
-            for i, r in enumerate(lines):
-                if i:
-                    time.sleep(1.6)
-                ok, got = inp.type_and_verify(r, actor)
-                if not ok:
-                    log.warning("第%d条灌字失败（%r）", i + 1, got)
-                    inp.clear()
-                    break
-                # settle 1.2(×slow_factor 2.5=3s) -> 0.25：紧跟的 sent_ok 里
-                # sleep(0.7)+dump(3s) 已经在等，重复等待纯浪费。
-                if not inp.tap_send(actor, settle=0.25):
-                    log.warning("第%d条找不到发送按钮", i + 1)
-                    inp.clear()
-                    break
-                # 🔴 2026-11-04 修（闭环）：**先做三态确认，再记账**。
-                #   旧版「tap_send 成功就立即记账」把「输入框还有残留文本 = 明确没发出去」
-                #   也记成已回 → 永不重试 = 永久漏回（违背必回铁律）。
-                #   现在区分：residual=确实没发 → 不记账、下轮重试；
-                #             ok/unknown=确认清空或读不到转场帧 → 按已发记账（防重复发送）。
-                _ok = inp.sent_ok(actor, r, timeout=4)
-                _why = getattr(inp, "last_reason", "") or ""
-                if (not _ok) and _why == "residual":
-                    log.warning("第%d条确认未发出（输入框仍有内容）→ 不记账，下轮重试", i + 1)
-                    # 🔴 2026-11-16（修D'）：per-sid 熔断——txt 变化也续计（平台拒绝
-                    #   与会话状态绑定）；连续 ≥3 → 冷却 2h。她发新消息（txt 变）→
-                    #   should_skip key 变化自动绕过，不漏回真人新消息。
-                    # 🔴 2026-11-16 13:1x（B 轮反转修正）：residual 先落库交叉验证——
-                    #   '小野猫' 159 条/24h 全部落库, residual 全是 AI 声明条误读
-                    #   （hands/input.py 已加 banner 过滤, 此处兜底 banner 文案变化）。
-                    #   落库=已发出 → 按已发记账, 不熔断、不重发（防同话题轰炸）。
-                    _landed_r = False
-                    try:
-                        _needle_r = (r or "").strip()
-                        if _needle_r and sid:
-                            try:
-                                from data import imdb as _IM3
-                                _uid3 = _IM3.current_uid(dev)
-                                _nm3 = _IM3._db_name_for_uid(dev, _uid3)
-                                if _nm3:
-                                    _raw3 = _IM3._dev_sql(
-                                        dev, _nm3,
-                                        "select ifnull(text,'') from chatmsg where "
-                                        "sessionId='%s' order by localTime desc limit 1"
-                                        % str(sid), timeout=8) or ""
-                                    _ln3 = ""
-                                    for _x in _raw3.replace("\r", "").splitlines():
-                                        if _x.strip():
-                                            _ln3 = _x.strip()
-                                    if _ln3 and _needle_r in _ln3:
-                                        _landed_r = True
-                            except Exception as _e4:
-                                log.debug("residual 实时库校验异常: %r", _e4)
-                            if not _landed_r:
-                                try:
-                                    _lm2 = db.last_message(sid)
-                                    if _lm2 is not None:
-                                        _tx3 = (_lm2.text or "").strip()
-                                        _ct3 = (_lm2.content or "").strip()
-                                        if _needle_r in _tx3 or _needle_r in _ct3:
-                                            _landed_r = True
-                                except Exception as _e5:
-                                    log.debug("residual 本地库校验异常: %r", _e5)
-                    except Exception as _e6:
-                        log.debug("residual 落库校验异常: %r", _e6)
-                    if _landed_r:
-                        log.info("第%d条 residual 但库已落库 → 按已发出记账（AI 声明条误读）", i + 1)
-                        _mark_replied(to_uid, sid=sid, text=txt)
-                        _RESID_N.pop(str(sid), None)
-                        sent_n += 1
-                        try:
-                            from data import watch as _Wg
-                            _Wg.mark_self_write(6.0)
-                        except Exception:
-                            pass
-                        continue
-                    _rn = int((_RESID_N.get(str(sid)) or 0) + 1)
-                    if _rn >= 3:
-                        log.warning("residual 连续 %d 次（sid 尾 %s，真·发送失败特征）→ 冷却 2h（residual_loop）",
-                                    _rn, str(sid)[-9:])
-                        mark_skip(sid, txt, "residual_loop", hours=2.0)
-                        _RESID_N[str(sid)] = 0
-                    else:
-                        _RESID_N[str(sid)] = _rn
-                    if getattr(inp, "last_diag", None):
-                        log.warning("[residual-取证] %s", inp.last_diag)
-                    # 修C：residual 期间 App 的输入中/心跳写库别拖垮下一个候选
-                    try:
-                        from data import watch as _Wf
-                        _Wf.mark_self_write(6.0)
-                    except Exception:
-                        pass
-                    inp.clear()
-                    break
-                if (not _ok) and _why == "unknown":
-                    # 🔴 2026-11-16（P1, 平移 flow.py P0-B3）：unknown ≠ 已发出。
-                    #   实时查设备库确认这条文本是否落库; 未落库 → 不记账、清空重试。
-                    _landed = False
-                    try:
-                        _needle = (r or "").strip()
-                        if _needle and sid:
-                            try:
-                                from data import imdb as _IM2
-                                _uid2 = _IM2.current_uid(dev)
-                                _nm2 = _IM2._db_name_for_uid(dev, _uid2)
-                                if _nm2:
-                                    _raw2 = _IM2._dev_sql(
-                                        dev, _nm2,
-                                        "select ifnull(text,'') from chatmsg where "
-                                        "sessionId='%s' order by localTime desc limit 1"
-                                        % str(sid), timeout=8) or ""
-                                    _ln2 = ""
-                                    for _x in _raw2.replace("\r", "").splitlines():
-                                        if _x.strip():
-                                            _ln2 = _x.strip()
-                                    if _ln2 and _needle in _ln2:
-                                        _landed = True
-                            except Exception as _e2:
-                                log.debug("unknown 实时库校验异常: %r", _e2)
-                            if not _landed:
-                                try:
-                                    _lm = db.last_message(sid)
-                                    if _lm is not None:
-                                        _tx2 = (_lm.text or "").strip()
-                                        _ct2 = (_lm.content or "").strip()
-                                        if _needle in _tx2 or _needle in _ct2:
-                                            _landed = True
-                                except Exception as _e3:
-                                    log.debug("unknown 本地库校验异常: %r", _e3)
-                    except Exception as _e:
-                        log.debug("unknown 落库校验异常（按未落库重试）: %r", _e)
-                    if not _landed:
-                        log.warning("第%d条 unknown 且库未落库 → 不记账、清空重试（防没发出却记账）",
-                                    i + 1)
+            if voice_result is None:
+                inp = Input(dev)
+                sent_n = 0
+                for i, r in enumerate(lines):
+                    if i:
+                        time.sleep(1.6)
+                    ok, got = inp.type_and_verify(r, actor)
+                    if not ok:
+                        log.warning("第%d条灌字失败（%r）", i + 1, got)
                         inp.clear()
                         break
-                    log.info("第%d条 unknown 但库已落库 → 按已发出记账", i + 1)
-                _mark_replied(to_uid, sid=sid, text=txt)
-                _RESID_N.pop(str(sid), None)   # 成功发出（或确认落库）→ 清熔断计数
-                sent_n += 1
-                try:
-                    from data import watch as _W
-                    _W.mark_self_write(6.0)
-                except Exception:
-                    pass
-                try:
-                    from brain import ratelimit as _RL
-                    _RL.note_sent()
-                except Exception:
-                    pass
-                if not _ok:
-                    log.warning("第%d条发送确认读不到输入框（unknown 已落库，按已发出记账）", i + 1)
-                log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
+                    # settle 1.2(×slow_factor 2.5=3s) -> 0.25：紧跟的 sent_ok 里
+                    # sleep(0.7)+dump(3s) 已经在等，重复等待纯浪费。
+                    if not inp.tap_send(actor, settle=0.25):
+                        log.warning("第%d条找不到发送按钮", i + 1)
+                        inp.clear()
+                        break
+                    # 🔴 2026-11-04 修（闭环）：**先做三态确认，再记账**。
+                    #   旧版「tap_send 成功就立即记账」把「输入框还有残留文本 = 明确没发出去」
+                    #   也记成已回 → 永不重试 = 永久漏回（违背必回铁律）。
+                    #   现在区分：residual=确实没发 → 不记账、下轮重试；
+                    #             ok/unknown=确认清空或读不到转场帧 → 按已发记账（防重复发送）。
+                    _ok = inp.sent_ok(actor, r, timeout=4)
+                    _why = getattr(inp, "last_reason", "") or ""
+                    if (not _ok) and _why == "residual":
+                        log.warning("第%d条确认未发出（输入框仍有内容）→ 不记账，下轮重试", i + 1)
+                        # 🔴 2026-11-16（修D'）：per-sid 熔断——txt 变化也续计（平台拒绝
+                        #   与会话状态绑定）；连续 ≥3 → 冷却 2h。她发新消息（txt 变）→
+                        #   should_skip key 变化自动绕过，不漏回真人新消息。
+                        # 🔴 2026-11-16 13:1x（B 轮反转修正）：residual 先落库交叉验证——
+                        #   '小野猫' 159 条/24h 全部落库, residual 全是 AI 声明条误读
+                        #   （hands/input.py 已加 banner 过滤, 此处兜底 banner 文案变化）。
+                        #   落库=已发出 → 按已发记账, 不熔断、不重发（防同话题轰炸）。
+                        _landed_r = False
+                        try:
+                            _needle_r = (r or "").strip()
+                            if _needle_r and sid:
+                                try:
+                                    from data import imdb as _IM3
+                                    _uid3 = _IM3.current_uid(dev)
+                                    _nm3 = _IM3._db_name_for_uid(dev, _uid3)
+                                    if _nm3:
+                                        _raw3 = _IM3._dev_sql(
+                                            dev, _nm3,
+                                            "select ifnull(text,'') from chatmsg where "
+                                            "sessionId='%s' order by localTime desc limit 1"
+                                            % str(sid), timeout=8) or ""
+                                        _ln3 = ""
+                                        for _x in _raw3.replace("\r", "").splitlines():
+                                            if _x.strip():
+                                                _ln3 = _x.strip()
+                                        if _ln3 and _needle_r in _ln3:
+                                            _landed_r = True
+                                except Exception as _e4:
+                                    log.debug("residual 实时库校验异常: %r", _e4)
+                                if not _landed_r:
+                                    try:
+                                        _lm2 = db.last_message(sid)
+                                        if _lm2 is not None:
+                                            _tx3 = (_lm2.text or "").strip()
+                                            _ct3 = (_lm2.content or "").strip()
+                                            if _needle_r in _tx3 or _needle_r in _ct3:
+                                                _landed_r = True
+                                    except Exception as _e5:
+                                        log.debug("residual 本地库校验异常: %r", _e5)
+                        except Exception as _e6:
+                            log.debug("residual 落库校验异常: %r", _e6)
+                        if _landed_r:
+                            log.info("第%d条 residual 但库已落库 → 按已发出记账（AI 声明条误读）", i + 1)
+                            _mark_replied(to_uid, sid=sid, text=txt)
+                            _RESID_N.pop(str(sid), None)
+                            sent_n += 1
+                            try:
+                                from data import watch as _Wg
+                                _Wg.mark_self_write(6.0)
+                            except Exception:
+                                pass
+                            continue
+                        _rn = int((_RESID_N.get(str(sid)) or 0) + 1)
+                        if _rn >= 3:
+                            log.warning("residual 连续 %d 次（sid 尾 %s，真·发送失败特征）→ 冷却 2h（residual_loop）",
+                                        _rn, str(sid)[-9:])
+                            mark_skip(sid, txt, "residual_loop", hours=2.0)
+                            _RESID_N[str(sid)] = 0
+                        else:
+                            _RESID_N[str(sid)] = _rn
+                        if getattr(inp, "last_diag", None):
+                            log.warning("[residual-取证] %s", inp.last_diag)
+                        # 修C：residual 期间 App 的输入中/心跳写库别拖垮下一个候选
+                        try:
+                            from data import watch as _Wf
+                            _Wf.mark_self_write(6.0)
+                        except Exception:
+                            pass
+                        inp.clear()
+                        break
+                    if (not _ok) and _why == "unknown":
+                        # 🔴 2026-11-16（P1, 平移 flow.py P0-B3）：unknown ≠ 已发出。
+                        #   实时查设备库确认这条文本是否落库; 未落库 → 不记账、清空重试。
+                        _landed = False
+                        try:
+                            _needle = (r or "").strip()
+                            if _needle and sid:
+                                try:
+                                    from data import imdb as _IM2
+                                    _uid2 = _IM2.current_uid(dev)
+                                    _nm2 = _IM2._db_name_for_uid(dev, _uid2)
+                                    if _nm2:
+                                        _raw2 = _IM2._dev_sql(
+                                            dev, _nm2,
+                                            "select ifnull(text,'') from chatmsg where "
+                                            "sessionId='%s' order by localTime desc limit 1"
+                                            % str(sid), timeout=8) or ""
+                                        _ln2 = ""
+                                        for _x in _raw2.replace("\r", "").splitlines():
+                                            if _x.strip():
+                                                _ln2 = _x.strip()
+                                        if _ln2 and _needle in _ln2:
+                                            _landed = True
+                                except Exception as _e2:
+                                    log.debug("unknown 实时库校验异常: %r", _e2)
+                                if not _landed:
+                                    try:
+                                        _lm = db.last_message(sid)
+                                        if _lm is not None:
+                                            _tx2 = (_lm.text or "").strip()
+                                            _ct2 = (_lm.content or "").strip()
+                                            if _needle in _tx2 or _needle in _ct2:
+                                                _landed = True
+                                    except Exception as _e3:
+                                        log.debug("unknown 本地库校验异常: %r", _e3)
+                        except Exception as _e:
+                            log.debug("unknown 落库校验异常（按未落库重试）: %r", _e)
+                        if not _landed:
+                            log.warning("第%d条 unknown 且库未落库 → 不记账、清空重试（防没发出却记账）",
+                                        i + 1)
+                            inp.clear()
+                            break
+                        log.info("第%d条 unknown 但库已落库 → 按已发出记账", i + 1)
+                    _mark_replied(to_uid, sid=sid, text=txt)
+                    _RESID_N.pop(str(sid), None)   # 成功发出（或确认落库）→ 清熔断计数
+                    sent_n += 1
+                    try:
+                        from data import watch as _W
+                        _W.mark_self_write(6.0)
+                    except Exception:
+                        pass
+                    try:
+                        from brain import ratelimit as _RL
+                        _RL.note_sent()
+                    except Exception:
+                        pass
+                    if not _ok:
+                        log.warning("第%d条发送确认读不到输入框（unknown 已落库，按已发出记账）", i + 1)
+                    log.info("✓ 已回(%d/%d) uid=%s: %r", i + 1, len(lines), to_uid, r)
 
             if sent_n:
                 # 🔴 §104：按**实际发出条数**落账，不等实时库 pull（5 分钟延迟会重复发）。
                 try:
-                    from brain import sendgate as _SG6
-                    _SG6.note_sent(str(sid), sent_n)
+                    if voice_result is None:
+                        from brain import sendgate as _SG6
+                        _SG6.note_sent(str(sid), sent_n)
                 except Exception as _e_ns:
                     log.warning("跟进台账记账失败 sid=%s: %r", sid, _e_ns)
                 out["sent"] += 1

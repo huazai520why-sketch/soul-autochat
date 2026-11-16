@@ -220,6 +220,8 @@ python run.py voice-send --text "我在" --sid 402857053500884668  # 当前会�
 | `SOUL_TTS_SPEAKER` | 方舟 Seed-TTS 2.0 音色 ID | 邻家男孩 2.0 |
 | `SOUL_TTS_URL` / `SOUL_TTS_RESOURCE_ID` | Agent Plan TTS HTTP 接口与资源 ID | 方舟官方默认 |
 | `SOUL_TTS_KEY` | Agent Plan 个人版/企业版 Key（也可放 `.tts_key`） | 空 |
+| `SOUL_AUTO_VOICE_REPLY` | `1` 时对方发语音就自动回一条 TTS 语音，并以设备库 `msgType=5` 确认 | `0` |
+| `SOUL_AUTO_VOICE_ALL` | 调试项：`1` 时文字消息也自动语音回复，生产建议保持 `0` | `0` |
 | `SOUL_MY_CONTACT` | 你自己的联系方式（**别写进源码**） | `13800138000`（示例） |
 | `SOUL_IDLE_SWITCH_MIN` | 空闲多少分钟切号 | `30` |
 | `SOUL_RESTART_MIN_GAP` | 两次重启 App 的最小间隔（秒） | `240` |
