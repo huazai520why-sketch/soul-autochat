@@ -33,6 +33,17 @@ CACHE = os.path.join(ROOT, "data", "cache")
 # 账号昵称映射（uid -> 名称）。发现新账号时用 uid 兜底。
 ME = {"96691646": "抬头仰望星空", "402857053": "离殇描绘未来时光"}
 
+# 🔴 2026-11-17 修复 S4-AI-filter（P0）：AI 会话 uid 黑名单。
+# 现象：daily_review 把 AI 会话（来自 AI_PARTNER 通道）当真人计入
+# catch_rate / engaged / cold_ratio 等指标，污染统计口径。
+# 根因：session 表 schema（见 data/imdb.py:11-12）只有
+#   (id, sessionId, chatType, userType, toUserId, unReadCount, timestamp,
+#    lastMsgText, msgStatus, status, dbStatus, extInfo) —— **没有 comeFrom 列**，
+# 所以只能 Python 侧按 toUserId 黑名单过滤。
+# 口径：命中黑名单的会话在 `collect()` 层直接跳过 —— 触达层（reach）与
+# 对话层（dialog）都会剔除，与「把 AI 当真人」的污染一并清掉。
+AI_UIDS = {"388335289", "388335475"}
+
 now = dt.datetime.now()
 TODAY0 = dt.datetime(now.year, now.month, now.day)
 YEST0 = TODAY0 - dt.timedelta(days=1)
@@ -146,6 +157,9 @@ def collect(ts_from, ts_to):
             by[sid].append((str(snd), t, txt))
         for sid, msgs in by.items():
             to_uid = sess.get(sid, "?")
+            # 🔴 2026-11-17 S4-AI-filter：跳过 AI 会话（uid 黑名单）
+            if str(to_uid) in AI_UIDS:
+                continue
             name = nicks.get(str(to_uid)) or nicks.get(to_uid) or ("UID:%s" % to_uid)
             mine = [m for m in msgs if m[0] == uid_s]
             hers = [m for m in msgs if m[0] != uid_s]

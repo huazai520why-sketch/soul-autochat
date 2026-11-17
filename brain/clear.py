@@ -787,11 +787,22 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                     #   每轮能推进到第 4 个及以后的真待回，不再卡死在前 3 人。
                     log.warning("连续 %d 次「末条是她但发不出」→ 给该 sid 记短冷却，继续下一个",
                                 her_stuck)
-                    _hs_sid = _sid_hint or (list(handled_sids)[-1] if handled_sids else None)
-                    if _hs_sid:
+                    # 🔴 2026-11-17（F2/F3 P1）：兜底路径 `_sid_hint=None, handled_sids=[]`
+                    #    会把 _hs_sid 算成 None → 不记冷却 → 同一人下一轮又被拉出来空烧。
+                    #    改：优先用**本行已反查好的 _sid**（line ~693 已按 sid_hint /
+                    #    flow.sid_from_row 得到，不必再跑 4 条 SQL 重查）；仍拿不到就退回
+                    #    handled_sids 末位；全都没有才用 r.nickname 兜底记（有键总比漏记强）。
+                    _hs_sid = _sid or _sid_hint \
+                        or (list(handled_sids)[-1] if handled_sids else None)
+                    _hs_key = str(_hs_sid) if _hs_sid else str(r.nickname or "")
+                    # 🔴 F3：原 hours=0.1（6 分钟）与额度窗口（滚动 24h）严重不匹配 ——
+                    #    额度满的会话每 6 分钟被重拉一遍，纯空烧。改 2 小时（简化口径，
+                    #    不去查 verdict 降低耦合；2h 也远比 6min 强，且不会把「等她回」
+                    #    的正常待回压得过死）。
+                    if _hs_key:
                         try:
                             from brain.pendingq import mark_skip as _ms
-                            _ms(str(_hs_sid), '', 'her_stuck', hours=0.1)
+                            _ms(_hs_key, '', 'her_stuck', hours=2.0)
                         except Exception as _e_hs:
                             log.debug("her_stuck 短冷却记台账异常（不影响继续）: %r", _e_hs)
                     her_stuck = 0  # 重置计数，继续处理下一个候选

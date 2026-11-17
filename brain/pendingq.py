@@ -44,7 +44,9 @@ CAND_SCAN = int(os.environ.get("SOUL_CAND_SCAN", "60") or 60)
 #   翻屏比搜索便宜 8 倍且不会触发 clear_text/切后台风险。实测 22h 的会话
 #   翻 3 屏落空、转搜索又超时；多翻 2 屏（+8s）远比搜一次（32s）划算。
 FIND_PAGES = int(os.environ.get("SOUL_FIND_PAGES", "5") or 5)
-SKIP_UID_PREFIX = ("2042683",)     # 官方营销号段（实测 2042683xx 全是积分/礼物推送）
+SKIP_UID_PREFIX = ("2042683",                    # 官方营销号段（实测 2042683xx 全是积分/礼物推送）
+                   "388335289", "388335475",     # 官方 AI_PARTNER 号（Soul 官方 AI 助手，不能当真人回）
+                   )
 LOOKBACK_DAYS = 7
 SCAN_SESSIONS = 300
 # 🔴 2026-11-08 03:30（P0 死锁修复，**阈值按实测数据修正：72h → 24h**）
@@ -1346,6 +1348,25 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                       sid, _r.get("reason") or "?", max(0.0, _left_min))
             _sla_warn(sid, to_uid, last.ts, "冷却中 剩%.0f分" % max(0.0, _left_min))
             continue
+        # 🔴 2026-11-17（F1 P0 · 流程层空烧主根因）：上面 1309 行的 _SG3.state_of
+        #    与发送闸 sendgate.allow() 的**判定时机不同源**：
+        #      · 候选链这里在「扫描期」判，此时 sent_24h 尚未计入本轮，常判 PENDING；
+        #      · sendgate.allow() 在「发送前」判，滚动 24h 已满 → FOLLOWING → allowed=0。
+        #    结果：候选被选出来→进会话→被闸拦→0 发出，循环空转（窗口 479 进 54 回）。
+        #    修法：在真正入队（out.append）**之前**再按「台账口径」复判一次，只有
+        #    真正能发（allowed>0）的才入队，把闸口径提前到候选口径，消除空烧。
+        #    注意：这里刻意**不传 her_ts_ms**（不落盘水位线，复判是纯只读的），
+        #    my_last_ts_ms 沿用上面已算好的 _my_ts_ms，保持与发送闸同一判据。
+        try:
+            from brain import sendgate as _SG4b
+            _vdb = _SG4b.state_of(str(sid), my_last_ts_ms=_my_ts_ms, has_human=True)
+            if _vdb.allowed <= 0:
+                scan_stats["gate_skip:%s" % _vdb.state] += 1
+                log.debug("候选闸拦截 uid=%s sid=%s state=%s allowed=0（%s）",
+                          to_uid, sid, _vdb.state, _vdb.reason)
+                continue
+        except Exception as _e_gate:
+            log.debug("候选闸复判异常 → 放行（发送闸仍会兜底）: %r", _e_gate)
         out.append((sid, to_uid, txt, int(last.ts or 0), _burst_n(db, sid, db.uid)))
 
     # 🔴🔴🔴 2026-11-09 P0（最后一道闸 · 设备未读对账）

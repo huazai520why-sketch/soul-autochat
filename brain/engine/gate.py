@@ -74,6 +74,13 @@ _PROMISE_RE = re.compile(
     r"(?:我给你|等下|回头|改天|晚点|下次)[^，。！？\s]{0,10}"
     r"(?:讲|说|发|找|寄|带|看|吃|扯|推)"
     r"|(?:推|发)你")
+# 🔴 2026-11-17 修复 S2（P0）：她索取方信号（「你要我/你让我/你叫我/你要/你让/
+#   要我/让我」）→ 她主动要求时我回「回头给你」是正常应答，不是主动空头承诺
+_PROMISE_HER_ASK_RE = re.compile(
+    r"你要我|你让我|你叫我|你要是|你要|你让|要我|让我")
+# 强承诺词：命中即维持 block（真把话讲死了）
+_PROMISE_STRONG_RE = re.compile(
+    r"我一定|我保证|放心|肯定|一定|包在我|说定|说好")
 
 # 🔴 2026-11-08 补：**结构判据**（dialog-designer 实测 19 条露骨句，纯子串表漏 7 条）。
 #   为什么必须有这一层：把「上床/开房」从 HARD_BAN 移走后，`今晚出来开个房`
@@ -330,11 +337,32 @@ _COLD_ACK_MAX = 12          # 超过这个长度视为「后面还有内容」�
 
 
 def cold_ack_hit(t):
-    """整条只是一句「我在/刚看到」→ 零信息，命中返回 True。"""
+    """整条只是一句「我在/刚看到」→ 零信息，命中返回 True。
+
+    🔴 2026-11-17 修复 S1（P0 gate.py:332-337）：原版命中 `_COLD_ACK` 且 ≤12 字
+      就 fail-closed（返回 True，「零信息应答」整轮作废），单候选形态下会导致
+      引擎无产出。现改为「分句清洗」：先把 `_COLD_ACK` 头部词剥掉，若剩余部分
+      ≥2 字且有实义内容 → 放行（返回 False）。
+      例：「在呢，你说」→ 剥「在呢」→ 剩「你说」（2 字）→ 放行。
+      「在呢」单独一句 → 剩「」（0 字）→ 仍判零信息（block）。
+    """
     s = str(t or "").strip()
     if not s or len(s) > _COLD_ACK_MAX:
         return False
-    return any(w in s for w in _COLD_ACK)
+    if not any(w in s for w in _COLD_ACK):
+        return False
+    # 分句清洗：剥掉冷 ACK 头部词、常见连接/标点，看剩下的实义部分
+    rest = s
+    for w in _COLD_ACK:
+        if rest.startswith(w):
+            rest = rest[len(w):]
+            break
+    rest = re.sub(r"^[\s，。！？、,.!?~…\-—:：]+", "", rest)
+    # 剩余 ≥2 字（按 _norm 去掉标点空白后）且有实义 → 放行
+    rest_norm = _norm(rest)
+    if len(rest_norm) >= 2:
+        return False
+    return True
 
 
 def solicit_hit(t):
@@ -350,7 +378,26 @@ def solicit_hit(t):
 
 
 def promise_hit(t):
-    return bool(_PROMISE_RE.search(str(t or "")))
+    """空头承诺：命中返回 True。
+
+    🔴 2026-11-17 修复 S2（P0 gate.py:73-76,453-454）：rules.py 教的「我记着，
+      回头给你」等正常应答被 _PROMISE_RE 整句误杀。她索取时的「回头给你」是
+      回应，不是主动空头承诺。降级规则（按序）：
+        1) 强承诺词（我一定/我保证/放心/肯定/一定/包在我/说定/说好）→ block
+        2) 她索取方信号（你要我/你让我/你叫我/你要/你让/要我…）→ 放行
+        3) 整句 ≤16 字且不含强承诺词 → 降级为 warning，不 block
+        4) 其余 → block（保持原有硬闸强度）
+    """
+    s = str(t or "")
+    if not _PROMISE_RE.search(s):
+        return False
+    if _PROMISE_STRONG_RE.search(s):
+        return True                              # 「我一定/我保证/放心…」真把话讲死
+    if _PROMISE_HER_ASK_RE.search(s):
+        return False                             # 她索取时的「回头给你」= 应答
+    if len(_norm(s)) <= 16:
+        return False                             # 短且无强承诺词 → 降级为 warning
+    return True
 
 
 def reverse_hit(t):

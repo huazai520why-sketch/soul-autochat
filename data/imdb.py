@@ -340,12 +340,28 @@ class IMDB(object):
             身份校验 → fail-closed 永远不发 63 次
           session.lastMsgText 与列表红点是同一份数据，必须纳入。
         """
+        # 🟡 2026-11-17 修复 D1（P0 session_digest 硬编码 SELECT chatType）：
+        #   镜像 session 表可能缺 chatType 列（schema 漂移：缩水合并 / open_account→sync
+        #   两条路径交替作用同一文件）。原代码硬编码 SELECT chatType，列缺失时整个
+        #   query 抛 OperationalError: no such column，被下面 except→log.debug→return None
+        #   **静默吞掉**，导致摘要读不到、末条判定全盲。
+        #   修法：先查 cols("session") 看有没有 chatType；没有就不取该列，
+        #   chat_type 返回 None。并把 except 的 log.debug 升为 log.warning 便于定位。
         try:
+            _scols = set()
+            try:
+                _scols = set(r[1] for r in self.con.execute("PRAGMA table_info(session)"))
+            except Exception:
+                pass
+            _sel = "toUserId, unReadCount, lastMsgText, timestamp"
+            _has_chattype = "chatType" in _scols
+            if _has_chattype:
+                _sel += ", chatType"
             r = self.con.execute(
-                "SELECT toUserId, unReadCount, lastMsgText, timestamp, chatType "
-                "FROM session WHERE sessionId = ?", (session_id,)).fetchone()
+                "SELECT %s FROM session WHERE sessionId = ?" % _sel,
+                (session_id,)).fetchone()
         except Exception as e:
-            log.debug("读 session 摘要异常: %r", e)
+            log.warning("读 session 摘要异常: %r", e)
             return None
         if r is None:
             return None
@@ -354,7 +370,7 @@ class IMDB(object):
             "unread": int(r["unReadCount"] or 0),
             "text": (r["lastMsgText"] or "").strip(),
             "ts": int(r["timestamp"] or 0),
-            "chat_type": r["chatType"],
+            "chat_type": r["chatType"] if _has_chattype else None,
         }
 
     def my_recent_texts(self, session_id, limit=40):
@@ -676,15 +692,61 @@ def _merge_device_into_mirror(device, name, local, dest_dir):
             #   即两边同为 NULL 视为「未变化」，不会因为 NULL 比较而误更新。
             #   WHERE 覆盖所有被更新的列（upd = s_use 去掉 sessionId），保证
             #   任何一列变化都会触发更新，无一漏更新。
-            _chg = " OR ".join(
-                "%s IS NOT excluded.%s" % (c, c) for c in upd)
-            con.execute(
-                "INSERT INTO main.session (%s) SELECT %s FROM dev.session WHERE 1 "
-                "ON CONFLICT(sessionId) DO UPDATE SET %s WHERE %s"
-                % (", ".join(s_use), ", ".join(s_use),
-                   ", ".join("%s=excluded.%s" % (c, c) for c in upd),
-                   _chg))
-            touched = con.total_changes - before2
+            # 🔴 2026-11-17 修复 D2（P0 合并设备库 no such column: main.chatType）：
+            #   schema 漂移：缩水合并不整体替换 local（main.session 可能缺 chatType），
+            #   而 open_account→sync 非缩水轮走 _pull_all 换成带 chatType 的设备 schema，
+            #   两条路径交替作用同一文件 → main.session 列集合漂移。
+            #   原来 DO UPDATE ... WHERE 里裸列 `chatType IS NOT excluded.chatType`
+            #   在 ON CONFLICT 上下文里 `excluded.chatType` 没问题，但**裸 chatType**
+            #   会被解析到 main.session 当前行；若 main.session 缺该列 → 报
+            #   `no such column: main.chatType`，整个 UPSERT 崩（窗口内连报 4 次，
+            #   几分钟后 main.session 被 _pull_all 换成带 chatType 的 schema 又自愈）。
+            #   修法三层：
+            #     ① 用 main 实际列（s_cols）交叉核验 upd，剔除不在 main 的列；
+            #        剔完为空则跳过 UPSERT（log.warning）。
+            #     ② 整个 UPSERT 包 try/except，失败降级为 5 个最小列交集的 UPSERT
+            #        （同样加 WHERE 变化检测）。
+            #     ③ 降级仍失败才 return None。
+
+            def _do_session_upsert(_ins, _upd):
+                """_ins = INSERT 列（含 sessionId），_upd = DO UPDATE SET 列。
+                两者分开传，以便降级时把 INSERT 列也收到最小集，
+                否则 INSERT 里仍含 main.session 缺失的列会再次触发同款报错。"""
+                if not _upd or not _ins:
+                    return 0
+                _chg = " OR ".join(
+                    "%s IS NOT excluded.%s" % (c, c) for c in _upd)
+                con.execute(
+                    "INSERT INTO main.session (%s) SELECT %s FROM dev.session WHERE 1 "
+                    "ON CONFLICT(sessionId) DO UPDATE SET %s WHERE %s"
+                    % (", ".join(_ins), ", ".join(_ins),
+                       ", ".join("%s=excluded.%s" % (c, c) for c in _upd),
+                       _chg))
+                return con.total_changes - before2
+
+            # ① 交叉核验：剔除不在 main.session 的列（schema 漂移防护）
+            _main_scols = set(s_cols)
+            upd = [c for c in upd if c in _main_scols]
+            if not upd:
+                log.warning("合并设备库：session 可更新列在 main.session 全部缺失 → 跳过 UPSERT")
+                touched = 0
+            else:
+                try:
+                    touched = _do_session_upsert(s_use, upd)
+                except Exception as _e1:
+                    log.warning("合并设备库：session UPSERT 失败 %r → 降级为最小列 UPSERT", _e1)
+                    try:
+                        # ② 降级：INSERT/UPDATE 都收到 5 个最小列与 main∩dev 的交集
+                        _min = ["sessionId", "toUserId", "unReadCount",
+                                "lastMsgText", "timestamp"]
+                        _min_use = [c for c in _min
+                                    if c in _main_scols and c in s_dev]
+                        _min_upd = [c for c in _min_use if c != "sessionId"]
+                        before2 = con.total_changes
+                        touched = _do_session_upsert(_min_use, _min_upd)
+                    except Exception as _e2:
+                        log.warning("合并设备库：最小列 session UPSERT 仍失败 %r → 放弃合并", _e2)
+                        return None
         con.commit()
         try:
             con.execute("DETACH DATABASE dev")

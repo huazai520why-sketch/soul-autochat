@@ -33,9 +33,14 @@ def _short_her(text):
 
 
 def _short_reply_ok(text):
-    """冷/收尾硬约束：一条 ≤8 字，且不带显式问号。"""
+    """冷/收尾硬约束：一条 ≤14 字，且不带显式问号。
+
+    🔴 2026-11-17 修复 S3（P0）：旧阈值 8 字会把 rules.voice / prompt 给出的
+      10/12/14 字档好句全部判违（「回复超过 8 字」），与张量层最高 14 字档对不上。
+      改为 14（对齐 rules.voice 张力层最高档），其余逻辑不变。
+    """
     t = gate.clean(str(text or ""))
-    return len(t) <= 8 and ("?" not in t and "？" not in t)
+    return len(t) <= 14 and ("?" not in t and "？" not in t)
 
 
 def recent_mine(sid, n=4):
@@ -130,7 +135,7 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None,
     for c in cands:
         ok, why = gate.check(c, recent)
         if ok and short_her and not _short_reply_ok(c):
-            ok, why = False, "冷/收尾回复超过1条或8字"
+            ok, why = False, "冷/收尾回复超过1条或14字"
         if ok and pool and gate.dup_hit(c, pool):
             ok, why = False, "批内重复"
         if ok:
@@ -173,7 +178,7 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None,
         for c in gate.to_messages(raw2, 1):
             ok, why = gate.check(c, recent)
             if ok and short_her and not _short_reply_ok(c):
-                ok, why = False, "冷/收尾回复超过8字或带问号"
+                ok, why = False, "冷/收尾回复超过14字或带问号"
             if ok:
                 return [c]
     return None
