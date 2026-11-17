@@ -540,6 +540,24 @@ def _rows_ready(snap):
     return False
 
 
+def _has_suggest_section(snap):
+    """本帧有没有「猜你想搜」这个区块。
+
+    没有就**立刻返回**，一秒都不等：老版本 UI / 账号被风控时本来就没有这块，
+    干等等于给每个候选白加 3~4s。
+    """
+    for nd in snap.nodes:
+        try:
+            if "猜你想搜" in ((nd.text or "") + (nd.desc or "")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+_SUG_MISS_LOGGED = {"n": 0}
+
+
 def find_suggested(snap, kws):
     """在搜索页首帧（未输入）里按关键词找「猜你想搜」里的人。
 
@@ -622,13 +640,22 @@ def enter_suggested(actor, kws, preempt=None, wait_rows=4.5):
     t_end = time.time() + max(0.0, float(wait_rows))
     btn = kw = None
     label = ""
+    if not _has_suggest_section(snap):
+        # 本帧没有「猜你想搜」区块（老版本 UI / 被风控）→ 立刻走灌字搜索，不等
+        log.debug("猜你想搜：本页没有该区块 → 直接走搜索")
+        return None
     while True:
         btn, kw, label = find_suggested(snap, kws)
         if btn is not None:
             break
-        if _rows_ready(snap) or time.time() >= t_end:
-            log.debug("猜你想搜：没有目标人（rows_ready=%s kws=%r）",
-                      _rows_ready(snap), list(kws or [])[:4])
+        if _rows_ready(snap):
+            if _SUG_MISS_LOGGED["n"] < 3:
+                _SUG_MISS_LOGGED["n"] += 1
+                log.info("猜你想搜：名单已出但无目标人（kw=%r）→ 转灌字搜索（前 3 次打印）",
+                         list(kws or [])[:3])
+            return None
+        if time.time() >= t_end:
+            log.debug("猜你想搜：等名单超时（%.1fs）→ 转灌字搜索", wait_rows)
             return None
         if _wait_preempt(1.2, preempt):
             return None
@@ -1022,4 +1049,29 @@ def leave(actor, tries=3):
             actor.hand.back(settle=1.3)
     else:
         log.warning("试了 %d 次仍在搜索页 → 交给 nav 强制恢复", tries)
+    # 🔴 2026-11-17 09:52（修「回列表白烧 45s」）：新版搜索是从**「通讯录」页**进来的，
+    #   点「取消」只会退回通讯录，而 detect() 认不出通讯录（unknown）→ nav 连续
+    #   4~5 次「回不到 chatlist」→ 强制 am start 回首页，再重新点聊天：
+    #   实测 09:51:44→09:52:31 整整 47s 全耗在这上面，一个候选的时间就这么没了。
+    #   ⇒ 退出搜索后先看一眼：不是列表页就**直接点「聊天」Tab**（一下就好）。
+    try:
+        snap = actor.snap(force=True)
+        if detect(snap) != "chatlist":
+            tab = None
+            for nd in snap.nodes:
+                try:
+                    t = (nd.text or "") or (nd.desc or "")
+                    if t.strip() != "聊天":
+                        continue
+                    if nd.bounds[1] > 300:        # 只认顶栏的 Tab，别点进某个会话
+                        continue
+                    tab = nd
+                    break
+                except Exception:
+                    continue
+            if tab is not None:
+                actor.hand.tap_node(tab, settle=1.2)
+                log.info("退出搜索后不在列表页（%s）→ 点「聊天」Tab 回列表", detect(snap))
+    except Exception as e:
+        log.debug("leave: 点「聊天」Tab 失败（交给 nav）: %r", e)
     return nav.to_chatlist(actor)

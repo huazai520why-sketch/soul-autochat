@@ -2601,9 +2601,19 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         if age_h >= 48.0:
             _pg_n = 0
         elif restart:
-            _pg_n = 6
+            # 🔴 2026-11-17 10:00（搜索修好之后重新算这笔账）
+            #   改前是 6 屏。实测（09:55~09:58）每个 24~48h 的候选都卡在
+            #   「翻完 6 屏 ≈ 40s」→ 直接撞上 `_soft_s=45s` 上限被放过，
+            #   **根本没走到搜索**，一轮 4 个候选 0 回复（221s 全废）。
+            #   而搜索现在是可靠的 5.2s 出结果（§43），继续深翻只是把预算烧光。
+            #   ⇒ 3 屏（先按用户口径「列表里看得见就直接点」），没命中立刻转搜索。
+            _pg_n = 3
         else:
-            _pg_n = None
+            # 🔴 2026-11-17 10:02（同上）：默认 FIND_PAGES=5 屏 ≈ 45s，
+            #   实测 10:02:16 又一个候选「翻完 5 屏 → 已耗时 47s（上限 45s）→ 放过」，
+            #   搜索压根没轮到。她 24h 内说过话，会话按时间排在前面，3 屏足够；
+            #   3 屏没命中就交给 5.2s 的搜索，比继续深翻快得多。
+            _pg_n = 3
         # Voice rows often have no text/nickname in the DB. If we recovered a
         # nickname from logs, inspect a deeper list window before paying for a
         # likely-miss textual search. Recent sessions are usually near the top.
