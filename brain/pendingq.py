@@ -2760,8 +2760,48 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                     pass
                 S.leave(actor)
                 break
+            # 🔴 2026-11-17 09:35（用户拍板「先点猜你想搜、命中免输入」）
+            #
+            #   现场实测：搜索页**未输入任何字**的首帧，「猜你想搜」直接列出待回候选
+            #   （小孩姐 / 雾漫汀兰 / 后来，标注「你们聊得很不错,对方在等你聊天」）。
+            #   而灌字路径在当前版本**结构性不可用**：`send_keys` 与 AdbKeyboard 广播
+            #   都会让 Soul 整页关闭搜索 → 30s 空等 → timeout → 熔断（§42 根因 B）。
+            #   ⇒ 先用昵称在本帧找现成的人，点了直接进会话：零输入、零搜索、零超时。
+            #     找不到才走下面的灌字搜索（不拖累命中的人）。
             _got = 0
-            for _label, _word in _plan:
+            _entered = False
+            _sug = None
+            _sug_words = [str(w) for _l, w in _plan if _l == "昵称"]
+            if _sug_words:
+                try:
+                    mark_before_enter(actor)   # 未读快照必须在点进会话**之前**取
+                    _sug = S.enter_suggested(actor, _sug_words, preempt=_cand_preempt)
+                except Exception as _e:
+                    log.warning("猜你想搜尝试异常（继续走灌字搜索）: %r", _e)
+                    _sug = None
+            if _sug is not None:
+                s2, pg2, _sug_kw = _sug
+                if pg2 != "chat":
+                    # 点开了但不是会话（个人主页/话题页）→ 按「进不去」处理。
+                    # 绝不能往下走搜索：此时搜索页多半已经没了，只会白等 30s
+                    # 还被记成 timeout（通道问题），污染熔断与台账。
+                    log.info("猜你想搜点开后不是会话（page=%s）→ 本轮跳过 uid=%s",
+                             pg2, to_uid)
+                    mark_skip(sid, txt, "enter_fail", hours=ENTER_RETRY_H)
+                    try:
+                        S.leave(actor)
+                    except Exception:
+                        pass
+                    out["skipped"] += 1
+                    continue
+                _got = 1
+                _entered = True
+                _used_nick = _sug_kw
+                try:
+                    remember_nick(sid, _sug_kw)
+                except Exception:
+                    pass
+            for _label, _word in ([] if _entered else _plan):
                 log.info("搜索[%s] %r", _label, _word[:16])
                 _got = S.search(actor, dev, _word, preempt=_cand_preempt)
                 if _got < 0:
@@ -2846,12 +2886,16 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             # 🔴 2026-11-04（必回闭环）：按该会话**历史失败次数**依次点第 2、3 条搜索结果。
             #   原来 enter_first 永远点第一条 → 目标人不在第一条时死循环失败
             #   （实测「那不知道」「[狗子]」各失败 8 次、永远回不了）。
-            try:
-                _prev_n = int((_IDFAIL.get(_idfail_key(sid, txt)) or {}).get("n", 0))
-            except Exception:
-                _prev_n = 0
-            mark_before_enter(actor)      # 未读快照（同上）
-            s2, pg2 = S.enter_first(actor, skip=_prev_n)
+            # 🔴 2026-11-17：`_entered=True` 表示已经从「猜你想搜」直接点进会话了，
+            #   此时绝不能再调 enter_first —— 当前页是会话页，没有结果行，
+            #   它只会 back 出去把刚进的会话弄丢。
+            if not _entered:
+                try:
+                    _prev_n = int((_IDFAIL.get(_idfail_key(sid, txt)) or {}).get("n", 0))
+                except Exception:
+                    _prev_n = 0
+                mark_before_enter(actor)      # 未读快照（同上）
+                s2, pg2 = S.enter_first(actor, skip=_prev_n)
 
         if pg2 != "chat":
             log.info("没进会话（%s），记台账后跳过", pg2)

@@ -13,6 +13,7 @@
   - 结果行 = 宽 900、高 ~190 的可点击 ViewGroup
   - 点结果行 → 直接进 ConversationActivity
 """
+import re
 import threading
 import time
 
@@ -304,6 +305,7 @@ def open_search(actor, preempt=None):
     snap = actor.snap()
     if in_search_page(snap):
         log.info("已在搜索页（顶栏输入框 + 取消），直接复用，不找放大镜")
+        _remember_snap(snap)          # 供 enter_suggested 复用，省一次 dump
         return True
     # 🔴 2026-11-08（P0 根因）：先关弹窗！
     #   实测 layout_love_bg 从 y=100 盖到 y=733，把顶栏搜索键（y=62~122）整个罩住，
@@ -317,6 +319,7 @@ def open_search(actor, preempt=None):
     except Exception as e:
         log.warning("关弹窗异常（继续尝试搜索）: %r", e)
     if in_search_page(snap):
+        _remember_snap(snap)
         return True
     if preempt and preempt():
         LAST_REASON = "preempted"
@@ -390,10 +393,284 @@ def open_search(actor, preempt=None):
         #    唤醒直接报「打不开搜索页」），所以退一步：**顶栏输入框**（y<=300）即可。
         box = s.find_one(cls="EditText")
         if in_search_page(s) or (box is not None and box.bounds[1] <= 300):
+            _remember_snap(s)         # 供 enter_suggested 复用，省一次 dump
             return True
         time.sleep(1.5)
     log.warning("没进搜索页（顶栏输入框未出现）")
     return False
+
+
+# 🔴 2026-11-17 09:30（用户拍板：先点「猜你想搜」，命中就免输入）
+#
+#   现场实测（900x1600，证据图 `_ops/m_searchpage.png`）：搜索页**未输入任何字**的
+#   首帧，「猜你想搜」已经直接列出待回候选，并标注「你们聊得很不错,对方在等你聊天」：
+#       小孩姐 / 雾漫汀兰 / 后来 / 爱啾啾啾斯坦
+#   —— 这些正是已读未回名单里的人，**根本不用输入就能点进去**。
+#
+#   为什么必须走这条路（§42 根因 B）：只要往搜索框灌任何文字，`send_keys` 和
+#   AdbKeyboard 的 `ADB_INPUT_TEXT` 广播**都一样**会让 Soul 整页关闭搜索，退回
+#   聊天列表/通讯录 → 后面 max_wait=30s 全在错页面上空等 → timeout →
+#   连 3 次熔断 20 分钟。实测连「小孩姐」这种 6 分钟前刚聊过、确定存在的人
+#   也照样超时 ⇒ 灌字路径在当前版本**结构性不可用**。
+#
+#   ⇒ 先在本帧按昵称找可点行，命中直接 tap：**零输入、零搜索、零超时**。
+#     找不到才退回原来的灌字搜索（不拖累命中的人）。
+SUGGEST_MIN_W = 400          # 行宽下限：整行才够宽，「搜索历史」小标签远小于此
+SUGGEST_MIN_H = 56           # 行高下限：排除标签/按钮
+SUGGEST_MAX_H = 420          # 行高上限：再高就是「整个区块/整页」了，不是一行
+SUGGEST_MAX_UP = 10          # 沿 parent 上溯的层数上限
+SUGGEST_SKIP_KEYS = ("搜索历史", "猜你想搜", "取消", "清除", "删除")
+
+# 🔴 2026-11-17（帧复用，让「猜你想搜」的**失败路径零成本**）：
+#   `open_search()` 判定「已进搜索页」时手里本来就有一帧（它就是靠这帧判的），
+#   而一帧 dump 要 1.5~4.7s。如果这里不接过来、`enter_suggested()` 再抓一次，
+#   那么**没进猜你想搜名单的人**每人白白多花 2~5s —— 16 个候选就是 30~80s，
+#   正好把命中省下的钱赔回去。
+#   ⇒ open_search 成功时把这帧存下来，enter_suggested 直接复用（限 20s 内）。
+_LAST_SNAP = {"snap": None, "ts": 0.0}
+SNAP_REUSE_SEC = 20.0
+
+
+def _remember_snap(snap):
+    try:
+        _LAST_SNAP["snap"] = snap
+        _LAST_SNAP["ts"] = time.time()
+    except Exception:
+        pass
+
+
+def _recent_snap(max_age=SNAP_REUSE_SEC):
+    s = _LAST_SNAP.get("snap")
+    if s is None:
+        return None
+    if time.time() - float(_LAST_SNAP.get("ts") or 0.0) > max_age:
+        return None
+    return s
+
+
+def _kw_key(s):
+    """关键词归一：去所有空白 + 去首尾标点。
+
+    昵称里常带空格 / 全角标点（「小孩 姐」「后来。」），逐字比对会漏；
+    中间标点不动（是昵称本身的一部分）。
+    """
+    t = re.sub(r"\s+", "", str(s or ""))
+    _P = r"[\s，。！？、,.!?~～…\-—_：:；;\"'（）()\[\]【】]+"
+    t = re.sub("^" + _P, "", t)
+    t = re.sub(_P + "$", "", t)
+    return t
+
+
+def _row_box(node):
+    """从文字节点上溯到「整行容器」（400 <= 宽、56 <= 高 <= 420）。
+
+    🔴 必须不要求 clickable：实测（900x1600，11-17 09:27）
+       猜你想搜的行容器 `w=900 h=192` 是 **clickable=false**，
+       行内可点的只有 头像(116x115) / 昵称文字(118x49) / 私聊(149x67)。
+    🔴 必须有高度上限：否则「小标签里的文字」会一路爬到**整页根节点**（900x1600），
+       然后把这个页面上任意一个「私聊」按钮配给它 —— 等于瞎点。
+    实测参考：猜你想搜行 900x192、搜索历史区块 900x463（后者应被排除）。
+    """
+    p = getattr(node, "parent", None)
+    for _ in range(SUGGEST_MAX_UP):
+        if p is None:
+            return None
+        try:
+            b = p.bounds
+            h = b[3] - b[1]
+            if (b[2] - b[0]) >= SUGGEST_MIN_W and SUGGEST_MIN_H <= h <= SUGGEST_MAX_H:
+                return p
+        except Exception:
+            return None
+        p = getattr(p, "parent", None)
+    return None
+
+
+def _chat_button(snap, row):
+    """行内「私聊」按钮 —— 唯一明确表示「打开会话」的可点控件。
+
+    为什么不用「头像/昵称」：那两处点下去是**个人主页**，不是会话；
+    点进去 page != chat，还得 back 出来，等于白烧 5s 并可能把页面弄乱。
+    「私聊」是行尾一个语义明确的按钮（实测 b=(753,1094,821,1140)）。
+    同一行内取最靠右的那个（行尾），并按垂直中心是否落在行内来归属行。
+    """
+    try:
+        ry0, ry1 = row.bounds[1], row.bounds[3]
+    except Exception:
+        return None
+    best = None
+    for n in snap.nodes:
+        try:
+            if not (n.clickable and n.visible):
+                continue
+            txt = (n.text or "") + (n.desc or "")
+            if "私聊" not in txt:
+                continue
+            b = n.bounds
+            if not (ry0 <= (b[1] + b[3]) // 2 <= ry1):
+                continue
+            if best is None or b[0] > best.bounds[0]:
+                best = n
+        except Exception:
+            continue
+    return best
+
+
+def _rows_ready(snap):
+    """页面上是否已经渲染出「人」的行（用来区分「还没加载」和「就是没有这个人」）。
+
+    刚进搜索页时实测只有 40 个节点（只有「猜你想搜」标题），名单是**异步加载**的；
+    这时立刻判「没命中」会白丢机会。反之若名单已出、只是没有目标人，
+    就该立刻返回，绝不能再等 —— 那是每个候选白烧 2~4s。
+    """
+    cnt = 0
+    for nd in snap.nodes:
+        try:
+            t = (nd.text or "").strip()
+        except Exception:
+            continue
+        if not (2 <= len(t) <= 14):
+            continue
+        if any(k in t for k in ("搜索", "取消", "猜你想搜", "查看更多", "历史", "私聊")):
+            continue
+        if _row_box(nd) is not None:
+            cnt += 1
+            if cnt >= 3:
+                return True
+    return False
+
+
+def find_suggested(snap, kws):
+    """在搜索页首帧（未输入）里按关键词找「猜你想搜」里的人。
+
+    返回 (chat_btn, kw, row_label)；没命中返回 (None, None, "")。
+
+    匹配口径（**必须靠 parent 上溯**，不能只看可点节点自己的 text）：
+      · 行容器自己**没有文字**，昵称在子 TextView 里，且行容器不可点；
+      · 「搜索历史」的小标签自己也带文字，但不是会话行。
+    ⇒ 找「text/desc 含关键词的节点」→ 上溯到整行容器 → 再取该行的「私聊」按钮。
+      没有「私聊」按钮的行（例如搜索历史头像）**不点**：点头像/昵称是进个人主页。
+    排序：关键词优先级（昵称在前）> 完全相等（不是子串）> 屏幕位置靠上。
+    """
+    keys = []                     # [(归一后的 key, 原始词)] —— 原始词给上层做身份校验用
+    for k in (kws or []):
+        kk = _kw_key(k)
+        if len(kk) >= 2 and all(kk != x[0] for x in keys):
+            keys.append((kk, str(k)))
+    if not keys:
+        return None, None, ""
+    cands = []
+    for node in snap.nodes:
+        try:
+            t_txt = _kw_key(node.text)
+            t_desc = _kw_key(node.desc)
+        except Exception:
+            continue
+        txt = t_txt or t_desc
+        if not txt:
+            continue
+        for idx, (kk, orig) in enumerate(keys):
+            if kk not in txt:
+                continue
+            row = _row_box(node)
+            if row is None:
+                break
+            try:
+                label = " ".join(x for x in ((row.label or ""), (row.desc or ""))
+                                 if x).strip()
+                top = row.bounds[1]
+            except Exception:
+                break
+            if any(k in label for k in SUGGEST_SKIP_KEYS):
+                break
+            btn = _chat_button(snap, row)
+            if btn is None:
+                break
+            cands.append((idx, 0 if txt == kk else 1, top, btn, orig, label or txt))
+            break
+    if not cands:
+        return None, None, ""
+    cands.sort(key=lambda c: (c[0], c[1], c[2]))
+    _, _, _, btn, kk, label = cands[0]
+    return btn, kk, label
+
+
+
+def enter_suggested(actor, kws, preempt=None, wait_rows=4.5):
+    """在搜索页首帧直接点「猜你想搜」里的人进会话。
+
+    返回 (snap, page, kw)：`page == "chat"` 才算命中，其它 page 原样返回给调用方
+    处置；没命中/没尝试返回 None。
+
+    为什么不做成「返回 True/False」：调用方需要区分
+      · 压根没人可点（None）→ 照常走灌字搜索；
+      · 点了但没进会话（page != chat）→ 搜索页多半已经没了，走搜索只会空等，
+        应当直接按「进不去」处理，别记成搜索超时。
+
+    名单是**异步加载**的：刚 open_search 成功时实测只有 40 个节点（只有标题），
+    所以这里小步轮询等名单出现；一旦名单已出却没有目标人，立刻返回（不等）。
+    """
+    if preempt and preempt():
+        return None
+    snap = _recent_snap()          # 优先复用 open_search 判页时那一帧（省 1.5~4.7s）
+    if snap is None:
+        try:
+            snap = actor.snap(force=True)
+        except Exception as e:
+            log.debug("猜你想搜：取帧失败 %r", e)
+            return None
+    t_end = time.time() + max(0.0, float(wait_rows))
+    btn = kw = None
+    label = ""
+    while True:
+        btn, kw, label = find_suggested(snap, kws)
+        if btn is not None:
+            break
+        if _rows_ready(snap) or time.time() >= t_end:
+            log.debug("猜你想搜：没有目标人（rows_ready=%s kws=%r）",
+                      _rows_ready(snap), list(kws or [])[:4])
+            return None
+        if _wait_preempt(1.2, preempt):
+            return None
+        try:
+            snap = actor.snap(force=True)
+        except Exception:
+            return None
+    if preempt and preempt():
+        return None
+    log.info("猜你想搜命中 %r（%s）→ 点「私聊」，不输入 b=%s",
+             kw, (label or "")[:18], tuple(btn.bounds))
+    # 🔴 2026-11-17 09:37（真机实测）：**第一下点击会被输入法/焦点收走**。
+    #   现场取证（`_ops/probe_sug5.txt`，900x1600）：
+    #     tap1 → page=unknown（页面没变，还在搜索页）
+    #     tap2 → page=chat，标题正是「半夏」 → 进会话了
+    #   所以这里必须允许点两下；只点一下的表现就是「点了没反应」。
+    pg = None
+    snap2 = None
+    for attempt in (1, 2):
+        try:
+            actor.hand.tap_node(btn, settle=1.8 if attempt == 1 else 2.2)
+        except Exception as e:
+            if attempt == 1:
+                log.warning("点「私聊」失败: %r → 退回灌字搜索", e)
+                return None
+            break
+        snap2, pg = actor.wait_page(("chat",), timeout=4.0 if attempt == 1 else 7.0)
+        if pg == "chat":
+            if attempt == 2:
+                log.info("第 2 次点击后进入会话（第 1 次被键盘/焦点收走，属正常）")
+            log.info("✓ 猜你想搜直接进会话（零输入、零搜索）kw=%r", kw)
+            return snap2, pg, kw
+        if preempt and preempt():
+            return snap2, pg, kw
+        # 页面可能轻微位移（键盘收起），按关键词重新定位一次再点
+        btn2, kw2, _lab2 = find_suggested(snap2, [kw])
+        if btn2 is None:
+            log.info("第 %d 次点击后没进会话（page=%s），且行已不在本帧 → 放弃", attempt, pg)
+            return snap2, pg, kw
+        btn = btn2
+    log.info("点了「私聊」但没进会话（page=%s）kw=%r", pg, kw)
+    return snap2, pg, kw
 
 
 # 搜索结果里这些不是会话行（实测 2026-11-02）：
@@ -401,14 +678,70 @@ def open_search(actor, preempt=None):
 NOT_ROW_KEYS = ("探索更多话题", "更多搜索", "问题反馈", "搜索历史", "猜你想搜")
 
 
-def results(actor, snap=None):
-    """搜索结果里的**会话行**（大块可点击容器，排除「更多搜索」这类入口）。
+class _Row(object):
+    """搜索结果里的一行（新版 UI 没有整行容器，只能自己拼出来）。"""
+    __slots__ = ("node", "bounds", "label")
 
-    snap 传入则复用这一帧（重试循环里每次 dump 3.5~6s，不能白拉）。
+    def __init__(self, node, bounds, label):
+        self.node = node
+        self.bounds = bounds
+        self.label = label
+
+    def __repr__(self):
+        return "<Row %s %r>" % (tuple(self.bounds), self.label[:16])
+
+
+def results(actor, snap=None):
+    """搜索结果里的**会话行**。
+
+    🔴🔴 2026-11-17 09:41（新版结果页实测，修「搜索永远 0 条结果 → 30s 超时」）
+       旧版：一行 = 一个可点的 900x190 容器，所以老实现按「可点 + 宽>500 + 高>90」筛。
+       新版（Soul 6.41，900x1600，实测 dump 见 `_ops/probe_res.txt`）：
+           **根本没有整行容器**，每行只有三个可点/文字节点：
+             头像(c=1 116x116, l=38) / 昵称(c=0 108x49, l=182) / 私聊(c=1 149x68, l=713)
+             外加一行灰字「7天内活跃」
+       ⇒ 老实现筛出来的 count=0，于是每次都「等满 30s 仍无结果」→ timeout → 熔断。
+       新实现：**以「私聊」按钮为核心拼行**（每个私聊按钮 = 一行，垂直归属按中心点），
+       行标签取该行内的昵称等文字。点这一行 = 点私聊 = 直接进会话（已实测）。
+       老版布局没有「私聊」按钮，会自动落到下面的兼容分支，行为不变。
     """
     s = snap if snap is not None else actor.snap()
+    nodes = s.nodes
+
+    # ① 新版：以「私聊」按钮拼行
+    rows = []
+    for n in nodes:
+        try:
+            if not (n.clickable and n.visible):
+                continue
+            txt = ((n.text or "") + (n.desc or "")).strip()
+            if "私聊" not in txt:
+                continue
+            b = n.bounds
+            y0, y1 = b[1] - 60, b[3] + 60
+            parts = []
+            for m in nodes:
+                try:
+                    mb = m.bounds
+                    if not (y0 <= (mb[1] + mb[3]) // 2 <= y1):
+                        continue
+                    mt = (m.text or m.desc or "").strip()
+                    if not mt or "私聊" in mt or mt == "头像":
+                        continue
+                    parts.append(mt)
+                except Exception:
+                    continue
+            label = " ".join(list(dict.fromkeys(parts)))
+            rows.append(_Row(n, (0, y0, 900, y1), label))
+        except Exception:
+            continue
+    if rows:
+        rows.sort(key=lambda r: r.bounds[1])
+        return rows
+
+    # ② 老版：整行可点容器（保留兼容）
     out = []
-    for n in s.nodes:
+    for n in nodes:
         if not (n.clickable and n.visible):
             continue
         label = (n.label or "") + " " + (n.desc or "")
@@ -472,7 +805,16 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0, preempt=None):
     if box is None:
         log.warning("搜索页没有输入框")
         return 0
-    actor.hand.tap_node(box, settle=0.5)
+    # 🔴🔴 2026-11-17 09:39（真机实测，这才是「灌字必失败」的真根因）
+    #
+    #   实测：`tap_node(box)` **第一下会被输入法/焦点收走**（页面毫无变化），
+    #   输入框根本没拿到焦点 → 后面 `clear_text` / `send_keys` / AdbKeyboard 广播
+    #   全部落空，Soul 还会因此把搜索页关掉，于是我们 30s 全在错的页面上空等。
+    #   对照实验（`_ops/probe_type.txt`）：点 **两下** 输入框后再灌字，
+    #   页面稳在搜索页、2.5s 内就出结果（「小孩姐 / 私聊 / 7天内活跃」）。
+    #   ⇒ 必须点两下。第二下才是真正拿焦点的那一下。
+    actor.hand.tap_node(box, settle=0.6)
+    actor.hand.tap_node(box, settle=0.6)
     from core.device import note_action
     note_action()              # A2：下面全是绕过 Hand 的裸 u2 调用
     try:
@@ -519,6 +861,11 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0, preempt=None):
         LAST_REASON = "preempted"
         log.info("搜索等待中检测到新消息 → 提前结束搜索，优先新消息")
         return -1
+    # 🔴 2026-11-17 09:45（止血）：灌字后若**页面已经不是搜索页**，说明 Soul 把
+    #   搜索页关掉了（旧版本一输入就关；本次修了焦点后应极少发生，但仍需兜底）。
+    #   这时再等满 30s 纯属浪费，还会被记成 timeout 去污染熔断与台账。
+    #   连续 2 帧都不在搜索页且没有结果行 → 立刻放弃（约 5s 而不是 30s）。
+    _gone = 0
     while time.time() - t0 < max_wait:
         if preempt and preempt():
             LAST_REASON = "preempted"
@@ -558,6 +905,16 @@ def search(actor, dev, kw, wait=5.0, max_wait=30.0, preempt=None):
             _BREAKER["until"] = 0.0
             log.info("搜索 %r -> %d 条结果（%.1fs）", kw, len(rs), time.time() - t0)
             return len(rs)
+        # 没结果行：先判「是不是已经不在搜索页了」（见上面 _gone 的说明）
+        if not in_search_page(snap):
+            _gone += 1
+            if _gone >= 2:
+                LAST_REASON = "timeout"
+                log.warning("搜索 %r -> 灌字后已不在搜索页（%.1fs）→ 立即放弃，不等满 %.0fs",
+                            kw, time.time() - t0, max_wait)
+                return 0
+        else:
+            _gone = 0
         if _wait_preempt(1.2, preempt):
             LAST_REASON = "preempted"
             log.info("搜索结果轮询间隔检测到新消息 → 提前结束搜索，优先新消息")
@@ -628,7 +985,9 @@ def enter_first(actor, tries=3, timeout=5.0, skip=0):
                      len(rs), idx, idx + 1, rs[idx].bounds)
         else:
             log.info("点搜索结果(第 %d/%d 次) %s", i + 1, tries, rs[idx].bounds)
-        actor.hand.tap_node(rs[idx], settle=1.6)
+        # 🔴 2026-11-17：新版结果行是**自拼的 _Row**（以「私聊」按钮为核心），
+        #   点它要落到 .node（私聊按钮）上，而不是 _Row 对象本身。
+        actor.hand.tap_node(getattr(rs[idx], "node", rs[idx]), settle=1.6)
         snap, pg = actor.wait_page(("chat",), timeout=timeout)
         if pg == "chat":
             return snap, "chat"
