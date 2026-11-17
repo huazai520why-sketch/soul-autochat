@@ -244,6 +244,57 @@ def _find_search_entry(snap):
     return None
 
 
+# 🔴 2026-11-17（新版 UI 实测）：搜索框从「聊天」页搬到了「通讯录」页。
+#   「聊天」页顶栏现在只有「状态 / 通讯录|聊天 / 群组或好友」，一个搜索控件都没有，
+#   上面 _find_search_entry 的四级兜底**必然全落空** —— 这才是
+#   「找不到搜索入口」「搜索入口打不开」反复出现、每个候选白烧 40~50s 的真根因。
+CONTACTS_TAB = "通讯录"
+
+
+def _find_entry_via_contacts(actor, snap=None, preempt=None):
+    """新版 UI：搜索框在「通讯录」页。切过去再找一次，找不到返回 None。
+
+    实测（900x1600）「通讯录」页顶栏的控件和 11-08 记录完全一致：
+        b=(24,152,784,224)  cls=android.widget.EditText
+        text='搜索备注、昵称或者聊天记录'   （rid 为空）
+    ⇒ 匹配规则一个字都不用改，只是**页面换了一个**。
+
+    只在「当前屏没有入口」时调用：
+      · 老版本第一屏就能命中 → 根本不会进来，行为完全不变；
+      · 在会话内 / 广场（底部导航被隐藏）→ 找不到「通讯录」节点 → 返回 None，
+        继续走原来的「回聊天列表」兜底路径，不会比以前更差。
+    """
+    global LAST_REASON
+    if snap is None:
+        try:
+            snap = actor.snap()
+        except Exception:
+            return None
+    tab = None
+    try:
+        tab = snap.hit(text=CONTACTS_TAB) or snap.hit(desc=CONTACTS_TAB)
+    except Exception as e:
+        log.debug("找「通讯录」Tab 异常: %r", e)
+    if tab is None:
+        return None
+    try:
+        actor.hand.tap_node(tab, settle=1.8)
+    except Exception as e:
+        log.warning("点「通讯录」Tab 失败（继续走回列表兜底）: %r", e)
+        return None
+    if preempt and preempt():
+        LAST_REASON = "preempted"
+        return None
+    try:
+        snap2 = actor.snap(force=True)
+    except Exception:
+        return None
+    n = _find_search_entry(snap2)
+    if n is not None:
+        log.info("聊天页没有搜索入口（新版 UI）→ 切「通讯录」页找到了")
+    return n
+
+
 def open_search(actor, preempt=None):
     """从会话列表打开搜索页。返回 True/False。"""
     global LAST_REASON
@@ -271,6 +322,10 @@ def open_search(actor, preempt=None):
         LAST_REASON = "preempted"
         return False
     n = _find_search_entry(snap)
+    if n is None:
+        # 🔴 2026-11-17（新版 UI 根因）：先试「通讯录」页再走回列表的老兜底。
+        #   聊天页顶栏已无任何搜索控件，回列表/滚顶部再找必然还是空转 14~16s。
+        n = _find_entry_via_contacts(actor, snap=snap, preempt=preempt)
     if n is None:
         # 🔴 2026-11-02：重启后第一轮落点常在「广场 / 会话内」，只在当前屏找必然失败
         #    （现网实测连续 6 次 return False，5 个待回候选全被跳过 = 不回她）。
