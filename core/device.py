@@ -10,6 +10,7 @@
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -234,6 +235,30 @@ class Device:
         return p, len(raw), time.time() - t0
 
     # ---------- u2 ----------
+    def _connect_no_timeout(self, u2mod, timeout):
+        """无 timeout 保护路径：把 connect 包进 daemon 线程 + join(timeout) 兜底。
+
+        参照 eyes/uitree.py 的 `_dump_timeout` 模式：u2 内部 socket 没有超时，
+        设备 not online / 半死时会永久挂起。超时就抛 TimeoutError，让上层
+        reset / 跳过，绝不把整条链路拖死。
+        """
+        box = {}
+
+        def _run():
+            try:
+                box["d"] = u2mod.connect(self.serial)
+            except Exception as e:            # noqa: BLE001
+                box["err"] = e
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            raise TimeoutError("u2 connect 超过 %.0fs（设备无响应，无 timeout 保护路径）" % timeout)
+        if "err" in box:
+            raise box["err"]
+        return box["d"]
+
     def u2(self, timeout=60):
         """uiautomator2 连接（懒加载）。失败抛 RuntimeError，由上层决定是否降级 adb。"""
         if self._u2 is not None:
@@ -243,12 +268,22 @@ class Device:
         except ImportError as e:
             raise RuntimeError("未安装 uiautomator2: %s" % e)
         t0 = time.time()
+        self.__dict__.setdefault("_u2_timeout_ok", None)
         try:
             try:
-                d = u2mod.connect(self.serial, timeout=timeout)
+                if self._u2_timeout_ok is None or self._u2_timeout_ok:
+                    try:
+                        d = u2mod.connect(self.serial, timeout=timeout)
+                        self._u2_timeout_ok = True
+                    except TypeError:
+                        # 该版本 connect() 不接受 timeout kw —— 记下来，之后直接走无 timeout 路径
+                        self._u2_timeout_ok = False
+                        d = self._connect_no_timeout(u2mod, timeout)
+                else:
+                    d = self._connect_no_timeout(u2mod, timeout)
             except TypeError:
-                # 老版本 uiautomator2 的 connect() 没有 timeout 参数
-                d = u2mod.connect(self.serial)
+                # 兜底：万一探测路径本身仍以 TypeError 暴露（极老版本）
+                d = self._connect_no_timeout(u2mod, timeout)
             d.info  # 触发一次通信，确认真的可用
         except Exception as e:
             raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, e))

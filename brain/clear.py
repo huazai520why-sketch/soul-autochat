@@ -571,6 +571,7 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
     interrupted = False  # 本轮是否被「库有变化」打断（打断 ≠ 假红点）
     t_budget = time.monotonic()   # 用户 2026-11-02：一分钟内没进展就进下一步流程
     reuse_snap = False   # 双击分支已拿到最新快照 -> 下一轮别再 dump 一次
+    lib_refreshed = False  # 🔴 F-CL-06：本轮是否已为「库有未读但屏上认领不到」刷过一次
 
     # 🔴🔴 2026-11-08（库直读 P0）：清红点的**目标来源**从「屏幕上找红点行」
     #   改为「库里查未读会话」。原因（实测，探针 L/M/N）：
@@ -635,38 +636,67 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
             r = todo[0] if todo else None
             _sid_hint = None
         if r is None:
+            # 🔴 2026-11-18（F-CL-06 P0）：原来这里「badge_chat 恒 0 → 直接 break」，
+            #   而库剩余未读 _want 非空时，很可能只是列表**没滚到/没刷新**到那一屏，
+            #   屏上认领不到 → 提前 break → 双击跳锚点/翻屏兜底成死代码 → 真待回漏回。
+            #   现在：先保底快速退出（库真清完），再对「_want 非空」情形刷新重取认领一次。
             b = badge_chat(snap)
-            if b == 0:
+            if not _want:
+                # 库确认清完（无剩余未读目标）→ 确实无目标，快速退出（保留原快速路径）
                 break
-            # 当前屏没红点但角标还有 -> 双击跳锚点（用户定的清红点手段）
-            if doubles >= MAX_DOUBLE:
-                log.info("双击 %d 次仍没找到红点（角标=%s），本轮放弃", doubles, b)
-                break
-            doubles += 1
-            # 🔴 2026-11-04（提速·bug）：这里原来用 len(dots(snap))（**未过滤** handled），
-            #   而下面 nd 用的是**过滤后**的数量 —— 口径不一致 → 屏上只要有「刚回过的人」
-            #   的红点残留，before=(1,1)/after=(1,0) 恒不等 → stall 每次被清零 →
-            #   熔断永不触发，必须耗满 MAX_DOUBLE=5 次（实测白烧 63s）。
-            #   改成与 nd 同口径。
-            before_key = (b, len([r for r in dots(snap) if r.nickname not in handled]))
-            snap, pg = actor.double_tap_tab("聊天", expect="chatlist", settle=1.0)
-            if snap is None:
-                break
-            nd = len([r for r in dots(snap) if r.nickname not in handled])
-            nb = badge_chat(snap)
-            log.info("双击第%d次 -> 角标=%s 红点=%d", doubles, nb, nd)
-            if (nb, nd) == before_key:
-                stall += 1
-                if stall >= 3:
-                    log.info("连续 %d 次双击无进展（角标=%s 红点=%d）→ 判定推不动，本轮收工",
-                             stall, nb, nd)
+            if not lib_refreshed:
+                # 库还有未读但本屏认领不到 → 复用现成下拉刷新，重取一帧再认领一次
+                lib_refreshed = True
+                log.info("库剩余 %d 个未读但屏上认领不到（角标=%s）→ 下拉刷新后重认领一次",
+                         len(_want), b)
+                try:
+                    _pull_down(actor)
+                except Exception as _e:
+                    log.debug("下拉刷新异常: %r", _e)
+                snap = actor.snap()
+                if detect(snap) != "chatlist":
+                    snap = to_list(actor)
+                lib_pairs = _rows_for_lib(snap, db, _want, handled=handled)
+                if lib_pairs:
+                    r = lib_pairs[0][0]
+                    _sid_hint = lib_pairs[0][1]
+                    log.info("刷新后库定目标 sid=%s → 屏上第 %d 行 %r",
+                             _sid_hint, r.center[1], r.nickname)
+                    # 落到下面的 handled.add 分支去点进这个刚认领到的目标
+                else:
+                    # 仍认领不到 → 落到下面的双击跳锚点/翻屏兜底（不再是死代码）
+                    r = None
+            if r is None:
+                # 角标还有 -> 双击跳锚点（用户定的清红点手段）；恒 0 不再提前 break
+                if doubles >= MAX_DOUBLE:
+                    log.info("双击 %d 次仍没找到红点（角标=%s，库剩余未读=%d），本轮放弃",
+                             doubles, b, len(_want))
                     break
-            else:
-                stall = 0
-            # double_tap_tab 返回的就是双击后的新列表快照 → 下一轮直接用它，
-            # 不再在循环开头重新 dump（省一次 3s）
-            reuse_snap = True
-            continue
+                doubles += 1
+                # 🔴 2026-11-04（提速·bug）：这里原来用 len(dots(snap))（**未过滤** handled），
+                #   而下面 nd 用的是**过滤后**的数量 —— 口径不一致 → 屏上只要有「刚回过的人」
+                #   的红点残留，before=(1,1)/after=(1,0) 恒不等 → stall 每次被清零 →
+                #   熔断永不触发，必须耗满 MAX_DOUBLE=5 次（实测白烧 63s）。
+                #   改成与 nd 同口径。
+                before_key = (b, len([r for r in dots(snap) if r.nickname not in handled]))
+                snap, pg = actor.double_tap_tab("聊天", expect="chatlist", settle=1.0)
+                if snap is None:
+                    break
+                nd = len([r for r in dots(snap) if r.nickname not in handled])
+                nb = badge_chat(snap)
+                log.info("双击第%d次 -> 角标=%s 红点=%d", doubles, nb, nd)
+                if (nb, nd) == before_key:
+                    stall += 1
+                    if stall >= 3:
+                        log.info("连续 %d 次双击无进展（角标=%s 红点=%d）→ 判定推不动，本轮收工",
+                                 stall, nb, nd)
+                        break
+                else:
+                    stall = 0
+                # double_tap_tab 返回的就是双击后的新列表快照 → 下一轮直接用它，
+                # 不再在循环开头重新 dump（省一次 3s）
+                reuse_snap = True
+                continue
 
         handled.add(r.nickname)
         if _sid_hint:

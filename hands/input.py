@@ -72,16 +72,26 @@ class Input(object):
         self._d = None
 
     def clear(self):
+        """清空输入框。返回 bool：成功（无异常）→ True；两次 clear_text 都抛异常 → False。
+
+        🔴 2026-11-18（F-IN-01 P0）：原来失败只 log.warning 不返回状态，上层完全
+          无感知 → type_and_verify 照旧灌字，清空失败时 send_keys 会**追加**到残留上，
+          叠加成「残留+开场白」的拼接消息发出去。现在把成败结果返给调用方，由
+          type_and_verify fail-closed（清空失败本轮就不发）。
+        """
         try:
             self.d.clear_text()
+            return True
         except Exception as e:
             # 🔴 2026-11-03 修复 P2：原来只打日志不重连，后续继续用失效连接。
             log.warning("clear_text 异常: %r → 重置 u2 重试", e)
             self._reset()
             try:
                 self.d.clear_text()
+                return True
             except Exception as e2:
                 log.warning("clear_text 重试仍失败: %r", e2)
+                return False
 
     def type_text(self, text, settle=1.0):
         """灌字。返回 True/False（以输入框实际文本为准，不看返回值）。"""
@@ -118,12 +128,32 @@ class Input(object):
             #   若框内有残留，send_keys 会**追加**而非替换，校验用子串判定仍通过 →
             #   发出「残留+新文本」的拼接消息。现在每轮（含首轮）都先 clear。
             actor.hand.tap_node(n, settle=0.7)
-            self.clear()
+            clear_ok = self.clear()         # 🔴 F-IN-01：接收清空结果，不再无感知
+            if clear_ok is False:
+                # 🔴 2026-11-18（F-IN-01 P0）：清空失败时灌字会**追加**到残留上 →
+                #   发出「残留+新文本」拼接消息。fail-closed：本轮**跳过 send_keys、
+                #   不发送**，直接进下一次 tries 重试（下一轮重新点框+清空）。
+                log.warning("第%d次：清空输入框失败 → 本轮不发送，跳过灌字（fail-closed）",
+                            i + 1)
+                continue
             time.sleep(0.3)
             self.type_text(text, settle=0.9)
             snap2 = actor.snap()
             got = self.box_text(snap2)
-            if got and text.strip() in got:
+            # 🔴 2026-11-18（F-IN-01 P0）：校验**等值优先**，子串仅作宽松兜底且只在
+            #   clear() 明确返回 True（确认清空成功、无残留）时才允许 —— 这样
+            #   「清空失败 + 残留」不会被 `text in got` 误判为通过。
+            if got is not None and got == text.strip():
+                self._snap = snap2          # 给 tap_send 复用
+                try:
+                    from core.device import action_gen as _ag
+                    self._snap_gen = _ag()
+                except Exception:
+                    self._snap_gen = None
+                return True, got
+            if clear_ok and got and text.strip() in got:
+                log.warning("第%d次灌字等值不匹配但为已确认清空后的子串命中（宽松兜底通过）："
+                            "期望 %r 实际 %r", i + 1, text, got)
                 self._snap = snap2          # 给 tap_send 复用
                 try:
                     from core.device import action_gen as _ag
@@ -133,6 +163,8 @@ class Input(object):
                 return True, got
             log.warning("第%d次灌字未落地：期望 %r 实际 %r", i + 1, text, got)
         # 🔴 2026-11-14（F09）：失败返回读真实当前帧，避免复用 TTL 内旧帧误判。
+        # 🔴 2026-11-18（F-IN-01）：若全因清空失败而跳过发送，同样走到这里返回
+        #   (False, None)，上层按「明确没发」不记账、下轮重试。
         return False, self.box_text(actor.snap(force=True))
 
     def tap_send(self, actor, settle=1.2, snap=None):

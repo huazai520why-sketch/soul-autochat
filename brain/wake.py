@@ -40,7 +40,10 @@ def _load_woke():
 
 def _save_woke(d):
     try:
-        WOKE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), "utf-8")
+        tmp = "%s.tmp-%d" % (WOKE_FILE, int(time.time() * 1000))
+        with open(tmp, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(d, ensure_ascii=False, indent=2))
+        os.replace(tmp, WOKE_FILE)
     except Exception as e:
         log.warning("保存唤醒台账失败: %r", e)
 

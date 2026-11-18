@@ -1299,15 +1299,23 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   「和你聊天感觉不像一个人呢」一直没人回）；40 分钟内源 300 → 有效 0。
             #   修法：变量名带单位，毫秒就是毫秒，秒才乘 1000，绝不二次换算。
             _my_ts_ms = float(_my_last_ts_ms(db, str(sid)) or 0.0)      # 毫秒
-            if not _my_ts_ms:
-                try:
-                    from data import reply_state as _RSx
-                    _recx = _RSx.get(str(sid))
-                    _posx = [float(x) for x in (_recx.get('sends') or []) if float(x) > 0]
-                    if _posx:
-                        _my_ts_ms = max(_posx) * 1000.0                  # 秒 → 毫秒
-                except Exception:
-                    pass
+            # 🔴 2026-11-18（§46 D-01 P0）：候选闸与发送闸 my_last_ts_ms 必须同源。
+            #   原逻辑主取镜像（滞后 ~300s），仅镜像=0 才用 reply_state.sends 兜底；
+            #   而真正发送前 sendgate.allow() 用的是实时 reply_state.sends。于是「我刚回完、
+            #   镜像还滞后」的会话：候选闸看到旧 my_last → 放行；发送闸看到新鲜 sends → AWAITING
+            #   拦掉 → 候选选出、进会话、被拦 0 发出，循环空烧（重启后窗口「回 0 条」203 次）。
+            #   修法：取「镜像值」与「reply_state.sends 最新值」的较大者作 my_last_ts_ms，
+            #   保证候选闸看到的时间不早于发送闸会看到的，消除同源差导致的空烧。
+            try:
+                from data import reply_state as _RSx
+                _recx = _RSx.get(str(sid))
+                _posx = [float(x) for x in (_recx.get('sends') or []) if float(x) > 0]
+                if _posx:
+                    _rs_ms = max(_posx) * 1000.0                     # 秒 → 毫秒
+                    if _rs_ms > _my_ts_ms:
+                        _my_ts_ms = _rs_ms
+            except Exception:
+                pass
             _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True,
                                 my_last_ts_ms=_my_ts_ms)
             if _vd.state == _VD.ARCHIVED:
@@ -1355,11 +1363,14 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
         #    结果：候选被选出来→进会话→被闸拦→0 发出，循环空转（窗口 479 进 54 回）。
         #    修法：在真正入队（out.append）**之前**再按「台账口径」复判一次，只有
         #    真正能发（allowed>0）的才入队，把闸口径提前到候选口径，消除空烧。
-        #    注意：这里刻意**不传 her_ts_ms**（不落盘水位线，复判是纯只读的），
-        #    my_last_ts_ms 沿用上面已算好的 _my_ts_ms，保持与发送闸同一判据。
+        #    注意：这里传 her_ts_ms=int(last.ts or 0)（与 1311 主判同值）——§46 D-01
+        #    一致性修复：原漏传会让 state_of 回落台账 her_ts（可能陈旧）→ 误判。
+        #    state_of 只读 verdict、不调 RS.on_her，不会落盘水位线，复判仍纯只读。
+        #    my_last_ts_ms 沿用上面已算好的 _my_ts_ms（镜像∪sends 取 max），与发送闸同源。
         try:
             from brain import sendgate as _SG4b
-            _vdb = _SG4b.state_of(str(sid), my_last_ts_ms=_my_ts_ms, has_human=True)
+            _vdb = _SG4b.state_of(str(sid), her_ts_ms=int(last.ts or 0),
+                                  my_last_ts_ms=_my_ts_ms, has_human=True)
             if _vdb.allowed <= 0:
                 scan_stats["gate_skip:%s" % _vdb.state] += 1
                 log.debug("候选闸拦截 uid=%s sid=%s state=%s allowed=0（%s）",
