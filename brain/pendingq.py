@@ -538,7 +538,9 @@ def _is_noreply_high(sid):
 _UNREAD_BEFORE = {"set": None}
 
 # 设备存活校验的缓存（见 _device_live_uids）
-_LIVE_CACHE = {"v": None, "ts": 0.0}
+# 2026-11-20 修复 X-01：单槽缓存无 uid 维度 → 同进程切号时后一账号复用/覆盖前一账号的
+#   sid 集合，未读差分被别的账号污染。改为按 uid 分桶（"uid" 标记当前桶归属）。
+_LIVE_CACHE = {"uid": None, "v": None, "ts": 0.0}
 # 🔴🔴 2026-11-12（DS-06）：TTL 与 data.imdb.DEVICE_LIVE_TTL_S 统一（默认 120s）。
 #   原来写死 120；改为引用 imdb 的共享常量，两边口径永不失联。
 try:
@@ -548,7 +550,8 @@ try:
 except Exception:
     _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
-_UNREAD_CACHE = {"ts": 0.0, "sids": set()}
+# 2026-11-20 修复 X-01：同 _LIVE_CACHE，加 uid 维度防切号污染。
+_UNREAD_CACHE = {"uid": None, "ts": 0.0, "sids": set()}
 _CANDIDATE_CACHE = {"key": None, "at": 0.0, "value": []}
 CANDIDATE_CACHE_S = float(os.environ.get("SOUL_CANDIDATE_CACHE_S", "8") or 8)
 
@@ -566,7 +569,9 @@ def _device_unread_sids(db):
     #   清缓存，函数内 60s 判断形同虚设（docstring 写了 TTL 但从未据此失效）。
     #   与 _device_live_uids 同款结构：非空 + 未过 60s 才复用，否则重扫设备库。
     now = time.time()
-    if _UNREAD_CACHE and now - float(_UNREAD_CACHE.get('ts', 0)) < 60.0 \
+    _cur_uid = str(getattr(db, "uid", None))  # 2026-11-20 修复 X-01：按 uid 分桶判命中
+    if _UNREAD_CACHE and _UNREAD_CACHE.get('uid') == _cur_uid \
+            and now - float(_UNREAD_CACHE.get('ts', 0)) < 60.0 \
             and _UNREAD_CACHE.get('sids') is not None:
         return _UNREAD_CACHE['sids']
     out = set()
@@ -579,7 +584,8 @@ def _device_unread_sids(db):
                 out = {str(k) for k, v in m.items() if v}
     except Exception as e:
         log.debug("设备未读集合取不到（降级为不硬放行）: %r", e)
-    _UNREAD_CACHE.update(ts=now, sids=out)
+    # 2026-11-20 修复 X-01：写入时记 uid，切号后视为未命中强制重扫
+    _UNREAD_CACHE.update(uid=_cur_uid, ts=now, sids=out)
     return out
 
 
@@ -590,7 +596,8 @@ def invalidate_live_cache():
     库刚同步进新会话时，缓存里可能还没有这个人 → 被当成「App 里已不存在」
     移出候选（实测一次移出 180 个）。新消息到达时清掉，逼它重新扫设备库。
     """
-    _LIVE_CACHE.update(v=None, ts=0.0)
+    # 2026-11-20 修复 X-01：清缓存时一并清 uid 标记，避免残留桶被误判命中
+    _LIVE_CACHE.update(uid=None, v=None, ts=0.0)
     _CANDIDATE_CACHE.update(key=None, at=0.0, value=[])
     log.info("设备存活缓存已清除（库变化信号触发）")
 
@@ -608,7 +615,8 @@ def invalidate_unread_cache():
     修法：daemon.cycle() 在 _dirty=True 时调本函数清缓存，
     让紧接着的 candidates() 重新查设备库拿到最新的未读集合。
     """
-    _UNREAD_CACHE.update(ts=0.0, sids=set())
+    # 2026-11-20 修复 X-01：清缓存时一并清 uid 标记，避免残留桶被误判命中
+    _UNREAD_CACHE.update(uid=None, ts=0.0, sids=set())
     _CANDIDATE_CACHE.update(key=None, at=0.0, value=[])
     log.info("设备未读缓存已清除（库变化信号触发）")
 
@@ -633,8 +641,10 @@ def _device_live_uids(db):
     None / 空集都不缓存（下次重查），保持「降级不过滤」的旧行为。
     """
     now = time.time()
+    _cur_uid = str(getattr(db, "uid", None))  # 2026-11-20 修复 X-01：按 uid 分桶判命中
     cache = _LIVE_CACHE.get("v")
-    if cache and (now - _LIVE_CACHE.get("ts", 0)) < _LIVE_TTL_S:
+    if _LIVE_CACHE.get("uid") == _cur_uid and cache \
+            and (now - _LIVE_CACHE.get("ts", 0)) < _LIVE_TTL_S:
         return cache
     dev = getattr(db, "dev", None) or _DEV_REF.get("dev")
     if dev is None:
@@ -643,6 +653,7 @@ def _device_live_uids(db):
     from data import imdb as _IM
     uids = _IM.device_live_uids(dev, db.uid)
     if uids:
+        _LIVE_CACHE["uid"] = _cur_uid  # 2026-11-20 修复 X-01：写入时记 uid
         _LIVE_CACHE["v"] = uids
         _LIVE_CACHE["ts"] = now
     return uids
@@ -1803,7 +1814,12 @@ def remember_nick(sid, nick):
     try:
         import json as _json
         data = {k: v[1] for k, v in _NICK_CACHE.items() if v and v[1]}
-        NICK_FILE.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        # 2026-11-20 修复 D-08：原子写（tmp + os.replace），照搬 _save_idfail 范式。
+        #   改前 write_text 直接覆盖，进程崩溃留半截 JSON → 昵称台账全丢。
+        NICK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = NICK_FILE.with_name(NICK_FILE.name + ".tmp")
+        _tmp.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(_tmp), str(NICK_FILE))
         log.info("记住昵称 sid=%s → %r（下次可搜昵称）", key[-10:], t)
     except Exception as e:
         log.debug("昵称缓存落盘失败: %r", e)

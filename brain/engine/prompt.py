@@ -173,8 +173,12 @@ def _advance_block(her_msg, turns_body):
     if s["score"] < 0.50 or s["n_her"] < 8:
         return ""
     lines = [l for l in turns_body.splitlines() if l.startswith("- ")]
-    my = [l for l in lines if " 我: " in l or " 我：" in l]
-    her = [l for l in lines if " 她: " in l or " 她：" in l]
+    # 2026-11-20 修复 SPEECH-13：行解析口径与 her_stats 对齐，补 startswith 兜底，
+    # 兼容 `- MM-DD 我:内容`（无空格分隔）这类行，避免 my 列表为空导致判据失效。
+    my = [l for l in lines if " 我: " in l or " 我：" in l
+          or l[2:].strip().startswith("我:") or l[2:].strip().startswith("我：")]
+    her = [l for l in lines if " 她: " in l or " 她：" in l
+           or l[2:].strip().startswith("她:") or l[2:].strip().startswith("她：")]
     if _ADV_RE.search("\n".join(my[-6:])):
         return ""                       # 最近推过：歇 6 条我方消息（约半天），拒绝≠冻结
     recent_her = (her_msg or "") + "\n" + "\n".join(her[-6:])
@@ -244,7 +248,10 @@ def _age_note(turns_text):
         if ts > time.time() + 86400:                      # 跨年
             ts = time.mktime((now.tm_year - 1, int(m.group(1)), int(m.group(2)),
                               int(m.group(3)), int(m.group(4)), 0, 0, 0, -1))
+        # 2026-11-20 修复 SPEECH-12：脏行兜底（见 age_h 负值处理）
         age_h = (time.time() - ts) / 3600.0
+        if age_h < 0.0:                                   # 脏行：同月但日期在未来 → 当 0 处理
+            age_h = 0.0
     except Exception:
         age_h = 0.0
     if age_h > L2_MAX_AGE_H:

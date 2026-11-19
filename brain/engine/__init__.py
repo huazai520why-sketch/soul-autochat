@@ -160,6 +160,12 @@ def respond(her_msg, sid="", hist=None, restart_h=0.0, max_n=None,
     #   依据：offer 型问句保持热度 37.5%，单独陈述句只有 7.3% ——
     #   所以要求的不是「别问」，而是「问就问你给得起的东西」。
     if short_her:
+        # 2026-11-20 澄清 SPEECH-01：retry 文案（:167）让模型问「给得起的东西」
+        #   看似与闸毙问号冲突，但 `_short_reply_ok`（含问号判据）只在 short_her
+        #   分支被调用（本文件 :137、:180 两处均有 `short_her` 前置门控）。
+        #   走本分支时该闸不生效，非 short_her 的 retry 教模型问句是 OK 的；
+        #   short_her 自己的 retry（:163）本就「不提问」，与 :180 毙问号一致。
+        #   故 SPEECH-01 为误报，retry 文案无需改动。
         retry = ("她这条≤4字或正在收尾。只回一句，不超过8字，不提问、不追加、不挽留。"
                  "直接接住她那句或自然收住。")
     else:

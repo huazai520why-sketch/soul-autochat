@@ -34,8 +34,15 @@ _LOCK = threading.Lock()
 
 # 本地模型的熔断状态（连续无产出就静默一段时间，别反复白等）
 _LOCAL_GUARD = {"fail": 0, "until": 0.0}
+# 🔴 2026-11-20 修复 SPEECH-05：_LOCAL_GUARD 被 _local_worker 读写，原先无锁。
+#   当前 soul_localq 单 worker 无害，但 `fail>=3 → until=now+1800; fail=0` 两步非原子，
+#   将来加第二个 worker 会有竞态。加锁保护读改写。
+_LOCAL_GUARD_LOCK = threading.Lock()
 # 同一个人多久内不重复跑本地分析（画像+方案实测 22s，太快重复只会积压队列）
+# 🔴 2026-11-20 修复 SPEECH-04：WARM_GAP_S=0.0 时下面的间隔判断永不触发（死分支已删），
+#   但仍按 sid 记录时间戳 → 字典长期只增不减。改成超上限就整体 clear()，防无限增长。
 _WARM_LAST = {}
+_WARM_LAST_MAX = 500   # 2026-11-20 SPEECH-04：超过这么多 sid 就清空重来（保守保护，不上 LRU）
 # 🔴 2026-11-03（用户口径）：**每一条新消息都重新算**，不再 10 分钟一次。
 #   连发多条由 soul_localq 的合并语义兜住（只跑「当前这轮 + 最后状态那轮」）。
 WARM_GAP_S = 0.0
@@ -432,6 +439,8 @@ def _hook_hit(her_msg):
     for kws, meaning, howto, forbid in _HOOKS:
         for kw in kws:
             if kw in t and len(kw) > best_len:
+                # 2026-11-20 SPEECH-09：返回**组首词 kws[0]** 用于查 _HOOK_FALLBACK
+                #   （其键与 kws[0] 对齐），不是命中的 kw —— 行为正确，非 bug。
                 best = (kws[0], meaning, howto, forbid)
                 best_len = len(kw)
     return best
@@ -484,15 +493,18 @@ def _post_hook(lines, hook):
     if not hook or not lines:
         return lines
     key = hook[0]
-    new, fb = [], None
+    new, _used_fb = [], []
     for x in lines:
         if _is_hook_close(x):
-            if fb is None:
-                fb = _hook_fallback(key, avoid=tuple(lines))
+            # 🔴 2026-11-20 修复 SPEECH-10：旧写法两条关门句共用同一个 fb（fb 只在
+            #   None 时取一次），末尾去重后两条变一条，target_n=2 意图落空。
+            #   改成每次把已用 fb 计入 avoid，让下一条换池中下一句。
+            fb = _hook_fallback(key, avoid=tuple(lines) + tuple(_used_fb))
+            _used_fb.append(fb)
             new.append(fb)
         else:
             new.append(x)
-    if fb is None:
+    if not _used_fb:
         return lines                      # 没有关门句，原样返回
     # 两条都关门时避免兜底句发两遍（同句重复是群发穿帮）
     if len(new) > 1 and len(set(new)) < len(new):
@@ -612,7 +624,10 @@ def _local_worker(ctx):
         return
     # 🔴 熔断：本地模型挂了（Ollama 没起 / 没装模型）时，每个会话都会
     #    反复等 20s 再回落云端，等于白烧时间和额度。连续失败 3 次就静默 30 分钟。
-    if _t.time() < _LOCAL_GUARD["until"]:
+    # 2026-11-20 SPEECH-05：读 until 加锁（与下面写 fail/until 用同一把锁）。
+    with _LOCAL_GUARD_LOCK:
+        _guard_until = _LOCAL_GUARD["until"]
+    if _t.time() < _guard_until:
         log.debug("[本地] 熔断中，跳过 sid=%s", sid[-8:])
         return
     t0 = _t.time()
@@ -627,6 +642,10 @@ def _local_worker(ctx):
             SK = importlib.import_module("brain.skills")
             r = SK.run_all(sid, her, turns)
             meta = r.get("brief") or r.get("l0") or ""
+            # 🔴 2026-11-20 修复 SPEECH-06：skills 返回值可能带「【内部参考…】/【她的画像…】」
+            #   工具提示行（给模型自己看的），原样进 meta 会白占 token 且可能被复述。
+            #   _clean_l0 只剥这两类内部提示行，不误剥正常内容，此处让注释描述真正落地。
+            meta = _clean_l0(meta)
             if r.get("ok"):
                 log.info("[三技能完成] sid=%s 画像%d字 方案%d字 裁决%d字",
                          sid[-8:], len(r.get("l0") or ""), len(r.get("l1") or ""),
@@ -638,14 +657,17 @@ def _local_worker(ctx):
         log.warning("[本地分析] 生成失败(流程=%s): %r", LOCAL_FLOW, e)
 
     # 熔断计数：连续 3 次空 → 静默 30 分钟（本地挂了就别每个会话白等 25s）
-    if not meta:
-        _LOCAL_GUARD["fail"] += 1
-        if _LOCAL_GUARD["fail"] >= 3:
-            _LOCAL_GUARD["until"] = _t.time() + 1800
+    # 2026-11-20 SPEECH-05：fail+=1 / 判满置 until / 清零 是两步非原子操作，
+    #   整体加锁保证 check-act 原子性（当前单 worker 无害，为将来多 worker 防竞态）。
+    with _LOCAL_GUARD_LOCK:
+        if not meta:
+            _LOCAL_GUARD["fail"] += 1
+            if _LOCAL_GUARD["fail"] >= 3:
+                _LOCAL_GUARD["until"] = _t.time() + 1800
+                _LOCAL_GUARD["fail"] = 0
+                log.warning("本地分析连续 3 次无产出 → 熔断 30 分钟（不阻塞回复）")
+        else:
             _LOCAL_GUARD["fail"] = 0
-            log.warning("本地分析连续 3 次无产出 → 熔断 30 分钟（不阻塞回复）")
-    else:
-        _LOCAL_GUARD["fail"] = 0
 
     log.info("[本地完成] sid=%s %d字 共%.1fs 流程=%s",
              sid[-8:], len(meta), _t.time() - t0, LOCAL_FLOW)
@@ -667,9 +689,12 @@ def warm_local(sid, db=None, her_msg="", nick=""):
     # 而画像/方案不需要每条消息都重算（旧架构 _PC_TTL=200s 同理）。
     import time as _t
     key = str(sid)
-    if _t.time() - _WARM_LAST.get(key, 0) < WARM_GAP_S:
-        log.debug("[本地] %s 刚跑过，跳过", key[-8:])
-        return False
+    # 🔴 2026-11-20 修复 SPEECH-04：原 `if _t.time()-_WARM_LAST.get(key,0) < WARM_GAP_S`
+    #   因 WARM_GAP_S=0.0 永假，是死分支（gap=0 的跳过永不触发），已删除。
+    #   保留 _WARM_LAST 写入（同 sid 时间戳仍可读），但加超上限就 clear() 的保护，
+    #   防长期运行时字典只增不减。
+    if len(_WARM_LAST) >= _WARM_LAST_MAX:
+        _WARM_LAST.clear()
     _WARM_LAST[key] = _t.time()
     db = db or _DB.get("db")
     case, turns = ("", 0)

@@ -175,7 +175,16 @@ _PHONE_RE = re.compile(r"1[3-9]\d{9}")
 
 
 def phone_hit(t):
-    """返回命中的完整手机号；没命中返回空串。"""
+    """返回命中的完整手机号；没命中返回空串。
+
+    🔴 2026-11-20 修复 SPEECH-07（**仅注释，不改行为，待用户确认**）：
+      rules 教模型把 SOUL_MY_CONTACT 拆三条发（[0:3]/[3:7]/[7:]，即 3-4-4 段）。
+      若 MY_CONTACT 配成真实 11 位手机号且模型**未严格按 3-4-4 拆**、某条意外凑出
+      11 位连续数字，会被本闸（_PHONE_RE=1[3-9]\\d{9}）整条作废 → 联系方式发不出。
+      纯默认 13800138000 拆开后单条不足 11 位，不会误触；风险仅限「配真号 + 拆错」。
+      ⚠️ 联系方式轮的豁免（如 phone_hit 命中但同句含「我号/我微信/发你」等 promise
+      信号时降级为 warn 不作废）涉及联系方式推送策略，风险高，**本轮不改，待用户拍板**。
+    """
     m = _PHONE_RE.search(str(t or ""))
     return m.group(0) if m else ""
 
@@ -228,8 +237,11 @@ _TENSION_WORDS = (
 )
 
 
-def _tension_hit(t):
-    """时间层词（睡不着/躺/被窝）—— 白天拦，夜间（含 21~23 预热层）放行。"""
+# 2026-11-20 修复 SPEECH-03：原 `_tension_hit` 实际匹配的是 _TIME_WORDS（时间层词），
+#   `_sex_tension_hit` 才匹配 _TENSION_WORDS（张力层词），函数名与内容错位易改错。
+#   现只改名对齐语义（_time_word_hit / _tension_word_hit）+ 补 docstring，**不改匹配行为**。
+def _time_word_hit(t):
+    """时间层词（睡不着/躺/被窝）命中 → 白天拦，夜间（含 21~23 预热层）放行。"""
     s = str(t or "")
     for w in _TIME_WORDS:
         if w in s:
@@ -237,8 +249,8 @@ def _tension_hit(t):
     return ""
 
 
-def _sex_tension_hit(t):
-    """张力层词（想你/心跳/勾引/搂）—— 白天 + 预热层都拦，**只有 23~05 放行**。"""
+def _tension_word_hit(t):
+    """张力层词（想你/心跳/勾引/搂）命中 → 白天 + 预热层都拦，**只有 23~05 放行**。"""
     s = str(t or "")
     for w in _TENSION_WORDS:
         if w in s:
@@ -417,6 +429,28 @@ def _norm(s):
     return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", str(s or ""))
 
 
+def _strip_filler(s, fillers):
+    """按 SPEECH-08 安全剥掉方言口头禅（dup_hit 复读比较用）。
+
+    2026-11-20 修复 SPEECH-08：旧版对整张 _FILLER 表一律全文 replace，
+      单字「撒」会把实义词「撒谎」误剥成「谎」。现改：
+        · 多字词（>=2 字，要得/要撒/哦豁）：仍是全文 replace（出现在词中间的概率极低）；
+        · 单字（撒/嘛/哈…）：只剥**词首/词尾**，词中间的保留，避免误伤实义词。
+      fillers 须按**长度降序**传入（多字词先剥），减少「要撒」被「撒」抢先剥的错位。
+    """
+    out = s
+    for f in fillers:
+        if len(f) >= 2:
+            out = out.replace(f, "")
+        else:
+            # 单字只剥首尾：先尾后首，反复剥到两端都不再是该字
+            while out.endswith(f):
+                out = out[:-1]
+            while out.startswith(f):
+                out = out[len(f):]
+    return out
+
+
 def dup_hit(t, recent):
     """与她最近几条我的发言比：完全相同 / 一方包含另一方 / 高度相似 → 判复读。
 
@@ -436,10 +470,10 @@ def dup_hit(t, recent):
     if len(a) < 3:
         return False
     # 去掉方言口头禅后再比：这些词重复出现是「人设口吻」，不是复读
-    _FILLER = ("要得", "要撒", "撒", "嘛", "哈", "哦", "咯", "噻", "哦豁")
-    a_bare = a
-    for f in _FILLER:
-        a_bare = a_bare.replace(f, "")
+    # 2026-11-20 修复 SPEECH-08：按长度降序排列（多字词先剥），减少「要撒」被「撒」抢先剥的错位；
+    #   单字（撒/嘛/哈）改为只剥词首/词尾（见 _strip_filler），避免把「撒谎」误剥成「谎」。
+    _FILLER = ("哦豁", "要得", "要撒", "撒", "嘛", "哈", "哦", "咯", "噻")
+    a_bare = _strip_filler(a, _FILLER)
     for r in (recent or []):
         b = _norm(r)
         if not b:
@@ -455,9 +489,8 @@ def dup_hit(t, recent):
         if len(a) >= 5 and len(b) >= 5 and (a in b or b in a):
             return True
         # 骨架完全相同（去掉口头禅后一字不差）
-        b_bare = b
-        for f in _FILLER:
-            b_bare = b_bare.replace(f, "")
+        # 2026-11-20 修复 SPEECH-08：b 侧剥词同样走 _strip_filler，与 a_bare 口径一致
+        b_bare = _strip_filler(b, _FILLER)
         if len(a_bare) >= 4 and a_bare == b_bare:
             return True
     return False
@@ -514,7 +547,11 @@ def check(text, recent=None, allow_soft=True):
     # 🔴 2026-11-08 新增：commit 型问句（「你会不会…」「你是不是特别…」）——
     #   实测保持热度 11.1%，而 offer 型 37.5%。给她拒绝的机会 = 帮她结束这段对话。
     #   夜间严格执行（那是张力场景）；白天放宽（「你觉得呢」是自然口语，不该一律毙）。
-    if commit_hit(t) and _is_night_now():
+    # 2026-11-20 修复 SPEECH-02：窗口由 _is_night_now()(21~05 含预热层) 收紧到
+    #   _is_tension_now()(23~05 真张力层)。因提示词 _night_block 预热层段只禁身体词、
+    #   不禁 commit 问句，闸若在 21~23 就拦 commit 会与提示词对撞、误废可用句。
+    #   现只在 23~05 真张力层拦 commit，21~23 预热层放行，与提示词预热层一致。
+    if commit_hit(t) and _is_tension_now():
         return False, "commit型问句(要她表态)"
     # 🔴🔴 2026-11-08（用户硬要求）：「聊骚一定是在晚上 白天禁止」。
     #   提示词里已经写了昼夜两段（prompt._night_block），但**光靠提示词不够**：
@@ -526,15 +563,18 @@ def check(text, recent=None, allow_soft=True):
         ew0 = explicit_hit(t)
         if ew0:
             return False, "白天禁止荤话(%s)" % ew0
-        tw = _tension_hit(t)
+        # 2026-11-20 修复 SPEECH-03：_tension_hit → _time_word_hit（原函数名与 _TIME_WORDS 错位）
+        tw = _time_word_hit(t)
         if tw:
             return False, "白天禁止暗示(%s)" % tw
-        tw2 = _sex_tension_hit(t)
+        # 2026-11-20 修复 SPEECH-03：_sex_tension_hit → _tension_word_hit（对齐 _TENSION_WORDS 语义）
+        tw2 = _tension_word_hit(t)
         if tw2:
             return False, "白天禁止暗示(%s)" % tw2
     elif not _is_tension_now():
         # 21~23 预热层：时间层放行，但身体词/想你/心跳/勾引仍不许（还没到点）
-        tw2 = _sex_tension_hit(t)
+        # 2026-11-20 修复 SPEECH-03：_sex_tension_hit → _tension_word_hit
+        tw2 = _tension_word_hit(t)
         if tw2:
             return False, "预热层禁止身体词(%s)" % tw2
     # 以下两条只记录，不否决

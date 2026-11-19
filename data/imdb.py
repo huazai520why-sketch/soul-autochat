@@ -407,6 +407,20 @@ class IMDB(object):
           （「哈哈」「在的」「嗯」）。只按文本判方向会把她的话当成我说的 →
           永不回复（漏回 = 最差失败模式）。所以再用**时间邻近**做一次交叉验证：
           摘要时间必须贴近我发那句的时间，才算同一句。
+
+        2026-11-20 修复 X-02：原实现只查本地 chatmsg 镜像（self.messages），
+          而镜像滞后约 300s（见 latest() 注释）——我方刚发的话还没进 chatmsg 时
+          本函数返回 0，调用方（latest / pendingq）拿不到「我方刚发」信号 →
+          我方刚发被误判「她新话」重入队 → 重复轰炸/自我回声。
+          现增加第二数据源 reply_state.sends（我方每次成功发送的秒级 ts）：
+          当本地 chatmsg 未命中（best 仍为 0）而 sends 有近期发送时，返回
+          sends 最近一次 ts（*1000 转 ms）作为**疑似值**。
+        ⚠️ 语义 / 误判权衡：sends 只存 ts 不存文本，无法精确匹配 text。
+          故只在 chatmsg 未命中时兜底、且返回的是「我方最近发过某句」的时间，
+          并非「发过这句」的确认时间。调用方须结合时间窗（约 120~180s）自行判定：
+          若摘要 ts 与本返回值相差在窗内才可判「可能是我方刚发」——这仍能过滤
+          大部分「她真发了同文本」的误判（那种情况两 ts 通常相隔很远）。
+          命中本地 chatmsg 时语义不变（最准）。
         """
         text = (text or "").strip()
         if not text:
@@ -418,6 +432,20 @@ class IMDB(object):
                     continue
                 if (m.text or "").strip() == text:
                     best = max(best, int(m.ts or 0))
+        except Exception:
+            pass
+        if best:
+            return best
+        # 2026-11-20 修复 X-02：本地镜像未命中 → 用 reply_state.sends 兜底透出
+        # 「我方刚发过」的时间信号。延迟导入 + 容错：imdb 是底层，避免循环导入，
+        # reply_state 缺失/异常时静默退回旧行为（返回 0）。
+        try:
+            from data import reply_state as _rs  # 延迟导入，避免循环依赖
+            sends = _rs.sends_of(str(session_id))  # 秒，升序
+            if sends:
+                last = float(sends[-1])
+                if last > 0:
+                    best = max(best, int(last * 1000))  # 秒 → 毫秒，对齐 m.ts
         except Exception:
             pass
         return best
@@ -1342,9 +1370,15 @@ def _db_owner_uid(device, dbname, uid, timeout=15):
     """
     if not uid:
         return 0, 0
+    # 2026-11-20 修复 X-03：原只 `.replace("'","")` 防单引号，不防注释符 `--`/`;`。
+    # uid 来自内部反推、本应纯数字（sessionId = uid+toUserId 均数字），故先白名单
+    # 校验：非纯数字一律拒绝（返回 0,0），再剥一遍危险字符双保险，杜绝 SQL 注入面。
+    suid = str(uid).replace("'", "").replace(";", "").replace("--", "")
+    if not suid.isdigit():
+        return 0, 0
     q = ("select (select count(*) from session "
          "where sessionId = '%s' || toUserId), (select count(*) from session)"
-         % str(uid).replace("'", ""))
+         % suid)
     txt = _dev_sql(device, dbname, q, timeout=timeout)
     for ln in (txt or "").replace("\r", "").splitlines():
         ln = ln.strip()
