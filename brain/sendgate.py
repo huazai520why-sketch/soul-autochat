@@ -176,6 +176,67 @@ def archived_sids():
         return []
 
 
+# ── 联系方式轮：一次性 3 条额度（2026-11-20 用户授权 B 方案，见 §48 遗留③④）──
+# 背景：rules 教模型把 MY_CONTACT 拆 3-4-4 三条发，但 verdict 的 CAP_24H=2 只给
+#   一个会话 24h 两条额度 → 第三条被 pendingq 的 lines[:_gate_n] 裁掉；本回合已发
+#   1 条时更只剩 1 条 → 她看到「没说完的号码」（2026-11-07 21:03 实证：
+#   她「后面呢？是你没说完的号码」、22:03「你是在微信上说不出话么」）。
+# 边界：只有「她明确开口要」才走这里（brain.contact.is_ask）；一生一次；
+#   不绕过归档 / AWAITING；发送成功后只记 1 条正常额度（其余算分片），
+#   所以不会把 24h 额度打爆，也不改变「没人要 → 绝不主动发」的口径。
+CONTACT_MAX = 3
+
+
+def contact_allow(sid: str, n_lines: int = CONTACT_MAX, *,
+                  her_ts_ms: Optional[float] = None,
+                  my_last_ts_ms: float = 0.0,
+                  now: Optional[float] = None) -> Decision:
+    """联系方式轮专用额度：一次性最多 3 条，不占 24h 正常额度。
+
+    调用方判定「她这条明确在要联系方式」（brain.contact.is_ask）后才调；
+    发送成功必须调 contact_note()（而不是 note_sent()），否则额度会被重复占用。
+    """
+    if not sid:
+        return Decision(False, 0, "contact_unbound", "无主会话不给联系方式额度")
+    try:
+        from brain import contact as CT
+        if not ON:
+            return Decision(True, max(1, min(int(n_lines), CONTACT_MAX)), "off",
+                            "SOUL_FOLLOWUP_ON=0 已关闭阶梯")
+        if RS.is_archived(sid):
+            return Decision(False, 0, V.ARCHIVED, "已归档 → 不发联系方式")
+        if CT.done(sid):
+            return Decision(False, 0, "contact_used",
+                            "本会话已给过联系方式（一生一次）→ 回退正常额度")
+        _her = float(her_ts_ms or 0)
+        _my = float(my_last_ts_ms or 0)
+        if _her > 0 and _my > _her:
+            return Decision(False, 0, V.AWAITING,
+                            "我方末条晚于她末条 → 她没新说话，不给联系方式额度")
+        n = max(1, min(int(n_lines), CONTACT_MAX))
+        log.info("发送闸[联系方式轮] sid=%s → 一次性 %d 条额度（不占 24h 正常额度）", sid, n)
+        return Decision(True, n, "contact", "联系方式轮：一次性 %d 条（3-4-4 拆发）" % n)
+    except Exception as e:
+        log.warning("联系方式额度异常（降级回正常闸）sid=%s: %r", sid, e)
+        return Decision(False, 0, "error", "联系方式额度异常: %r" % (e,))
+
+
+def contact_note(sid: str, n: int = CONTACT_MAX) -> None:
+    """联系方式发完记账：打「一生一次」标记 + 只记 1 条正常额度。"""
+    if not sid:
+        return
+    try:
+        from brain import contact as CT
+        CT.mark_done(sid)
+    except Exception as e:
+        log.warning("联系方式标记失败 sid=%s: %r", sid, e)
+    try:
+        if ON:
+            RS.note_sent(sid, 1)
+    except Exception as e:
+        log.warning("联系方式记账失败 sid=%s: %r", sid, e)
+
+
 def state_of(sid: str, **kw):
     """给 data.pending.summary() 的四桶统计用：返回 Verdict。"""
     if not sid:
@@ -206,4 +267,5 @@ def state_of(sid: str, **kw):
 
 
 __all__ = ["ON", "Decision", "allow", "note_sent", "on_her",
-           "is_archived", "archived_sids", "state_of"]
+           "is_archived", "archived_sids", "state_of",
+           "CONTACT_MAX", "contact_allow", "contact_note"]

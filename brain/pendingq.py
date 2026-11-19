@@ -3037,6 +3037,10 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         #    §6.6-2：ADAPT_CAP=2 一轮两句就会把 24h 的 2 条额度用光，
         #    所以 n_cand 必须被闸裁过；发送成功后按真实条数记账（不等库 pull）。
         _gate_n = 0
+        # 2026-11-20（联系方式轮，用户授权 B 方案）：她明确开口要联系方式时，
+        #   走一次性 3 条额度，否则 CAP_24H=2 会把 3-4-4 第三条裁掉
+        #   ── 2026-11-07 21:03 她「后面呢？是你没说完的号码」即此因。
+        _contact_ok = False
         try:
             from brain import sendgate as _SG5
             # 2026-11-19 修复 FLOW-04：发送闸必须与候选闸同源传 my_last_ts_ms。
@@ -3053,8 +3057,24 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                         _my_ts_ms_gate = _rs_ms_p
             except Exception:
                 _my_ts_ms_gate = 0.0
-            _gate = _SG5.allow(str(sid), 99, her_ts_ms=float(her_ts or 0), has_human=True,
-                               my_last_ts_ms=_my_ts_ms_gate)
+            _gate = None
+            try:
+                from brain import contact as _CTc
+                if _CTc.is_ask(txt):
+                    _gate = _SG5.contact_allow(str(sid), 3, her_ts_ms=float(her_ts or 0),
+                                               my_last_ts_ms=_my_ts_ms_gate)
+                    if _gate.ok:
+                        _contact_ok = True
+                        log.info("联系方式轮：她开口要 → 一次性 %d 条额度（sid=%s）",
+                                 _gate.n, sid)
+                    else:
+                        log.info("联系方式轮未放行（%s）→ 回退正常额度", _gate.reason)
+            except Exception as _e_ct:
+                log.debug("联系方式轮判定异常（回退正常额度）: %r", _e_ct)
+                _gate = None
+            if _gate is None or not _gate.ok:
+                _gate = _SG5.allow(str(sid), 99, her_ts_ms=float(her_ts or 0), has_human=True,
+                                   my_last_ts_ms=_my_ts_ms_gate)
             if not _gate.ok:
                 log.info("跟进阶梯拦截 sid=%s state=%s（%s）→ 本轮不回",
                          sid, _gate.state, _gate.reason)
@@ -3098,6 +3118,11 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             hist = R.hist_with_her(hist, feed)
             # 条数按她最后一条算（合并后总长会撑大 target_n，见 flow.py 同处注释）
             n = R.target_n([burst[-1]] if burst else [txt], hist)
+            if _contact_ok:
+                # 联系方式必须够 3 条才拆得开 3-4-4；按常规 target_n 只出 1~2 条
+                # 会导致号码分片永远发不完整。
+                n = 3
+                log.info("联系方式轮：强制出 3 条（3-4-4 拆发）")
             if _gate_n:
                 n = max(1, min(n, _gate_n))
             lines = R.generate(sid, feed, hist=hist, n_cand=n)
@@ -3108,8 +3133,18 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             lines = [fallback_line()]
             log.warning("出话失败 → 用兜底话术 %r", lines[0])
         if _gate_n and len(lines) > _gate_n:
-            lines = lines[:_gate_n]
-            log.info("发送闸裁剪：本轮最多发 %d 条（额度）", _gate_n)
+            _keep_all = False
+            if _contact_ok:
+                try:
+                    from brain import contact as _CTc2
+                    _keep_all = _CTc2.is_contact_lines(lines)
+                except Exception:
+                    _keep_all = False
+            if _keep_all:
+                log.info("联系方式轮：保留完整 %d 条分片（不裁剪）", len(lines))
+            else:
+                lines = lines[:_gate_n]
+                log.info("发送闸裁剪：本轮最多发 %d 条（额度）", _gate_n)
 
         if dry_run:
             from brain import auto_voice as AV
@@ -3301,7 +3336,19 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 try:
                     if voice_result is None:
                         from brain import sendgate as _SG6
-                        _SG6.note_sent(str(sid), sent_n)
+                        _ct_done = False
+                        if _contact_ok and sent_n >= 2:
+                            try:
+                                from brain import contact as _CTc3
+                                _ct_done = _CTc3.is_contact_lines(lines[:sent_n])
+                            except Exception:
+                                _ct_done = False
+                        if _ct_done:
+                            # 分片已完整发出：只记 1 条额度（其余算分片），并打标记
+                            _SG6.contact_note(str(sid), sent_n)
+                            log.info("联系方式轮：分片已完整发出（%d 条）→ 记 1 条额度 + 标记", sent_n)
+                        else:
+                            _SG6.note_sent(str(sid), sent_n)
                 except Exception as _e_ns:
                     log.warning("跟进台账记账失败 sid=%s: %r", sid, _e_ns)
                 out["sent"] += 1

@@ -621,6 +621,9 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
     多条之间留 1.6s 间隔 —— 太密会被当成刷屏（Soul 有连发限制），
     太长她又会觉得对面在挤牙膏，1.5~2s 接近真人打字节奏。
     """
+    # 2026-11-20（联系方式轮，用户授权 B 方案）：她明确开口要联系方式时走一次性
+    #    3 条额度（3-4-4 拆发），否则 CAP_24H=2 会把第三条裁掉。
+    _contact_ok = False
     # §104 跟进阶梯：发送前先过闸（页面校验之前）。归档或额度用尽则一条不发；
     #    额度不足时按 allow 返回的 n 截断 lines（Decision.n 已按额度截断）。
     #    sid="" 为无主会话，放行且不纳入额度；台账异常一律降级放行，
@@ -725,13 +728,47 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
                                     _my_ts_ms = _ts_m
             except Exception:
                 pass
-            _d = SG.allow(sid, len(lines), her_ts_ms=_her_ts_feed,
-                          my_last_ts_ms=_my_ts_ms)
+            _her_last_txt = ""
+            try:
+                if db is not None and sid:
+                    _uid_me = str(getattr(db, "uid", "") or "")
+                    for _m2 in db.messages(str(sid), limit=12):
+                        if str(getattr(_m2, "sender", "") or "") != _uid_me:
+                            _her_last_txt = (getattr(_m2, "text", "") or "").strip()
+            except Exception:
+                _her_last_txt = ""
+            _d = None
+            try:
+                from brain import contact as _CTf
+                if _her_last_txt and _CTf.is_ask(_her_last_txt):
+                    _d = SG.contact_allow(sid, len(lines), her_ts_ms=_her_ts_feed,
+                                          my_last_ts_ms=_my_ts_ms)
+                    if _d.ok:
+                        _contact_ok = True
+                        log.info("[%s] 联系方式轮：她开口要 → 一次性 %d 条额度", nick, _d.n)
+                    else:
+                        log.info("[%s] 联系方式轮未放行（%s）→ 回退正常额度", nick, _d.reason)
+            except Exception as _e_ctf:
+                log.debug("联系方式轮判定异常（回退正常额度）: %r", _e_ctf)
+                _d = None
+            if _d is None or not _d.ok:
+                _d = SG.allow(sid, len(lines), her_ts_ms=_her_ts_feed,
+                              my_last_ts_ms=_my_ts_ms)
             if not _d.ok:
                 log.info("[%s] 跟进阶梯拦截 sid=%s state=%s（%s）", nick, sid, _d.state, _d.reason)
                 return 0, "跟进阶梯拦截(%s)" % _d.state
             if _d.n < len(lines):
-                lines = lines[:_d.n]
+                _keep_ct = False
+                if _contact_ok:
+                    try:
+                        from brain import contact as _CTf2
+                        _keep_ct = _CTf2.is_contact_lines(lines)
+                    except Exception:
+                        _keep_ct = False
+                if _keep_ct:
+                    log.info("[%s] 联系方式轮：保留完整 %d 条分片（不裁剪）", nick, len(lines))
+                else:
+                    lines = lines[:_d.n]
     except Exception:
         pass
     # 🔴 灌字前必须确认在会话页：搜索页也有输入框，一旦页面没退干净，
@@ -921,7 +958,19 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
         if sent:
             try:
                 from brain import sendgate as SG
-                SG.note_sent(sid, sent)
+                _ct_done_f = False
+                if _contact_ok and sent >= 2:
+                    try:
+                        from brain import contact as _CTf3
+                        _ct_done_f = _CTf3.is_contact_lines(lines[:sent])
+                    except Exception:
+                        _ct_done_f = False
+                if _ct_done_f:
+                    SG.contact_note(sid, sent)
+                    log.info("[%s] 联系方式轮：分片已完整发出（%d 条）→ 记 1 条额度 + 标记",
+                             nick, sent)
+                else:
+                    SG.note_sent(sid, sent)
             except Exception:
                 pass
     return sent, ""
