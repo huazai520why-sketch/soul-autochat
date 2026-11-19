@@ -3060,13 +3060,18 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             _gate = None
             try:
                 from brain import contact as _CTc
+                _ct_kind = ""
                 if _CTc.is_ask(txt):
+                    _ct_kind = "她开口要"
+                elif _CTc.is_open_door(txt):
+                    _ct_kind = "她开门·线下信号"
+                if _ct_kind:
                     _gate = _SG5.contact_allow(str(sid), 3, her_ts_ms=float(her_ts or 0),
                                                my_last_ts_ms=_my_ts_ms_gate)
                     if _gate.ok:
                         _contact_ok = True
-                        log.info("联系方式轮：她开口要 → 一次性 %d 条额度（sid=%s）",
-                                 _gate.n, sid)
+                        log.info("联系方式轮：%s → 一次性 %d 条额度（sid=%s）",
+                                 _ct_kind, _gate.n, sid)
                     else:
                         log.info("联系方式轮未放行（%s）→ 回退正常额度", _gate.reason)
             except Exception as _e_ct:

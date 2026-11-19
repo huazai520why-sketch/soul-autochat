@@ -740,12 +740,18 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
             _d = None
             try:
                 from brain import contact as _CTf
+                _ct_kind_f = ""
                 if _her_last_txt and _CTf.is_ask(_her_last_txt):
+                    _ct_kind_f = "她开口要"
+                elif _her_last_txt and _CTf.is_open_door(_her_last_txt):
+                    _ct_kind_f = "她开门·线下信号"
+                if _ct_kind_f:
                     _d = SG.contact_allow(sid, len(lines), her_ts_ms=_her_ts_feed,
                                           my_last_ts_ms=_my_ts_ms)
                     if _d.ok:
                         _contact_ok = True
-                        log.info("[%s] 联系方式轮：她开口要 → 一次性 %d 条额度", nick, _d.n)
+                        log.info("[%s] 联系方式轮：%s → 一次性 %d 条额度",
+                                 nick, _ct_kind_f, _d.n)
                     else:
                         log.info("[%s] 联系方式轮未放行（%s）→ 回退正常额度", nick, _d.reason)
             except Exception as _e_ctf:
@@ -1078,6 +1084,19 @@ def _reply_and_send(actor, db, out, dry_run):
         #    所以条数只看**她最后一条**（她一次说完的落脚点）。
         _tn_in = [out.burst[-1]] if out.burst else [_model_msg]
         n = R.target_n(_tn_in, hist)
+        # 2026-11-20 C 方案（补 §50 遗留②）：她开口要 / 把话推到线下 → 必须够 3 条
+        #   才拆得开 3-4-4；只出 1~2 条时完整号会被 gate.phone_hit 整条毙掉。
+        try:
+            from brain import contact as _CTn
+            _ct_hint_txt = (out.last_text or "").strip()
+            if _ct_hint_txt and _CTn.is_ask(_ct_hint_txt):
+                n = 3
+                log.info("[%s] 联系方式轮：她开口要 → 强制出 3 条（3-4-4）", out.nick)
+            elif _ct_hint_txt and _CTn.is_open_door(_ct_hint_txt):
+                n = 3
+                log.info("[%s] 联系方式轮：她开门·线下信号 → 强制出 3 条（3-4-4）", out.nick)
+        except Exception as _e_ctn:
+            log.debug("联系方式提示判定异常（按常规条数）: %r", _e_ctn)
         lines = R.generate(out.sid or ("x" + str(int(time.time()))),
                            _model_msg, hist=hist, n_cand=n)
         if lines:

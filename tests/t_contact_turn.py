@@ -34,6 +34,15 @@ for s in ("你号码多少", "加个微信嘛", "给个联系方式", "你电话
 for s in ("我手机没电了", "半夜被电话吵醒", "手机搁腿上", "今天好累", "[地铁老人看手机]"):
     ck("is_ask- %r" % s, not CT.is_ask(s))
 
+# ── 1b. 她「把话推到线下」识别（2026-11-20 C 方案·窄口子）──
+for s in ("哪天见面啊", "想见你", "周末出来玩？", "约一下？", "什么时候见",
+          "你过来嘛", "来我这儿", "你在哪呢", "你在哪儿", "你现在在哪"):
+    ck("is_open_door+ %r" % s, CT.is_open_door(s))
+for s in ("我熬过来了", "今天好累", "手机没电了", "不想见面", "见不了",
+          "你在干嘛", "不见面算了", "[地铁老人看手机]", ""):
+    ck("is_open_door- %r" % s, not CT.is_open_door(s))
+ck("door 与 ask 不重叠（要号不算开门）", CT.is_ask("你号码多少") and not CT.is_open_door("你号码多少"))
+
 # ── 2. 分片识别（用生产实际 MY_CONTACT，不硬编码默认号）────
 from brain.engine import rules as _R  # noqa: E402
 
