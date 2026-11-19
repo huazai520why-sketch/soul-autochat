@@ -143,6 +143,22 @@ def recently_replied(uid, sid=None, text=None, her_ts_ms=0, now=None):
     rec = _REPLIED.get(str(sid)) if sid else None
     if rec is None:
         rec = _REPLIED.get(str(uid))
+    # 🔴 2026-11-19 修复 DATA-13（P2 内存查不到时 fallback 读一次盘）：
+    #   _REPLIED 只在本进程启动时 load_replied() 一次，之后靠 mark_replied 更新。
+    #   若台账被**别的进程**（另一个 daemon/工具）写过，本进程内存里没有这条，
+    #   直接 return False → 误判「没回过」→ 对同一人重复回（重复回比漏回更伤）。
+    #   修法：内存（sid/uid 两个键）都查不到时，读一次盘兜底（load_replied 同款
+    #   口径，已含 7 天 / REPLIED_GAP*4 过期收缩），与 load_skip 每次读盘一致。
+    #   只读不回填内存：避免跨键污染（按 uid 命中的盘上记录若回填进 sid 键，
+    #   会干扰后续判定），读盘开销小（几十条）可接受。
+    if not isinstance(rec, dict):
+        try:
+            _disk = load_replied()
+        except Exception as _e:
+            log.debug("recently_replied 读盘兜底失败（按未回处理）: %r", _e)
+            _disk = {}
+        _k_sid = str(sid) if sid else None
+        rec = (_disk.get(_k_sid) if _k_sid else None) or _disk.get(str(uid))
     if not isinstance(rec, dict):
         return False
     try:

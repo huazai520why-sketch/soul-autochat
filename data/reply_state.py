@@ -15,6 +15,7 @@
 
 所有 IO 都吞异常并打 WARNING：台账坏了只能降级成「放行」，绝不能把生产链路打断。
 """
+import copy
 import json
 import os
 import threading
@@ -54,13 +55,18 @@ def _mtime_ns() -> int:
 def load() -> Dict[str, Any]:
     """读全量台账（带同进程 mtime 缓存）；文件不存在/损坏返回 {}。
 
+    🔴 2026-11-19 修复 DATA-15（P2 浅拷贝共享嵌套 sends 列表）：原来返回
+      `dict(d)`（浅拷贝）—— 顶层是副本，但每条记录里的 `sends` 列表仍与缓存
+      **共享同一个 list 对象**，调用方就地 append/修改会污染缓存，等下次 mtime
+      命中时把脏数据当新鲜台账返回。改用 copy.deepcopy 深拷贝，隔离彻底。
+
     Returns:
-        {sid: rec} 的浅拷贝，调用方改动不会污染缓存。
+        {sid: rec} 的深拷贝，调用方任意改动都不会污染缓存。
     """
     mt = _mtime_ns()
     with _LOCK:
         if _CACHE["d"] is not None and _CACHE["mtime_ns"] == mt:
-            return dict(_CACHE["d"])
+            return copy.deepcopy(_CACHE["d"])
         try:
             d = json.loads(FILE.read_text(encoding="utf-8"))
             d = d if isinstance(d, dict) else {}
@@ -69,15 +75,24 @@ def load() -> Dict[str, Any]:
             d = {}
         _CACHE["d"] = d
         _CACHE["mtime_ns"] = mt
-        return dict(d)
+        return copy.deepcopy(d)
 
 
 def _save(d: Dict[str, Any]) -> None:
-    """原子写：临时文件 + os.replace，避免半截 JSON 把台账写坏。"""
+    """原子写：临时文件 + os.replace，避免半截 JSON 把台账写坏。
+
+    🔴 2026-11-19 修复 DATA-14（P2 写入后 fsync 再 replace）：原来 tmp.write_text
+      直接 os.replace，断电/崩溃时 replace 了但数据还没落盘（OS 缓存）→ 台账丢计数
+      （B-09 那 24h 额度会少记、放行超发）。改成：write → flush → fsync → replace，
+      保证 replace 之前数据已在盘上。
+    """
     try:
         FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = FILE.with_name(FILE.name + ".tmp")
-        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        with open(str(tmp), "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(d, ensure_ascii=False))
+            _f.flush()
+            os.fsync(_f.fileno())   # 🔴 DATA-14：fsync 强制落盘后再原子替换
         os.replace(str(tmp), str(FILE))
         with _LOCK:
             _CACHE["d"] = d

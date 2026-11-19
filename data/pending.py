@@ -145,21 +145,9 @@ def _skip_uid(to_uid):
     return str(to_uid or "").startswith(SKIP_UID_PREFIX)
 
 
-def _my_last_ts_ms(db, sid):
-    """我方在该会话最后一条消息的毫秒时间；查不到返回 0。
-
-    D7 修复：summary() 统计 AWAITING 时必须传这个值，否则 verdict 会把
-    「我方末条晚于她」的分支恒判成未知。只读 chatmsg，不写 App 库。
-    """
-    if db is None or not sid:
-        return 0
-    try:
-        for m in reversed(db.messages(str(sid), limit=60, skip_system=True)):
-            if str(getattr(m, "sender", "") or "") == str(getattr(db, "uid", "") or ""):
-                return int(getattr(m, "ts", 0) or 0)
-    except Exception as e:
-        log.debug("summary 取我方末条时间失败 sid=%s: %r", sid, e)
-    return 0
+# 🔴 2026-11-19 修复 DATA-07（P2）：删除死函数 `_my_last_ts_ms`。
+#   本文件的这一份定义在 data 层无任何调用方（brain/pendingq.py、wake.py 用的是
+#   pendingq 里同名的另一份实现），属无引用死代码，删掉避免与 brain 版混淆。
 
 
 def unread_sids(db, now_ms=None):
@@ -344,8 +332,12 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
                                and int(getattr(last, "ts", 0) or 0) > _RS2.her_ts_of(str(sid)))
                 if not _is_new_her:
                     continue
-            except Exception:
-                continue
+            except Exception as _e:
+                # 🔴 2026-11-19 修复 DATA-10（P2 归档判定失败被当成「跳过」）：
+                #   原来 except 里 continue，归档判定一异常（如读台账失败）就把这条
+                #   会话整条跳过 —— 归档失败本该「按未归档处理」继续往下判，而不是丢掉。
+                #   改为 log.warning 并放行（落到后续时效/已回/冷却等闸里继续筛）。
+                log.warning("归档判定异常 sid=%s（按未归档放行继续筛）: %r", sid, _e)
         her_ts = int(getattr(last, "ts", 0) or 0)
         if her_ts and her_ts < cutoff:
             continue                        # 超期（她早忘了）
@@ -381,9 +373,9 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
         out.append(PendingItem(sid, to_uid, txt, her_ts, unread,
                                reason, pri, last_sender=sender))
 
-    # 排序：档位优先 → 同档「最老优先」（先灭火）
-    out.sort(key=lambda x: (x.priority, x.her_ts or 0))
-    # 🔴🔴 2026-11-08（探针 R 实测后加的，必须在上面之后）：
+    # 🔴 2026-11-19 修复 DATA-08（P2）：删掉被立即覆盖的第一次 out.sort。
+    #   下面「很新的提到最前」的 _key 排序会整体重排，这次旧排序是死操作，删掉。
+    # 🔴🔴 2026-11-08（探针 R 实测后加的）：
     #   只做「同档最老优先」时，队首是 **6.0 天前**的会话，而 9 分钟前刚到的那条
     #   排在 30+ 位 —— 新消息被老积压挤住，用户口径明确不允许。
     #   现在「很新（<HOT_MS）」的一律提到最前面，按时间**倒序**（最新的先回）；
@@ -418,6 +410,12 @@ def count_pending(db, real_total=True, max_age_h=None):
             ⇒ 匹配永远进不去，而那些人又永远定位不到 ⇒ 硬死锁。
       现在：闸门传 max_age_h=pendingq.STALE_GIVEUP_H，与候选队列同一口径。
 
+    🔴 2026-11-19 修复 DATA-09（P1 real_total=True 不得静默丢弃 max_age_h）：
+      max_age_h 只在 real_total=False 透传、real_total=True 被忽略 → 调用方传
+      real_total=True, max_age_h=24 与 should_reply 的 24h 口径不一致。修法：
+      **两个分支都透传 max_age_h**（_kw 对 real_total=True 同样生效），
+      更符合调用方预期（传了小时数就按小时数算，无论是否含冷却/已回）。
+
     返回 int；库不可用时返回 -1（**用 -1 区分「0 个人」和「查不到」**，
     否则日志里分不清「真没人等」还是「库挂了」）。
     """
@@ -427,6 +425,7 @@ def count_pending(db, real_total=True, max_age_h=None):
         _kw = {}
         if max_age_h is not None:
             _kw["max_age_h"] = max_age_h
+        # 🔴 DATA-09：real_total=True 分支也透传 max_age_h（同一口径），不再忽略。
         if real_total:
             return len(should_reply(db, include_cooling=True, include_replied=True,
                                     **_kw))

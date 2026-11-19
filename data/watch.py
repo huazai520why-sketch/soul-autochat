@@ -64,18 +64,30 @@ class Watcher(object):
         return changed
 
     def _sig(self):
-        """目录内所有 IM 库（db + wal）的 (名字:mtime:size) 指纹。
+        """当前账号 IM 库（db + wal）的 (名字:mtime:size) 指纹。
 
         2026-11-04：原来只 stat 一个写死的库文件名，切号后立刻失明。
-        现在按目录 glob，两个账号的库都在视野里 —— 实测同为 ~50ms（4 个文件），
-        但不再依赖「当前账号是哪个」。
+          → 改按目录 glob，两个账号的库都在视野里。
+
+        🔴 2026-11-19 修复 DATA-11（P2 只 stat 当前账号库）：目录 glob 会把
+          **另一个账号**库的写入也算进来 —— 切号前另一账号被 App 后台写一下，
+          当前账号就误判 dirty、白刷一轮库（pull 一次 2~3s，纯浪费）。
+          现在：`set_path()` 每轮 open_account 后会跟随到当前账号库路径
+          （self.db_path），有它就只 stat 这一个库 + 它的 -wal（低成本、
+          无需额外查 uid，路径本身就是当前账号引用）；拿不到路径时退回
+          目录 glob（保留 2026-11-04 的切号不失明兜底）。
         """
-        d = self.dir_path or (os.path.dirname(self.db_path) if self.db_path else "")
-        if not d:
-            return ""
-        # toybox sh 会展开 glob；-shm 不监控（App 每秒都在写，纯噪声）
-        cmd = ("stat -c '%n %Y:%s' " + d + "/*-DATA.db "
-               + d + "/*-DATA.db-wal")
+        # 有当前账号库路径 → 只 stat 它（避免另一账号写入污染 dirty）
+        dbp = self.db_path
+        if dbp:
+            cmd = ("stat -c '%n %Y:%s' " + dbp + " " + dbp + "-wal")
+        else:
+            d = self.dir_path or (os.path.dirname(self.db_path) if self.db_path else "")
+            if not d:
+                return ""
+            # toybox sh 会展开 glob；-shm 不监控（App 每秒都在写，纯噪声）
+            cmd = ("stat -c '%n %Y:%s' " + d + "/*-DATA.db "
+                   + d + "/*-DATA.db-wal")
         # 🔴 两个坑（2026-11-02 实测）：
         #   ① stat 的格式串里有 %Y/%s，不能走 Python 的 % 格式化
         #      （会报 "unsupported format character 'Y'"）→ 用字符串拼接
@@ -117,7 +129,11 @@ class Watcher(object):
                 self._err += 1
                 if self._err in (1, 10):
                     log.warning("监控异常第 %d 次: %r", self._err, e)
-            time.sleep(min(MAX_IDLE_S, POLL_S * (1 + self._err // 5)))
+            # 🔴 2026-11-19 修复 DATA-12（P2 指数退避）：原来是线性退避
+            #   `POLL_S*(1+_err//5)`，连续异常时爬得太慢、每次都高频空转 stat。
+            #   改指数退避并封顶 30s：`min(30.0, POLL_S * 2**min(_err,5))` ——
+            #   连续失败时间隔指数拉大，降低无谓开销；上限 30s 保证不会睡死。
+            time.sleep(min(30.0, POLL_S * (2 ** min(self._err, 5))))
 
     def start(self):
         if self._th is not None:

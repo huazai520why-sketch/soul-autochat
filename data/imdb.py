@@ -243,6 +243,22 @@ class IMDB(object):
         if self._con is not None:
             self._con.close()
             self._con = None
+        # 🔴 2026-11-19 修复 DATA-06（P2）：若本对象 path 本身就是临时快照
+        #   `<db>-snap.db`（_usable_path 删不掉陈旧 shm 时生成的读替身），关闭后
+        #   它就是陈旧残留（占盘、下次可能被当旧库读到），先关连接再 unlink 掉。
+        #   只在确认是 snap（名字以 -snap.db 结尾）时才删，绝不误删真实账号库。
+        try:
+            if self.path.name.endswith("-snap.db") and self.path.exists():
+                for _suf in ("-shm", "-wal", ""):
+                    _q = Path(str(self.path) + _suf)
+                    try:
+                        if _q.exists():
+                            _q.unlink()
+                    except OSError:
+                        pass
+                log.info("关闭库 → 已清理临时快照 %s", self.path.name)
+        except Exception as _e:      # noqa: BLE001
+            log.debug("清理临时快照失败（忽略）: %r", _e)
 
     def _guess_uid(self):
         """自己 uid。
@@ -639,7 +655,11 @@ def _merge_device_into_mirror(device, name, local, dest_dir):
         con.execute("ATTACH DATABASE ? AS dev", (str(tmp_db),))
         # 🔴 2026-11-15 上午复查（D12，P2）：合并正确性依赖 chatmsg.msgId 唯一索引
         #   （INSERT OR IGNORE 才不重不漏）。索引缺失时 OR IGNORE 变全量重复插入
-        #   → 镜像膨胀。先验索引，缺失就放弃合并（维持旧「镜像冻结」行为）并告警。
+        #   → 镜像膨胀。
+        # 🔴 2026-11-19 修复 DATA-04（P1 缺索引放弃合并且无自愈）：原来检测到无
+        #   唯一索引就 return None 放弃；缩水分支锁定后索引永不重建 → 合并永久
+        #   静默失败。修法：主动自愈 —— 建索引前先按 msgId 去重删重复行，再
+        #   CREATE UNIQUE INDEX IF NOT EXISTS，然后继续合并（不再放弃）。
         try:
             _idx = con.execute("PRAGMA main.index_list(chatmsg)").fetchall()
             _has_msgid_uniq = False
@@ -651,10 +671,20 @@ def _merge_device_into_mirror(device, name, local, dest_dir):
                     _has_msgid_uniq = True
                     break
             if not _has_msgid_uniq:
-                log.warning("合并设备库：镜像 chatmsg.msgId 无唯一索引 → 放弃合并（防重复插入）")
-                return None
+                log.warning("合并设备库：镜像 chatmsg.msgId 无唯一索引 → 自愈（去重 + 建索引）")
+                # 建唯一索引前先按 msgId 去重：保留每组重复 msgId 里 id 最大的一行，
+                # 删掉其余重复行（历史里只多留最新一条，避免唯一索引建不起来）。
+                con.execute(
+                    "DELETE FROM main.chatmsg WHERE id NOT IN ("
+                    "  SELECT MAX(id) FROM main.chatmsg"
+                    "  WHERE msgId IS NOT NULL GROUP BY msgId"
+                    ") AND msgId IS NOT NULL")
+                con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_chatmsg_msgid "
+                            "ON main.chatmsg(msgId)")
+                con.commit()
+                log.info("合并设备库：已为镜像 chatmsg.msgId 建唯一索引 idx_chatmsg_msgid")
         except Exception as _e:
-            log.warning("合并设备库：索引检查异常 %r → 放弃合并", _e)
+            log.warning("合并设备库：索引检查/自愈异常 %r → 放弃合并", _e)
             return None
 
         def cols(table, schema="main"):
@@ -832,7 +862,14 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
         log.debug("量库大小失败（跳过保护）: %r", _e)
         _dev_sz, _loc_sz = 0, 0
 
-    if _loc_sz > 2 * 1024 * 1024 and _dev_sz > 0 and _dev_sz < _loc_sz * 0.5:
+    # 🔴 2026-11-19 修复 DATA-01（P1 设备库缩水合并阈值锁死）：比例判据加**绝对值**下限。
+    #   现象：原来只看 `_dev_sz < _loc_sz * 0.5`，而设备库本身只保留最近 N 条
+    #   （~3776KB 缓慢增长）、镜像保留全量（11.4→11.6MB 因合并膨胀），
+    #   比例单调下降永不回 ≥0.5 → 分支锁死，窗口 500+ 次触发。
+    #   修法：只有**设备库绝对值也小于 1MB** 才算「真清空」；
+    #   设备库几 MB（>1MB，只保留最近 N 条的设计尺寸）不再走此分支，避免锁死。
+    if (_loc_sz > 2 * 1024 * 1024 and _dev_sz > 0
+            and _dev_sz < _loc_sz * 0.5 and _dev_sz < 1024 * 1024):
         # 🔴🔴 2026-11-08 10:52（生产实测修正：光"拒绝"会让 daemon 完全瘫痪）
         #
         #   实测：Soul 在 10:25~10:49 把**两个账号的库都清空了**
@@ -855,9 +892,11 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
                 log.warning("已把本地镜像另存为 %s", keep.name)
         except Exception as _e:
             log.debug("存 .keep 失败: %r", _e)
-        log.warning(
-            "设备库 %s 只剩 %.0fKB（本地镜像 %.1fMB）—— 疑似 Soul 已清空该账号记录，"
-            "**保留本地镜像、本轮用它继续跑**（不覆盖、不报错）",
+        # 🔴 2026-11-19 修复 DATA-02（P2 文案与级别）：设备库小于镜像 50% 多为
+        #   「设备只保留最近 N 条」的设计行为，非真清空，降级 INFO 并改口径。
+        log.info(
+            "设备库 %s 小于镜像 50%（%.0fKB / 镜像 %.1fMB）—— 疑似设备只保留最近 N 条，设计如此"
+            "→ 已增量合并（保留本地镜像、不覆盖、不报错）",
             name[:28], _dev_sz / 1024.0, _loc_sz / 1048576.0)
         # 🔴 2026-11-08 21:0x：**不再直接 return**。镜像冻结是「消息几小时不回」的
         #   真根因（详见 _merge_device_into_mirror 注释）。设备库仍是新消息唯一来源，
@@ -1590,6 +1629,15 @@ def health(db, quick=True):
 
 def invalidate():
     """丢掉本地库缓存（库损坏/切号时调）。"""
+    # 🔴 2026-11-19 修复 DATA-05（P2）：置 None 前先关连接，避免文件句柄泄漏。
+    #   库损坏/切号时旧连接还开着，Windows 上会一直占着 db/-wal 句柄，
+    #   影响后续 pull 换文件。关不掉（已损坏）就吞掉，照旧降级。
+    try:
+        _old = _LAST.get("db")
+        if _old is not None:
+            _old.close()
+    except Exception as _e:
+        log.debug("invalidate 关闭旧库连接失败（忽略）: %r", _e)
     _LAST["db"] = None
     _LAST["ts"] = 0.0
     _LAST["uid"] = ""
