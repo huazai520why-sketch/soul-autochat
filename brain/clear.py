@@ -598,6 +598,17 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
         if time.monotonic() - t_budget > budget_s and out["entered"] > 0:
             log.info("清红点已用 %.0fs（>%.0fs 预算）→ 本轮先停，剩下的下一轮继续",
                      time.monotonic() - t_budget, budget_s)
+            # 🔴 2026-11-19 修复 FLOW-03：break 前把剩余未处理目标落短冷却，
+            #   避免下一轮 sweep 重新从头部取同一批（handled_sids 是局部变量，随函数丢弃）。
+            try:
+                from brain.pendingq import mark_skip as _ms_budget
+                for _rem_sid in set(lib_sids) - handled_sids:
+                    try:
+                        _ms_budget(str(_rem_sid), '', 'sweep_budget', hours=0.1)
+                    except Exception:
+                        pass
+            except Exception as _e_budget:
+                log.debug("sweep 预算冷却记台账异常: %r", _e_budget)
             break
         if time.monotonic() - t_budget > budget_s * 2:
             log.warning("清红点 %.0fs 一个人都没进去 → 直接收工（异常）",
@@ -832,7 +843,15 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                     if _hs_key:
                         try:
                             from brain.pendingq import mark_skip as _ms
-                            _ms(_hs_key, '', 'her_stuck', hours=2.0)
+                            # 🔴 2026-11-19 修复 FLOW-19：mark_skip 的 txt 必须传该行真实末条文本，
+                            #   与 should_skip(sid,txt) 查询口径对齐，否则冷却 key 不匹配、形同虚设。
+                            _hs_txt = ''
+                            try:
+                                _dig_hs = db.session_digest(str(_hs_sid)) if _hs_sid else {}
+                                _hs_txt = (_dig_hs or {}).get('text') or ''
+                            except Exception:
+                                pass
+                            _ms(_hs_key, _hs_txt, 'her_stuck', hours=2.0)
                         except Exception as _e_hs:
                             log.debug("her_stuck 短冷却记台账异常（不影响继续）: %r", _e_hs)
                     her_stuck = 0  # 重置计数，继续处理下一个候选

@@ -51,8 +51,19 @@ def note_dump(ms):
 
 
 def slow_factor():
-    """设备越卡，动作后的等待越长（防止"点了没反应→再点→变双击"）。"""
+    """设备越卡，动作后的等待越长（防止"点了没反应→再点→变双击"）。
+
+    🔴 2026-11-19 修复 FLOW-07：本因子只反映「最近一次 dump 路径」的耗时。
+    局限：只有 eyes.uitree 真正执行 dump 时才会经 note_dump() 喂数；
+    帧复用（缓存命中、不 dump）的路径不更新 DUMP_MS，所以设备恢复后
+    若一直复用旧帧，DUMP_MS 会停留在峰值、因子迟迟不回落。
+    本函数内做衰减兜底：每次调用以极小步长向低值收敛，避免永久卡在高档。
+    eyes.uitree.py 侧的根因（复用不更新）不在本文件负责范围，此处仅缓解。
+    """
     ms = DUMP_MS[0]
+    # 2026-11-19 修复 FLOW-07：向低值缓慢收敛（每 8 次调用约降 1ms 量级，不影响单次手感）
+    if ms > 0:
+        DUMP_MS[0] = ms - (1 if ms <= 10 else max(1, ms // 64))
     if ms >= 2000:
         return 2.5
     if ms >= 800:
@@ -98,7 +109,9 @@ class Device:
     # ---------- 单例 ----------
     @classmethod
     def get(cls, serial=None):
-        if cls._inst is None:
+        # 2026-11-19 修复 FLOW-06：单例原先不区分 serial，先用默认探测 serial 建了实例后，
+        # 再用显式 serial 调 get() 会拿到旧实例、指向错误设备。现在 serial 变了就重建。
+        if cls._inst is None or (serial and cls._inst.serial != serial):
             cls._inst = cls(serial=serial)
         return cls._inst
 
@@ -260,7 +273,15 @@ class Device:
         return box["d"]
 
     def u2(self, timeout=60):
-        """uiautomator2 连接（懒加载）。失败抛 RuntimeError，由上层决定是否降级 adb。"""
+        """uiautomator2 连接（懒加载）。失败抛 RuntimeError，由上层决定是否降级 adb。
+
+        🔴 2026-11-19 修复 FLOW-08：原实现只对「connect 不接受 timeout kw（TypeError）」
+        走 _connect_no_timeout 兜底；但设备半死时 connect(timeout=...) 会**接受**
+        timeout 却仍永久挂起（u2 内部 socket 无超时），此时 _u2_timeout_ok=True、
+        正常抛异常路径根本兜不住，主线程被永久阻塞。修法：把整段 connect+d.info
+        探测放进 daemon 子线程，主线程 join(timeout+5) 兜底，超时即放弃并抛
+        可捕获的 TimeoutError，绝不拖死整条链路。
+        """
         if self._u2 is not None:
             return self._u2
         try:
@@ -269,24 +290,40 @@ class Device:
             raise RuntimeError("未安装 uiautomator2: %s" % e)
         t0 = time.time()
         self.__dict__.setdefault("_u2_timeout_ok", None)
-        try:
+
+        # 2026-11-19 修复 FLOW-08：复用 _connect_no_timeout 的 daemon 线程模式兜底整段 connect
+        box = {}
+
+        def _u2_connect_run():
             try:
-                if self._u2_timeout_ok is None or self._u2_timeout_ok:
-                    try:
-                        d = u2mod.connect(self.serial, timeout=timeout)
-                        self._u2_timeout_ok = True
-                    except TypeError:
-                        # 该版本 connect() 不接受 timeout kw —— 记下来，之后直接走无 timeout 路径
-                        self._u2_timeout_ok = False
+                try:
+                    if self._u2_timeout_ok is None or self._u2_timeout_ok:
+                        try:
+                            d = u2mod.connect(self.serial, timeout=timeout)
+                            self._u2_timeout_ok = True
+                        except TypeError:
+                            # 该版本 connect() 不接受 timeout kw —— 记下来，之后直接走无 timeout 路径
+                            self._u2_timeout_ok = False
+                            d = self._connect_no_timeout(u2mod, timeout)
+                    else:
                         d = self._connect_no_timeout(u2mod, timeout)
-                else:
+                except TypeError:
+                    # 兜底：万一探测路径本身仍以 TypeError 暴露（极老版本）
                     d = self._connect_no_timeout(u2mod, timeout)
-            except TypeError:
-                # 兜底：万一探测路径本身仍以 TypeError 暴露（极老版本）
-                d = self._connect_no_timeout(u2mod, timeout)
-            d.info  # 触发一次通信，确认真的可用
-        except Exception as e:
-            raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, e))
+                d.info  # 触发一次通信，确认真的可用
+                box["d"] = d
+            except Exception as e:            # noqa: BLE001
+                box["err"] = e
+
+        th = threading.Thread(target=_u2_connect_run, daemon=True)
+        th.start()
+        th.join(timeout + 5)  # 2026-11-19 修复 FLOW-08：外层硬兜底，比内层 timeout 略宽
+        if th.is_alive():
+            raise RuntimeError(
+                "u2 连接硬超时(>%.0fs，设备无响应): %s" % (timeout + 5, self.serial))
+        if "err" in box:
+            raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, box["err"]))
+        d = box["d"]
         log.info("u2 已连接 %s (%.1fs) ver=%s", self.serial, time.time() - t0, u2_version())
         self._u2 = d
         return d

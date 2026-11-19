@@ -472,6 +472,15 @@ def maybe_switch(actor, dev, db, st, force_quota=False):
         d["dry_since"] = 0
         d["last_switch_try"] = 0            # 成功 → 清掉失败退避
         _save(d)
+        # 2026-11-19 修复 FLOW-17：切号成功后补调 note_online(新uid)，确保
+        #   cur_uid/online_since 重算。原来只手写 online_since，若某轮漏写，
+        #   online_hours() 仍按旧号起点算 → 新号一上线就被误判「已在线 8h」
+        #   → 立刻再触发强制切号（切号风暴/退避）。note_online 内部只在
+        #   cur_uid 变化时重置，与上面手写不冲突（幂等）。
+        try:
+            note_online(d.get("cur_uid"))
+        except Exception as _e:
+            log.debug("切号后重置在线计时异常（不影响切号）: %r", _e)
         # 🔴 2026-11-15（P1-B7）：切号成功记录 switch_from/switch_to/switch_ts，
         #   供 _target_cool_left 做「切走后 4h 不切回该号」判定（maybe/force 同接）。
         try:
@@ -523,6 +532,12 @@ def force_switch_if_due(actor, dev, db, st):
         d["dry_since"] = 0
         d["last_switch_try"] = 0            # 成功 → 清掉失败退避
         _save(d)
+        # 2026-11-19 修复 FLOW-17：同 maybe_switch，补调 note_online(新uid)
+        #   确保 force 分支切号成功后 online_since 也被重算（防切号风暴）。
+        try:
+            note_online(d.get("cur_uid"))
+        except Exception as _e:
+            log.debug("切号后重置在线计时异常（不影响切号）: %r", _e)
         # 🔴 2026-11-15（P1-B7）：切号成功记录 switch_from/switch_to/switch_ts，
         #   供 _target_cool_left 做「切走后 4h 不切回该号」判定（maybe/force 同接）。
         try:
@@ -601,11 +616,20 @@ def switch_account(actor, dev):
         # 🔴 不能靠「当前账号在第一行」这种硬假设 —— 切错号代价太大。
         #    做法：先记下当前 uid，切完再读一次 uid 对比；没变就换另一个账号行再试。
         from data.imdb import open_account
-        try:
-            before = str(open_account(dev).uid)
-        except Exception as e:
-            log.warning("切号前读 uid 失败（仍然继续）: %r", e)
-            before = ""
+
+        # 2026-11-19 修复 FLOW-16：把「读当前 uid」抽成局部函数，每次 attempt
+        #   重开面板后都要重读一次作 before（不再只在 attempt==0 前读一次）。
+        #   原因：attempt>=1 重开面板后行顺序可能变化（最近使用置顶等），且
+        #   重启 App 后库可能已刷新，旧 before 会失效 → 每轮基于当前真实 uid
+        #   来排除「自己所在行」并做切号前后对比。
+        def _read_uid():
+            try:
+                return str(open_account(dev).uid or "")
+            except Exception as e:
+                log.warning("读当前 uid 失败: %r", e)
+                return ""
+
+        before = _read_uid()
 
         # 候选账号行（排除「添加账号」）
         def _cand_rows(sn):
@@ -621,6 +645,14 @@ def switch_account(actor, dev):
         # 🔴 2026-11-10（P0 修复）：原来 range(2) —— 面板里有 3 个账号时，
         #   第 3 个候选**永远点不到**（见 SWITCH_MAX_TRY 注释里的夜间实测）。
         tried_rows = 0
+        # 2026-11-19 修复 FLOW-16：记录本轮已点过的行（按几何 bounds 标识）。
+        #   order 每轮基于新面板重算，单靠 attempt 索引可能重复点同一行或跳过
+        #   真目标；改为跳过所有已点过的行，保证每轮点一个「新」候选。
+        _tapped_bounds = set()
+
+        def _row_key(r):
+            return tuple(r.bounds)
+
         for attempt in range(SWITCH_MAX_TRY):
             if attempt == 0:
                 s = actor.snap(force=True)
@@ -651,6 +683,11 @@ def switch_account(actor, dev):
                 s = actor.snap(force=True)
                 if "添加账号" not in "\n".join(s.texts()):
                     return False, "账号面板没打开"
+                # 2026-11-19 修复 FLOW-16：重开面板后重读当前 uid 作 before，
+                #   保证本轮排除与前后对比都基于最新 uid（attempt>=1 原来不刷新）。
+                _cur = _read_uid()
+                if _cur:
+                    before = _cur
 
             cand = _cand_rows(s)
             log.info("面板候选账号行 %d 个", len(cand))
@@ -664,15 +701,38 @@ def switch_account(actor, dev):
                              _i, _r.bounds, (_r.label or "")[:16], (_r.desc or "")[:24])
                 except Exception:
                     log.info("   面板行%d bounds=%s（读标签失败）", _i, getattr(_r, "bounds", "?"))
-            # 🔴 2026-11-08 21:3x（实测）：面板第一行就是**当前账号**，
-            #   点它当然「uid 没变」，白跑一轮 + 一次 app 重启。
-            #   现在从第二行开始点（只有一个号时才回落到第一行）。
-            order = (cand[1:] + cand[:1]) if len(cand) > 1 else cand
-            if attempt >= len(order):
+            # 2026-11-19 修复 FLOW-16：不再固定 `cand[1:]+cand[:1]`（假定第一行
+            #   恒为当前号）。每轮按重读到的 before uid 构造 order —— 面板行顺序
+            #   可能变化（最近使用置顶等），固定偏移会重复点同一行/跳过真目标。
+            #   规则：能定位到当前号所在行（cand_idx>=0）就排除该行，其余按原序；
+            #   定位不到（uid 缺失/面板无匹配）就退回旧行为（第一行视为当前号），
+            #   与旧逻辑兼容。
+            cand_idx = -1
+            if before:
+                for _i, _r in enumerate(cand):
+                    _lbl = ((_r.label or "") + " " + (_r.desc or ""))
+                    if before in _lbl:
+                        cand_idx = _i
+                        break
+            if cand_idx >= 0:
+                order = cand[:cand_idx] + cand[cand_idx + 1:]
+                log.info("当前号在面板第 %d 行（uid 命中）→ 排除后剩 %d 个候选",
+                         cand_idx + 1, len(order))
+            else:
+                order = (cand[1:] + cand[:1]) if len(cand) > 1 else cand
+                log.info("未能用 uid 定位当前号行 → 按旧行为跳过第一行（候选 %d 个）",
+                         len(order))
+            # 2026-11-19 修复 FLOW-16：order 每轮基于新面板重算，单靠 attempt 索引
+            #   会重复点同一行/跳过真目标。改为剔除本轮已点过的行（按 bounds 标识），
+            #   取第一个未试过的候选作目标；全部试过就停止（防死循环）。
+            _untapped = [r for r in order if _row_key(r) not in _tapped_bounds]
+            if not _untapped:
+                log.info("候选行都已试过（本轮已点 %d 行）→ 停止重试", len(_tapped_bounds))
                 break
-            target = order[attempt]
+            target = _untapped[0]
+            _tapped_bounds.add(_row_key(target))
             tried_rows += 1
-            log.info("尝试切到第 %d 个账号 %s", attempt + 1, target.bounds)
+            log.info("尝试切到第 %d 个账号 %s", tried_rows, target.bounds)
             actor.hand.tap_node(target, settle=1.5)
 
             t0 = time.time()

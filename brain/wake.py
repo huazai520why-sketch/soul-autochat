@@ -622,7 +622,26 @@ def send_wake(actor, dev, cand, text, db=None):
     try:
         from brain import sendgate as SG
         if SG.ON:
-            _d = SG.allow(cand.sid, 1, has_human=True)
+            # 🔴 2026-11-19 修复 FLOW-05：发送闸必须与候选预过滤同源读取我方末条时间，
+            #   否则镜像比台账新时（我方在别处发过、台账 sends 未写）闸看到旧值放行→进会话
+            #   才被拦截→0 唤出空烧。取 max(镜像末条 ts, reply_state.sends 最大值×1000)。
+            _my_ts_ms_wake = 0
+            try:
+                from brain.pendingq import _my_last_ts_ms as _mltm
+                _my_ts_ms_wake = float(_mltm(db, str(cand.sid)) or 0)
+            except Exception:
+                pass
+            try:
+                from data import reply_state as _RSw
+                _recw = _RSw.get(str(cand.sid))
+                _posw = [float(x) for x in (_recw.get('sends') or []) if float(x) > 0]
+                if _posw:
+                    _rs_ms_wake = max(_posw) * 1000.0
+                    if _rs_ms_wake > _my_ts_ms_wake:
+                        _my_ts_ms_wake = _rs_ms_wake
+            except Exception:
+                pass
+            _d = SG.allow(cand.sid, 1, has_human=True, my_last_ts_ms=_my_ts_ms_wake)
             if not _d.ok:
                 log.info("唤醒被跟进阶梯拦截 sid=%s state=%s（%s）",
                          cand.sid, _d.state, _d.reason)

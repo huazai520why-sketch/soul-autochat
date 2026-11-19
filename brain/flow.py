@@ -665,7 +665,68 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
                                      " → 她刚发，按 C2 清零喂闸", str(sid)[-8:], _ts_s, _last_send)
             except Exception as _e:
                 log.debug("实时库核对失败（按台账走）: %r", _e)
-            _d = SG.allow(sid, len(lines), her_ts_ms=_her_ts_feed)
+            # 2026-11-19 修复 FLOW-02：session.timestamp 会被「未读推送 / 推荐位刷新」
+            #   污染（见 pendingq.py:1151-1155）。仅凭「session.ts > 我方末发+5s」就当
+            #   「她刚发」喂 verdict C2「她再发→清零」会让刷出来的假水位线清空额度 → 重复发。
+            #   喂闸前再用 chatmsg 末条交叉验证：只有 chatmsg 末条确实是**她（sender≠uid）**，
+            #   且其 ts 与 session.ts 相近（差 ≤120s）时才认定她真说了话 → 才喂 _her_ts_feed。
+            _her_ts_ok = False
+            _her_chat_ts = 0.0
+            try:
+                if _her_ts_feed:
+                    _raw_c = _IM._dev_sql(
+                        actor.dev, _name,
+                        "select senderId, localTime from chatmsg where sessionId='%s' "
+                        "and msgType not in (27, 35) and ifnull(text,'')<>'' "
+                        "order by localTime desc limit 1" % str(sid), timeout=8) or ""
+                    _ln_c = ""
+                    for _x in _raw_c.replace("\r", "").splitlines():
+                        if _x.strip():
+                            _ln_c = _x.strip()
+                    if _ln_c and "|" in _ln_c:
+                        _parts = _ln_c.split("|")
+                        _sender_c = (_parts[0] or "").strip()
+                        _lts = float(_parts[1] or 0)
+                        _lts_s = _lts if _lts < 1e11 else _lts / 1000.0
+                        _session_ts_s = _her_ts_feed / 1000.0
+                        if _sender_c and _sender_c != str(_uid_now) \
+                                and abs(_lts_s - _session_ts_s) <= 120:
+                            _her_ts_ok = True
+                            _her_chat_ts = _lts_s
+            except Exception as _e_c:
+                log.debug("chatmsg 交叉验证失败（按台账走，不喂）: %r", _e_c)
+            if _her_ts_feed and not _her_ts_ok:
+                log.info("实时库核对 sid=...%s：session.ts=%.0f 但 chatmsg 末条不匹配 "
+                         "（非她发或时间差 >120s）→ 疑似推送污染，不喂 C2 清零",
+                         str(sid)[-8:], _her_ts_feed / 1000.0)
+                _her_ts_feed = None
+            _my_ts_ms = 0.0
+            # 2026-11-19 修复 FLOW-18 第1层 / FLOW-01：发送闸 my_last_ts_ms 必须与候选闸同源。
+            #   取「镜像 db 我方末条 ts」∪「reply_state.sends 最新值」的较大者（毫秒），
+            #   与 pendingq.py:1301-1318 同款逻辑。避免「镜像滞后但台账已更新」时
+            #   调用方漏传 → AWAITING 误判（漏回）或漏判（重复发）。
+            try:
+                from data import reply_state as _RSf
+                _recf = _RSf.get(sid)
+                _posf = [float(x) for x in (_recf.get('sends') or []) if float(x) > 0]
+                if _posf:
+                    _my_ts_ms = max(_posf) * 1000.0                  # 秒 → 毫秒
+            except Exception:
+                _my_ts_ms = 0.0
+            # 镜像 db 我方末条（滞后但比台账更「真实」——note_sent 落账的也是它）。
+            try:
+                if db is not None:
+                    _uid_m = getattr(db, "uid", "") or ""
+                    if _uid_m:
+                        for _m in db.messages(str(sid), limit=60):
+                            if str(getattr(_m, "sender", "") or "") == str(_uid_m):
+                                _ts_m = int(getattr(_m, "ts", 0) or 0)
+                                if _ts_m > _my_ts_ms:
+                                    _my_ts_ms = _ts_m
+            except Exception:
+                pass
+            _d = SG.allow(sid, len(lines), her_ts_ms=_her_ts_feed,
+                          my_last_ts_ms=_my_ts_ms)
             if not _d.ok:
                 log.info("[%s] 跟进阶梯拦截 sid=%s state=%s（%s）", nick, sid, _d.state, _d.reason)
                 return 0, "跟进阶梯拦截(%s)" % _d.state
@@ -716,6 +777,56 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
                 _ok = inp.sent_ok(actor, line, timeout=4)
                 _why = getattr(inp, "last_reason", "") or ""
                 if (not _ok) and _why == "residual":
+                    # 2026-11-19 修复 FLOW-13：residual 旧版直接当「明确未发出」
+                    #   → 不记账 → 下轮重发。若 residual 其实是 AI 声明条/banner
+                    #   误读（hands/input.py 已加 banner 过滤，此处兜底文案变化），
+                    #   重发会引发同话题连发轰炸 + per-sid 熔断锁死。
+                    #   与 pendingq.py:3107-3151 对齐：residual 先落库交叉验证，
+                    #   末条已含本条 text → 按已发记账，不重试。
+                    _landed_r = False
+                    try:
+                        _needle_r = (line or "").strip()
+                        if _needle_r and sid:
+                            # 优先实时查设备库（最新），失败再回落本地 db.last_message。
+                            try:
+                                from data import imdb as _IM3
+                                _uid3 = _IM3.current_uid(actor.dev)
+                                _nm3 = _IM3._db_name_for_uid(actor.dev, _uid3)
+                                if _nm3:
+                                    _raw3 = _IM3._dev_sql(
+                                        actor.dev, _nm3,
+                                        "select ifnull(text,'') from chatmsg where "
+                                        "sessionId='%s' order by localTime desc limit 1"
+                                        % str(sid), timeout=8) or ""
+                                    _ln3 = ""
+                                    for _x in _raw3.replace("\r", "").splitlines():
+                                        if _x.strip():
+                                            _ln3 = _x.strip()
+                                    if _ln3 and _needle_r in _ln3:
+                                        _landed_r = True
+                            except Exception as _e4:
+                                log.debug("residual 实时库校验异常: %r", _e4)
+                            if not _landed_r and db is not None:
+                                try:
+                                    _lm2 = db.last_message(sid)
+                                    if _lm2 is not None:
+                                        _tx3 = (_lm2.text or "").strip()
+                                        _ct3 = (_lm2.content or "").strip()
+                                        if _needle_r in _tx3 or _needle_r in _ct3:
+                                            _landed_r = True
+                                except Exception as _e5:
+                                    log.debug("residual 本地库校验异常: %r", _e5)
+                    except Exception as _e6:
+                        log.debug("residual 落库校验异常: %r", _e6)
+                    if _landed_r:
+                        log.info("[%s] 第%d条 residual 但库已落库 → 按已发出记账（AI 声明条误读）",
+                                 nick, i + 1)
+                        sent += 1
+                        # 已发出：记上这一条，继续发剩余 lines（与 pendingq.py 的
+                        #   continue 语义一致）；本轮 note_sent 由 finally 统一收口。
+                        continue
+                    # 真未发出：清空输入框，返回「明确未发出」。此 return 早退仍会走
+                    #   函数末尾的 finally（按真实发出条数记账），不会漏记已发部分。
                     inp.clear()
                     return sent, "第%d条确认未发出（输入框仍有内容）" % (i + 1)
                 if not _ok:

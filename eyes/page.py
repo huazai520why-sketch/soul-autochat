@@ -44,7 +44,13 @@ def detect(snap):
     # chat 页最强判据：输入框 resource-id 或「发送」
     if snap.find(res="et_sendmessage", limit=1) or snap.find(res="sendmessage", limit=1):
         return "chat"
-    if "发送" in texts and not (("聊天" in texts) and ("广场" in texts)):
+    # 2026-11-19 修复 FLOW-09：原「发送」单文本判 chat 过宽（广场发帖/招呼详情等页也带「发送」
+    # 按钮 → 误判成 chat）。收紧为「发送」文本 + 输入框 resource-id 同时存在才算 chat。
+    if (
+        "发送" in texts
+        and (snap.find(res="et_sendmessage", limit=1) or snap.find(res="sendmessage", limit=1))
+        and not (("聊天" in texts) and ("广场" in texts))
+    ):
         return "chat"
 
     # 🔴 2026-11-08（结构判据优先，文案只做兜底）：
@@ -77,7 +83,21 @@ def badges(snap, tab_y_min=1500):
     实测：广场 tab 的红点是 TextView '6' at (299,1510,333,1544)，
     聊天 tab 是 TextView '12' at (626,1510,660,1544)，都在图标右上角、
     且 y 都在 1500~1560 区间（比 tab 文字 y=1571 更靠上）。
+
+    🔴 2026-11-19 修复 FLOW-10：原实现把 900x1600 的 bounds / y 阈值 / x 分档
+    直接硬编码，换分辨率（如 1080x1920）后红点全部落空。现用 Device.wm_size()
+    拿真实分辨率，按 sx=width/900、sy=height/1600 归一化所有阈值后再判。
     """
+    # 2026-11-19 修复 FLOW-10：按真实分辨率归一化；拿不到 wm_size 时退回 900x1600 基准
+    try:
+        from ..core.device import Device
+        w, h = Device.get().wm_size()
+        sx, sy = w / 900.0, h / 1600.0
+    except Exception:
+        sx, sy = 1.0, 1.0
+
+    y_min = tab_y_min * sy          # 基准 1500 归一化
+    y_max = 1570 * sy               # 基准 tab 文字上沿
     out = {}
     for n in snap.nodes:
         if not n.visible:
@@ -86,14 +106,15 @@ def badges(snap, tab_y_min=1500):
         if not _NUM_RE.match(t):
             continue
         x1, y1, x2, y2 = n.bounds
-        if y1 < tab_y_min or y1 > 1570:
+        if y1 < y_min or y1 > y_max:
             continue
-        # 按 x 归到对应的 tab 区间（900 宽四等分）
-        if x1 < 201:
+        # 按 x 归到对应的 tab 区间（基准 900 宽四等分 → 201/402/699 归一化）
+        nx1 = x1 / sx
+        if nx1 < 201:
             out["星球"] = int(t)
-        elif x1 < 402:
+        elif nx1 < 402:
             out["广场"] = int(t)
-        elif x1 < 699:
+        elif nx1 < 699:
             out["聊天"] = int(t)
         else:
             out["自己"] = int(t)

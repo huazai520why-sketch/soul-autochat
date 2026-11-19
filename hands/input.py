@@ -25,13 +25,29 @@ PLACEHOLDER = "文明聊天，友善交友~"
 #   输入框区域显示「对话由AI生成，非Soul立场」AI 免责声明条——box_text 把它
 #   读成「输入框残留」→ 消息其实已发出（该会话 159 条/24h 全部落库 st3）→
 #   误判 residual → 不记账重发（同话题 6 连发轰炸）+ per-sid 熔断锁死热聊会话 2h。
-AI_BANNER_TEXTS = ("对话由AI生成",)
+# 2026-11-19 修复 FLOW-11：扩为多文案元组（覆盖「AI生成」「由AI生成」等常见变体，
+#   防 App 改文案后单点字符串失效）；并要求命中 banner 时同时校验框内长度
+#   ≤ banner 长度阈值（真残留会远长于 banner），双条件才判「已清空」。
+AI_BANNER_TEXTS = ("对话由AI生成", "由AI生成", "AI生成", "AI 免责", "非Soul立场")
+# banner 命中时框内允许的最大长度：真免责条只有一两行（≤40 字符），
+# 若框内文本远长于此，说明是「她正文里含 banner 字样」的真残留，不能判成功。
+AI_BANNER_MAX_LEN = 40
 
 
 def _ai_banner(t):
-    """命中 AI 免责声明条 → 输入框本身已清空（视为发送成功）。"""
+    """命中 AI 免责声明条 → 输入框本身已清空（视为发送成功）。
+
+    2026-11-19 修复 FLOW-11：双条件判定——
+      ① 文本命中 AI_BANNER_TEXTS 任一子串（兼容多种文案变体）；
+      ② 且框内长度 ≤ AI_BANNER_MAX_LEN（真残留会远长于 banner）。
+    只满足①不满足②（她正文恰好含 banner 字样）时不判成功，避免漏发。
+    """
     t = (t or "").strip()
-    return bool(t) and any(k in t for k in AI_BANNER_TEXTS)
+    if not t:
+        return False
+    if not any(k in t for k in AI_BANNER_TEXTS):
+        return False
+    return len(t) <= AI_BANNER_MAX_LEN
 
 
 class Input(object):
@@ -152,15 +168,25 @@ class Input(object):
                     self._snap_gen = None
                 return True, got
             if clear_ok and got and text.strip() in got:
-                log.warning("第%d次灌字等值不匹配但为已确认清空后的子串命中（宽松兜底通过）："
-                            "期望 %r 实际 %r", i + 1, text, got)
-                self._snap = snap2          # 给 tap_send 复用
-                try:
-                    from core.device import action_gen as _ag
-                    self._snap_gen = _ag()
-                except Exception:
-                    self._snap_gen = None
-                return True, got
+                # 2026-11-19 修复 FLOW-12：子串兜底前再读一次框做残留确认。
+                #   clear_ok=True 只代表 clear_text 没抛异常，不代表框真空了
+                #   （可能静默失败）；此时 `text in got` 命中可能是「残留+新文本」
+                #   拼接。现在去掉 text 后剩余部分必须为空/纯空白才放行，
+                #   否则视为残留未清、本轮判失败（fail-closed）。
+                _expect = text.strip()
+                _rest = got.replace(_expect, "", 1).strip()
+                if not _rest:
+                    log.warning("第%d次灌字等值不匹配但为已确认清空后的子串命中（宽松兜底通过）："
+                                "期望 %r 实际 %r", i + 1, text, got)
+                    self._snap = snap2          # 给 tap_send 复用
+                    try:
+                        from core.device import action_gen as _ag
+                        self._snap_gen = _ag()
+                    except Exception:
+                        self._snap_gen = None
+                    return True, got
+                log.warning("第%d次子串兜底拒绝（去掉期望文本后仍有残留 %r，疑似清空静默失败）："
+                            "期望 %r 实际 %r", i + 1, _rest, text, got)
             log.warning("第%d次灌字未落地：期望 %r 实际 %r", i + 1, text, got)
         # 🔴 2026-11-14（F09）：失败返回读真实当前帧，避免复用 TTL 内旧帧误判。
         # 🔴 2026-11-18（F-IN-01）：若全因清空失败而跳过发送，同样走到这里返回

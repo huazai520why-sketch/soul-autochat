@@ -1128,7 +1128,10 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                                      sid, _d_txt[:16])
                             continue
                     except Exception:
-                        pass
+                        # 2026-11-19 修复 FLOW-20：交叉验证异常不能吞掉后继续硬放行——
+                        #   否则镜像滞后时摘要=我方原句会误判「她新话」硬入队（自我回声）。
+                        #   保守跳过本轮硬放行，宁漏勿错。
+                        continue
                 if _d_txt and _d_ts and not _recently_replied(
                         to_uid, sid=sid, text=_d_txt, her_ts_ms=_d_ts):
                     log.info("设备未读硬放行·镜像滞后 uid=%s sid=%s 摘要=%r"
@@ -2083,7 +2086,7 @@ def _swipe_list(actor, up=True):
     return _swipe_once(actor, 450, 400, 450, 1100)
 
 
-def first_dot_row(actor):
+def first_dot_row(actor, expected_nick=None):
     """当前屏「第一个红点行」。
 
     2026-11-04（新消息必回）：末条是「[切]」「？？」这种 1~2 字/纯表情时，
@@ -2092,12 +2095,22 @@ def first_dot_row(actor):
     消息就这样被罚了 3 小时冷却。
     刚发来的消息必然在列表顶部、且带红点 ⇒ 直接进第一个红点行。
     进错人不会串台：进会话后 `身份校验` 用 session 摘要对不上就 fail-closed 不发。
+    🔴 2026-11-19 修复 FLOW-15：盲点前先用该行昵称与目标候选昵称（expected_nick）
+      比对，不一致就不点 —— 昵称是列表上唯一稳定信号，避免赌错 ≈20s 白烧 + 推高 idfail。
     """
+    _exp_ni = _norm(expected_nick) if expected_nick else ""
     try:
         from eyes.chatlist import rows as _rows
         snap = actor.snap(force=True)
         for r in _rows(snap):
             if r.has_dot:
+                if _exp_ni:
+                    # 2026-11-19 修复 FLOW-15：昵称对不上就不点（双向包含同 find_row 昵称层）。
+                    _rn = _norm(getattr(r, "nickname", "") or "")
+                    if not _rn or not (_rn == _exp_ni or _exp_ni in _rn or _rn in _exp_ni):
+                        log.info("红点行昵称 %r 与目标 %r 不一致 → 不盲点（FLOW-15）",
+                                 getattr(r, "nickname", ""), expected_nick)
+                        return None
                 return r
     except Exception as e:
         log.warning("取红点行失败: %r", e)
@@ -2675,7 +2688,8 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             #   已经失败过的交给正常搜索路径（按 skip 依次试结果），不再靠盲点红点行加码。
             _idn = int((_IDFAIL.get(_idfail_key(sid, txt)) or {}).get("n", 0))
             if _idn == 0:
-                row = first_dot_row(actor)
+                # 2026-11-19 修复 FLOW-15：盲点红点行前先按目标昵称过滤，对不上就不点。
+                row = first_dot_row(actor, expected_nick=_nick_try)
                 if row is not None:
                     log.info("新消息文本定位不到（末条 %r）→ 直接进第一个红点行 %r",
                              txt[:10], row.nickname)
@@ -2947,6 +2961,13 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             if row is None:
                 S.leave(actor)
             out["skipped"] += 1
+            # 2026-11-19 修复 FLOW-14：进不去也计入熔断连续计数，避免整轮逐个撞墙。
+            _NOT_CHATLIST_STREAK[0] += 1
+            if _NOT_CHATLIST_STREAK[0] >= NOT_CHATLIST_MAX:
+                log.warning("连续 %d 次进不去/页面不对 → 判定设备级故障，本轮提前收工",
+                            _NOT_CHATLIST_STREAK[0])
+                out["aborted"] = "not_chatlist"
+                break
             continue
 
         # 用户 2026-11-02：搜索/跳转都不要点太快，页面还没加载完就操作会失败
@@ -2986,6 +3007,13 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             if row is None:
                 S.leave(actor)
             out["skipped"] += 1
+            # 2026-11-19 修复 FLOW-14：身份校验失败（页面/定位不对）也计入熔断连续计数。
+            _NOT_CHATLIST_STREAK[0] += 1
+            if _NOT_CHATLIST_STREAK[0] >= NOT_CHATLIST_MAX:
+                log.warning("连续 %d 次进不去/身份不对 → 判定设备级故障，本轮提前收工",
+                            _NOT_CHATLIST_STREAK[0])
+                out["aborted"] = "not_chatlist"
+                break
             continue
         _idfail_clear(sid, txt)
 
@@ -2995,7 +3023,22 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         _gate_n = 0
         try:
             from brain import sendgate as _SG5
-            _gate = _SG5.allow(str(sid), 99, her_ts_ms=float(her_ts or 0), has_human=True)
+            # 2026-11-19 修复 FLOW-04：发送闸必须与候选闸同源传 my_last_ts_ms。
+            #   _my_ts_ms 在 candidates() 里算过，但那是另一个函数、本作用域不可见，
+            #   故按同款逻辑（镜像∪reply_state.sends 取 max）在此重算一次传入。
+            try:
+                _my_ts_ms_gate = float(_my_last_ts_ms(db, str(sid)) or 0.0)
+                from data import reply_state as _RSp
+                _recp = _RSp.get(str(sid))
+                _posp = [float(x) for x in (_recp.get('sends') or []) if float(x) > 0]
+                if _posp:
+                    _rs_ms_p = max(_posp) * 1000.0        # 秒 → 毫秒
+                    if _rs_ms_p > _my_ts_ms_gate:
+                        _my_ts_ms_gate = _rs_ms_p
+            except Exception:
+                _my_ts_ms_gate = 0.0
+            _gate = _SG5.allow(str(sid), 99, her_ts_ms=float(her_ts or 0), has_human=True,
+                               my_last_ts_ms=_my_ts_ms_gate)
             if not _gate.ok:
                 log.info("跟进阶梯拦截 sid=%s state=%s（%s）→ 本轮不回",
                          sid, _gate.state, _gate.reason)
@@ -3004,6 +3047,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 actor.hand.back(settle=1.5)
                 if row is None:
                     S.leave(actor)
+                # 2026-11-19 修复 FLOW-14：闸拦截也计入熔断连续计数（页面已对、人已确认，
+                #   但连着被闸挡说明环境异常/额度问题，凑够阈值就整轮收工，别逐个空烧）。
+                _NOT_CHATLIST_STREAK[0] += 1
+                if _NOT_CHATLIST_STREAK[0] >= NOT_CHATLIST_MAX:
+                    log.warning("连续 %d 次被闸拦截 → 判定本轮异常，提前收工",
+                                _NOT_CHATLIST_STREAK[0])
+                    out["aborted"] = "not_chatlist"
+                    break
                 continue
             _gate_n = _gate.n
         except Exception as _e_gate:

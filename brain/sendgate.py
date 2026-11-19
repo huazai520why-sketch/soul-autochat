@@ -75,22 +75,39 @@ def allow(
         rec = RS.get(sid)
         _her = float(rec.get("her_ts_ms") or 0) or float(her_ts_ms or 0)
         _sends = rec.get("sends") or []
-        # 2026-11-14 夜审修复（B-01，P0）：调用方（flow/pendingq/wake）从不传
-        #   my_last_ts_ms → verdict 的 AWAITING 判据恒不触发 → 同一句 4 分钟内
-        #   被回两次（pendingq.log 22:54:20 与 22:58:26 生产实证）。用台账实时的
-        #   sends 兜底：我方末条晚于她末条 → AWAITING → 只跟不追。台账不受
-        #   300s 镜像滞后影响；她若真回了新话，on_her 已清空 sends（且有
-        #   ts<=old 保护，旧消息不会误清），不会误伤。
-        if not my_last_ts_ms and _sends:
-            try:
-                # 🔴 2026-11-15（P1-7）：sends 台账可能含 0 值（占位/异常写入），
-                #   max() 会把 0 当真实发送时刻 → my_last_ts=0 → AWAITING 判据误判
-                #   （0 远早于 her_ts，反而认为我没回过）。过滤 >0 再取 max。
-                _pos = [float(x) for x in _sends if float(x) > 0]
-                if _pos:
-                    my_last_ts_ms = max(_pos) * 1000.0
-            except Exception:
-                pass
+        # 2026-11-19 修复 FLOW-18 第2层（防御性兜底）：闸内把 my_last_ts_ms 收口到
+        #   max(调用方传入值, 台账 sends 最新值)。原因：sendgate 只有 sid 没有
+        #   actor/dev，无法低成本拿到镜像 db 引用（open_account 需 device），
+        #   故按任务规范退化为「传入值 ∪ 台账 sends 取 max」，并在下面注释说明限制。
+        #   效果：三个调用方（flow.py:668 / pendingq.py:2998 / wake.py:625）
+        #   即使有人漏传或传了滞后值（如 flow 只传镜像 db ts），台账的实时 sends
+        #   也能把 my_s 拉起来，避免 AWAITING 漏判（重复发）或误判（漏回）。
+        try:
+            _pos = [float(x) for x in _sends if float(x) > 0]
+        except Exception:
+            _pos = []
+        _sends_max_ms = (max(_pos) * 1000.0) if _pos else 0.0
+        # 调用方传了 >0 的值：与台账 max 取较大者（处理调用方用了滞后镜像 ts 的情况）。
+        if my_last_ts_ms and float(my_last_ts_ms) > 0:
+            if _sends_max_ms > float(my_last_ts_ms):
+                log.debug("发送闸 sid=...%s my_last_ts_ms 调用方传 %.0f < 台账 %.0f → 取台账值",
+                          str(sid)[-8:], float(my_last_ts_ms), _sends_max_ms)
+                my_last_ts_ms = _sends_max_ms
+        else:
+            # 调用方未传 / 传 0 / 传 None：用台账 sends 兜底。
+            # 🔴 2026-11-14 夜审修复（B-01，P0）：原版没这兜底 → verdict 的 AWAITING
+            #   判据恒不触发 → 同一句 4 分钟内被回两次（pendingq.log 22:54:20 与
+            #   22:58:26 生产实证）。台账不受 300s 镜像滞后影响；她若真回了新话，
+            #   on_her 已清空 sends（且有 ts<=old 保护，旧消息不会误清），不会误伤。
+            # 🔴 2026-11-15（P1-7）：sends 台账可能含 0 值（占位/异常写入），
+            #   max() 会把 0 当真实发送时刻 → my_last_ts=0 → AWAITING 判据误判
+            #   （0 远早于 her_ts，反而认为我没回过）。过滤 >0 再取 max。
+            if _sends_max_ms > 0:
+                my_last_ts_ms = _sends_max_ms
+            # ⚠️ 限制说明：sendgate 无 device/actor 引用，未接入镜像 db.my_text_ts /
+            #    latest。若台账也为空且调用方又漏传，my_s 仍为 0 → AWAITING 不触发，
+            #    依赖调用方自行传入。这是任务规范里明确允许的退化（「拿不到 db 引用
+            #    就只做传入值与台账sends取max」）。
         if _her <= 0:
             # 🔴 不伪造 her_ts 落盘：台账没有真人消息时间戳时，
             #    用本回合最早一条发送时刻作起点（一条都没发则用当前时刻）。
@@ -165,12 +182,19 @@ def state_of(sid: str, **kw):
         return V.state_of(has_human=False)
     try:
         rec = RS.get(sid)
+        _my_ms = float(kw.get("my_last_ts_ms") or 0.0)
+        # 2026-11-19 修复 FLOW-18 第2层：state_of 与 allow 同款兜底 —— 调用方漏传
+        #   或传 0 时用台账 sends 兜底；传了值时也与之取 max（防滞后）。
+        _pos = [float(x) for x in (rec.get("sends") or []) if float(x) > 0]
+        _sends_max_ms = (max(_pos) * 1000.0) if _pos else 0.0
+        if _sends_max_ms > _my_ms:
+            _my_ms = _sends_max_ms
         return V.state_of(
             sid=sid,
             her_ts_ms=float(rec.get("her_ts_ms") or kw.get("her_ts_ms") or 0),
             sends=rec.get("sends") or [],
             now=kw.get("now"),
-            my_last_ts_ms=kw.get("my_last_ts_ms") or 0.0,
+            my_last_ts_ms=_my_ms,
             has_human=kw.get("has_human", True),
             n_lines=kw.get("n_lines", 1),
         )
