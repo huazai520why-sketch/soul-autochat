@@ -1813,7 +1813,20 @@ def remember_nick(sid, nick):
     _NICK_CACHE[key] = (time.time(), t)
     try:
         import json as _json
-        data = {k: v[1] for k, v in _NICK_CACHE.items() if v and v[1]}
+        # 2026-11-20（§52）：落盘必须读磁盘全量合并，不能只写内存子集。
+        #   nick_of 在 _NICK_CACHE >500 时会 clear()，清空后内存只剩新积累的
+        #   少量条目；旧逻辑直接用这份子集 os.replace 覆盖 NICK_FILE，实测
+        #   nick_cache.json 从 380 条被截到 49 条（老会话唯一可靠定位信号丢失，
+        #   也让 sid_by_nick 反查命中率下降）。改为磁盘全量 ∪ 内存增量。
+        data = {}
+        try:
+            if NICK_FILE.exists():
+                data.update(_json.loads(NICK_FILE.read_text(encoding="utf-8")) or {})
+        except Exception:
+            pass
+        for _k, _v in _NICK_CACHE.items():
+            if _v and _v[1]:
+                data[_k] = _v[1]
         # 2026-11-20 修复 D-08：原子写（tmp + os.replace），照搬 _save_idfail 范式。
         #   改前 write_text 直接覆盖，进程崩溃留半截 JSON → 昵称台账全丢。
         NICK_FILE.parent.mkdir(parents=True, exist_ok=True)

@@ -51,6 +51,19 @@ def main():
             assert PQ.sid_by_nick("不存在的昵称") is None
             assert PQ.sid_by_nick("") is None
             assert PQ.sid_by_nick(None) is None
+
+            # remember_nick 落盘必须读磁盘全量合并，不能用内存子集覆盖
+            # （nick_of 的 >500 clear() 后，旧逻辑会把磁盘历史昵称清空，
+            # 实测 nick_cache 380 条被截到 49 条）。
+            nf.write_text(json.dumps(
+                {"1001": "小鱼干儿", "1002": "观雨"}, ensure_ascii=False),
+                encoding="utf-8")
+            with mock.patch.object(PQ, "_NICK_CACHE", {}):
+                PQ.remember_nick("1003", "新人昵称")
+            merged = json.loads(nf.read_text(encoding="utf-8"))
+            assert merged.get("1001") == "小鱼干儿"   # 磁盘历史保留
+            assert merged.get("1002") == "观雨"
+            assert merged.get("1003") == "新人昵称"   # 内存增量写入
     print("PASS t_idfail_giveup")
 
 
