@@ -835,16 +835,31 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                     #    handled_sids 末位；全都没有才用 r.nickname 兜底记（有键总比漏记强）。
                     _hs_sid = _sid or _sid_hint \
                         or (list(handled_sids)[-1] if handled_sids else None)
-                    _hs_key = str(_hs_sid) if _hs_sid else str(r.nickname or "")
+                    _hs_key = str(_hs_sid) if _hs_sid else ""
+                    # 2026-11-20（§52 修复）：昵称当 key 写进 pending_skip.json 后
+                    #   永远不会被 should_skip(sid, ...) 命中（实测台账里出现
+                    #   「寶寶♡飛飛」昵称键，真实 sid=...5314259 的冷却完全失效）。
+                    #   拿不到 sid 时先用昵称缓存反查，反查不到就不写，杜绝脏键。
+                    if not _hs_key.isdigit() and r.nickname:
+                        try:
+                            from brain.pendingq import sid_by_nick as _sbn
+                            _rev = _sbn(r.nickname)
+                            if _rev:
+                                _hs_key = _rev
+                                _hs_sid = _rev
+                        except Exception:
+                            pass
                     # 🔴 F3：原 hours=0.1（6 分钟）与额度窗口（滚动 24h）严重不匹配 ——
                     #    额度满的会话每 6 分钟被重拉一遍，纯空烧。改 2 小时（简化口径，
                     #    不去查 verdict 降低耦合；2h 也远比 6min 强，且不会把「等她回」
                     #    的正常待回压得过死）。
-                    if _hs_key:
+                    if _hs_key.isdigit():
                         try:
                             from brain.pendingq import mark_skip as _ms
                             # 🔴 2026-11-19 修复 FLOW-19：mark_skip 的 txt 必须传该行真实末条文本，
                             #   与 should_skip(sid,txt) 查询口径对齐，否则冷却 key 不匹配、形同虚设。
+                            #   语音/空摘要时 _hs_txt 为 ""：pending_ledger.should_skip 对
+                            #   空文本记录按 sid 整会话冷却（§52），冷却不再是空台账。
                             _hs_txt = ''
                             try:
                                 _dig_hs = db.session_digest(str(_hs_sid)) if _hs_sid else {}
@@ -854,6 +869,9 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
                             _ms(_hs_key, _hs_txt, 'her_stuck', hours=2.0)
                         except Exception as _e_hs:
                             log.debug("her_stuck 短冷却记台账异常（不影响继续）: %r", _e_hs)
+                    else:
+                        log.warning("her_stuck 拿不到数字 sid（昵称=%r）→ 不写台账，"
+                                    "避免昵称键污染 pending_skip", r.nickname)
                     her_stuck = 0  # 重置计数，继续处理下一个候选
                     continue
             else:

@@ -1832,6 +1832,30 @@ def remember_nick(sid, nick):
         log.info("昵称缓存回填（原为 None/缺失）sid=%s → %r", key[-10:], t)
 
 
+def sid_by_nick(nick):
+    """昵称反查 sid（NICK_FILE 是 sid->昵称）。
+
+    2026-11-20（§52）：clear.sweep 的 her_stuck 兜底路径拿不到 sid 时，
+    旧逻辑直接把昵称当 key 写进 pending_skip.json —— 该键永远不会被
+    should_skip(sid, ...) 命中，冷却形同虚设且污染台账（实测出现
+    「寶寶♡飛飛」这类昵称键）。写台账前先用本函数反查真实 sid。
+    读盘而非读内存 _NICK_CACHE：clear 在另一模块，进程内缓存未必同份。
+    """
+    t = str(nick or "").strip()
+    if not t:
+        return None
+    try:
+        import json as _json
+        if NICK_FILE.exists():
+            data = _json.loads(NICK_FILE.read_text(encoding="utf-8"))
+            for k, v in (data or {}).items():
+                if isinstance(v, str) and v.strip() == t:
+                    return str(k)
+    except Exception as e:
+        log.debug("昵称反查 sid 失败 %r: %r", t, e)
+    return None
+
+
 def _sessions_with(db, text):
     """文本出现在几个不同会话里（前缀匹配，兼容 kw_of 的 20 字截断）。
 
@@ -3013,12 +3037,21 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 # 计数归零：2h 后重试时从第 1 条结果重新试一轮（会话顺序/新消息会变），
                 # 否则 skip 会一直停在第 4、5 条，永远试不到正确的那条。
                 _idfail_clear(sid, txt)
+                # 2026-11-20（§52 修复）：旧逻辑 2h 冷却到期 + 计数清零后会从头再试
+                #   4 次 → 再冷却 2h，无限循环（实测 sid=...489038460 一夜 4 连试后
+                #   每 2h 重来，§40 遗留⑤「idfail 未计入放弃闸」即此）。计入 loc_fail
+                #   放弃闸：新鲜会话第 4 次、老会话（≥24h）第 2 次失败即归档止损；
+                #   她再发新人话由 C4 自动复活，不是拉黑。
+                _loc_giveup(sid, to_uid, "id_mismatch", age_h)
             else:
                 log.warning("身份校验失败（第 %d 次，消息 %r）→ 不发送，防串台"
                             "（fail-closed），下次试第 %d 条搜索结果",
                             _n, txt[:12], _n + 1)
                 # 2min 冷却：每次重试都要重搜 11s + 进会话，太短白烧；太长她等太久。
                 mark_skip(sid, txt, "id_mismatch", hours=0.034)
+                # 同上：老会话（≥24h，实测回出率仅 0.8%）2 次身份失败就归档，
+                # 新鲜会话继续累计到阈值，由本分支上一支处理。
+                _loc_giveup(sid, to_uid, "id_mismatch", age_h)
             actor.hand.back(settle=1.5)
             if row is None:
                 S.leave(actor)

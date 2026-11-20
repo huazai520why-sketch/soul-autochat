@@ -114,7 +114,11 @@ def cmd_check():
 
     try:
         b = R.engine()
-        line("出话引擎", "OK (PERSONA %d 字)" % len(getattr(b, "PERSONA", "") or ""))
+        # 2026-11-20（§52）：persona.py 只有 IDENT/system_blocks()/chars()，
+        # 从来没有 PERSONA 属性，旧写法恒定打印「PERSONA 0 字」（§50 遗留③）。
+        # 改用真实人设字数；规则字数由 rules.chars() 负责，这里只验人设块。
+        from brain.engine import persona as _persona
+        line("出话引擎", "OK (人设 %d 字)" % int(_persona.chars() or 0))
     except Exception as e:
         line("出话引擎", "FAIL %r" % e, False)
 

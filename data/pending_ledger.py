@@ -52,7 +52,14 @@ def should_skip(sid, text, default_hours=DEFAULT_SKIP_HOURS, last_out=None):
     rec = load_skip().get(str(sid)) or {}
     if not rec:
         return False
-    if (rec.get("text") or "").strip() != (text or "")[:120].strip():
+    rec_text = (rec.get("text") or "").strip()
+    # 2026-11-20（§52 修复）：空文本记录 = 按 sid 整会话冷却。
+    #   写入侧在拿不到末条文本时会刻意传 ""（clear.her_stuck 语音会话、
+    #   sweep_budget、flow.enter_fail 媒体会话），旧逻辑要求 text 全等才命中，
+    #   导致这些冷却台账写入后永远匹配不上任何候选（实测 pending_skip.json 里
+    #   her_stuck 记录 text="" 28 小时仍在、冷却形同虚设）。空记录在冷却窗口内
+    #   对该 sid 的任意文本生效；窗口外仍由下面的 age 判断自然失效。
+    if rec_text and rec_text != (text or "")[:120].strip():
         return False
     age = time.time() - float(rec.get("ts") or 0)
     hours = float(rec.get("hours") or default_hours)
