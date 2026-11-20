@@ -377,7 +377,19 @@ class IMDB(object):
                 "SELECT %s FROM session WHERE sessionId = ?" % _sel,
                 (session_id,)).fetchone()
         except Exception as e:
-            log.warning("读 session 摘要异常: %r", e)
+            # 2026-11-20 修复 A3（P1）：摘要读失败（malformed/异常）不能再静默 return None，
+            #   否则 latest() 退化只读 chatmsg，对「入向不落 chatmsg」的账号重回必回盲区
+            #   （实测 14:29 连 4 次，镜像库持续损坏）。
+            #   保守降级：不在此处做重活（避免新一轮崩溃），把降级意图显式化 ——
+            #   记一条明确的 warning 说明已退化到「只读 chatmsg」并给出 sid 与损坏原因；
+            #   同时累计一个实例级计数器，供上层/诊断脚本识别「镜像持续损坏」。
+            #   注：未做设备库兜底 —— 设备侧「单会话摘要」无现成可复用的只读查询路径
+            #   （_dev_sql 返回原始文本需脆裂解析，且在异常处理器里做 adb I/O 有
+            #   「新一轮崩溃」风险），故按保守路径只显式化降级意图。
+            log.warning("读 session 摘要异常（摘要失效，已退化到只读 chatmsg，"
+                        "可能漏回「入向不落 chatmsg」账号，如 402857053）: sid=%s %r",
+                        session_id, e)
+            self._digest_degraded = getattr(self, "_digest_degraded", 0) + 1
             return None
         if r is None:
             return None
@@ -422,9 +434,24 @@ class IMDB(object):
           大部分「她真发了同文本」的误判（那种情况两 ts 通常相隔很远）。
           命中本地 chatmsg 时语义不变（最准）。
         """
+        # 2026-11-20 修复 A2（P1）：仅返回时间戳（向后兼容），来源判定交给
+        #   my_text_ts_src —— 调用方（pendingq 1134）需区分「精确文本匹配（可硬跳过）」
+        #   与「sends 兜底（非精确，不可硬跳过，防固定话术连发误判漏回）」。
+        ts, _src = self.my_text_ts_src(session_id, text, limit=limit)
+        return ts
+
+    def my_text_ts_src(self, session_id, text, limit=60):
+        """我发过这句的最近时间 + 来源标记：(ts_ms, source)。
+
+        2026-11-20 修复 A2（P1）：把 my_text_ts 拆成带来源的版本，用于区分
+          「镜像摘要精确文本匹配」（source="mirror"，可作硬闸）与
+          「reply_state.sends 兜底」（source="sends"，只存 ts 不存文本，
+          是「我方最近发过某句」而非「发过这句」——固定话术连发时会误判
+          她真人新话 → 漏回，故不可作硬闸）。未命中 source=""。
+        """
         text = (text or "").strip()
         if not text:
-            return 0
+            return 0, ""
         best = 0
         try:
             for m in self.messages(session_id, limit=limit):
@@ -435,20 +462,20 @@ class IMDB(object):
         except Exception:
             pass
         if best:
-            return best
-        # 2026-11-20 修复 X-02：本地镜像未命中 → 用 reply_state.sends 兜底透出
-        # 「我方刚发过」的时间信号。延迟导入 + 容错：imdb 是底层，避免循环导入，
-        # reply_state 缺失/异常时静默退回旧行为（返回 0）。
+            return best, "mirror"
+        # 本地镜像未命中 → reply_state.sends 兜底透出「我方刚发过」的时间信号。
+        # 延迟导入 + 容错：imdb 是底层，避免循环导入，
+        # reply_state 缺失/异常时静默退回旧行为（返回 ("", "")）。
         try:
-            from data import reply_state as _rs  # 延迟导入，避免循环依赖
-            sends = _rs.sends_of(str(session_id))  # 秒，升序
+            from data import reply_state as _rs
+            sends = _rs.sends_of(str(session_id))
             if sends:
                 last = float(sends[-1])
                 if last > 0:
-                    best = max(best, int(last * 1000))  # 秒 → 毫秒，对齐 m.ts
+                    return max(best, int(last * 1000)), "sends"
         except Exception:
             pass
-        return best
+        return best, ""
 
     def latest(self, session_id):
         """会话最新一条：(Msg|None, source)，source ∈ {"db", "session", ""}。

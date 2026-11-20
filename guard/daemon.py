@@ -68,6 +68,15 @@ log = get_logger("guard.daemon")
 MATCH_EVERY = 8.0         # 两次匹配之间（一轮内连打也保留小间隔，别点太快）
 WAKE_EVERY = 60.0         # 两次唤醒之间
 IDLE_SLEEP = 30.0         # 无事可做时的空转间隔
+# 🔴 2026-11-20 修复（F1 P0 保守版·空烧 idle 死胡同兜底）：
+#   「回复侧无候选 + 匹配额度耗尽 + 唤醒无候选」三重叠加时，整轮掉进 idle 死胡同，
+#   原先每 IDLE_SLEEP(30s) 就把七阶段重扫一遍，既刷屏又纯空转（历史曾连累加到
+#   199 轮、窗口实测空烧 156 轮 / idle 634 轮）。检测到该死态时，用下面这个**一次性
+#   长退避**代替 30s 短轮询，把重扫频率从「每 30s」压到「每 10 分钟」。
+#   注意：这里只做「告警 + 退避」两件事，**不碰**匹配额度 / 唤醒阶梯 / 冷却 / 切号
+#   等任何产品策略参数（见 cycle ⑦ 段注释）。退避期间仍走 wait_bell 分片扫铃，
+#   奇遇铃一弹立刻抢占，不会因为退避漏掉铃。
+IDLE_DEADEND_BACKOFF_S = 600.0   # 空烧死态的一次性长退避（10 分钟）
 DEV_RETRY = 180.0         # 设备不可用后等多久再试
 # 连续匹配的参数（用户 2026-11-08：把额度花光）
 MATCH_STREAK_N = int(os.environ.get("SOUL_MATCH_STREAK_N", "12") or 12)   # 一轮最多连打几个
@@ -253,7 +262,19 @@ def _hb(tag=""):
       现在：在长耗时段内部主动打心跳，watchdog 只在「真的没动静」时才动手。
     """
     try:
-        if lock.touch(tag or "hb"):
+        # 🔴 2026-11-20 修复（F4 P1）：区分「写失败」与「owner 变更」。
+        #   touch() 现在用两个 falsy 信号区分：
+        #     · TOUCH_WRITE_FAILED  → owner 仍是自己，只是这一下写文件失败
+        #       （Windows 句柄竞争 / 杀软瞬时锁定，重试一次仍未成功）
+        #       → 丢一次心跳不至于杀轮，降级 warning，不再 raise。
+        #     · TOUCH_OWNER_CHANGED / False → 锁可能真被别的 pid 占用 / 已丢失
+        #       → 走 ensure 兜底，仍失败才 raise（保住单实例互斥）。
+        _t = lock.touch(tag or "hb")
+        if _t is True:
+            return
+        if _t == lock.TOUCH_WRITE_FAILED:
+            log.warning("心跳写锁失败但锁 owner 仍是本进程 → 降级处理，不杀轮"
+                        "（单次心跳未刷新，下一轮补上）")
             return
         ok, why = lock.ensure("daemon")
         if not ok:
@@ -307,6 +328,9 @@ def cycle(a, dev, db, st, dry_run=False):
     """
     t_round = time.time()
     lock.touch("round-start")
+    # 🔴 2026-11-20 修复（F1 P0）：标记「本轮唤醒段真跑过且没唤成人」，供 ⑦
+    #   判定三重死态（回复无候选 + 额度耗尽 + 唤醒无候选）用。
+    _wake_ran = False
 
     # 0) 拉库：**5 分钟同步一次**（用户 2026-11-02），有新消息信号时立刻强制刷新。
     #    原来每轮都 pull 10MB，又慢又容易拉到不一致的库。
@@ -1112,8 +1136,12 @@ def cycle(a, dev, db, st, dry_run=False):
         n = do_wake(a, dev, db, st, dry_run=dry_run)
         st["last_wake"] = time.time()
         lock.touch("waked")
-        if n:
+        if n > 0:
             return "waked"
+        # 🔴 2026-11-20 修复（F1 P0）：记下「本轮唤醒段跑过且没唤成任何人」，供 ⑦
+        #   判定三重死态用。此处把原来的 `if n:` 改成 `if n > 0`（0 不再当真），
+        #   并落 _wake_ran 标记 —— 这样「唤醒侧一个候选都没有」也能被 ⑦ 识别。
+        _wake_ran = True
 
     # ⑥ 账号轮转：榨干配额 或 在线 8h 强制切
     # 🔴 2026-11-09 R8（用户拍板「当前账号没榨干不切号」）：
@@ -1144,6 +1172,27 @@ def cycle(a, dev, db, st, dry_run=False):
             log.warning("账号轮转异常（不阻断）: %r", e)
 
     # ⑦ 空闲：只有「确实无人可聊、无事可做」才在这里等
+    # 🔴 2026-11-20 修复（F1 P0 保守版·空烧 idle 死胡同兜底）：
+    #   「回复侧无候选（pending_zero_rounds 已 >= 闸门阈值，本轮一路降到 idle）
+    #    + 匹配额度已耗尽（match_quota_day 已记）+ 唤醒无候选（本轮唤醒段跑过但没唤成
+    #    人）」三重叠加 = 真正的死态：回复、匹配、唤醒三条产出通道同时为零。
+    #   原先这里只散打 INFO、每 IDLE_SLEEP(30s) 就把七阶段重扫一遍，运维看不出是死态，
+    #   日志还刷屏（历史空烧曾连累加到 199 轮 / 窗口实测空烧 156、idle 634 轮）。
+    #   现在做且只做两件**可观测性 + 不刷屏**的保守事，不动任何产品策略参数：
+    #     1) 打一条显式 WARNING，把 pending_zero_rounds 计数打进去，点明「需人工关注或等额度重置」；
+    #     2) 置 st["idle_deadend"] 标记，由主循环把本次空闲等待从 30s 换成
+    #        IDLE_DEADEND_BACKOFF_S(600s) 的一次性长退避，期间仍分片扫铃不被打断。
+    #   **没有**加强制切号、**没有**改匹配额度 / 唤醒阶梯 / 冷却时长 / 切号逻辑——
+    #   那些属产品策略，待用户确认后由相应单元处理。
+    _quota_gone = (st.get("match_quota_day") == time.strftime("%Y-%m-%d"))
+    if _wake_ran and _quota_gone:
+        _zz = int(st.get("pending_zero_rounds", 0) or 0)
+        log.warning(
+            "⚠️ 空烧死态：回复侧无候选（空烧 %d 轮）+ 匹配额度耗尽 + 唤醒无候选 → "
+            "本轮三条产出通道同时为零，空转。需人工关注或等匹配额度次日重置；"
+            "本轮结束后退避 %.0f 分钟再重扫（退避期仍扫铃，弹铃立刻抢占）。",
+            _zz, IDLE_DEADEND_BACKOFF_S / 60.0)
+        st["idle_deadend"] = True
     log.info("空闲 %.0fs（无待回/无红点/匹配与唤醒都在冷却）", IDLE_SLEEP)
     return "idle"
 
@@ -1282,6 +1331,10 @@ def do_wake(a, dev, db, st, dry_run=False):
     plan = W.plan(db, n=W.MAX_PER_ROUND)
     if not plan:
         log.info("唤醒：没有候选")
+        # 🔴 2026-11-20 修复（F1 P0）：「唤醒无候选」是 ⑦ 段三重死态判定的输入之一。
+        #   这里保持 return 0（沿用既有契约：`if n: return "waked"`），
+        #   cycle 用外层 _wake_ran 标记 + 是否走到 ⑦ idle 来识别「唤醒侧无候选」，
+        #   不在此处引入新的哨兵返回值，避免破坏其它 do_wake 调用点的语义。
         return 0
     # 🔴 进唤醒前先清一次库变化信号：这一轮前面（回复/红点/匹配）自己的写入
     #    还挂在 dirty 上，不清掉的话第一个人就会被「检测到新消息」拦下，
@@ -1457,10 +1510,19 @@ def run(once=False, dry_run=False):
                     #   空闲等待也要分片扫铃 —— 铃只存活几十秒，一整段睡
                     #   IDLE_SLEEP(30s) 就错过（实测铃存活性短）。
                     #   wait_bell 每 5s 扫一眼，弹了就立刻处理，占满整个空闲窗。
+                    # 🔴 2026-11-20 修复（F1 P0）：空烧死态（回复无候选 + 匹配额度
+                    #   耗尽 + 唤醒无候选）时，用一次性长退避代替 30s 短轮询，避免
+                    #   每 30s 重扫七阶段刷屏空转；退避仍走 wait_bell 分片扫铃，
+                    #   弹铃立刻抢占，不会漏铃。退避一次后清标记，下一轮若死态解除
+                    #   （额度重置 / 来了新候选）自动恢复正常 30s 节奏。
+                    _idle_wait = IDLE_SLEEP
+                    if st.get("idle_deadend"):
+                        _idle_wait = IDLE_DEADEND_BACKOFF_S
+                        st["idle_deadend"] = False
                     try:
-                        wait_bell(a, dev, IDLE_SLEEP)
+                        wait_bell(a, dev, _idle_wait)
                     except Exception:
-                        time.sleep(IDLE_SLEEP)      # 扫铃异常兜底，别让空闲段白等
+                        time.sleep(_idle_wait)     # 扫铃异常兜底，别让空闲段白等
                 elif what == "blocked":
                     time.sleep(30)
                 elif what in ("replied", "bell"):

@@ -209,8 +209,14 @@ class Device:
     def wm_size(self):
         out = self.text("wm size")
         m = re.search(r"(\d+)x(\d+)", out)
+        # 2026-11-20 修复（F5）：空/无法匹配时先轻量重试 1 次（退避 1s）再判死，
+        #   让 adb 偶发抖动（"wm size 解析失败: ''" → 盲等 180s）快速自愈。
         if not m:
-            raise RuntimeError("wm size 解析失败: %r" % out)
+            time.sleep(1.0)
+            out = self.text("wm size")
+            m = re.search(r"(\d+)x(\d+)", out)
+            if not m:
+                raise RuntimeError("wm size 解析失败: %r" % out)
         return int(m.group(1)), int(m.group(2))
 
     def current_app(self):
@@ -226,8 +232,16 @@ class Device:
     def screencap(self, timeout=30):
         """exec-out 取 PNG 原始字节。校验 magic，坏图直接抛错（不返回半张图）。"""
         rc, raw, err = self.run(["exec-out", "screencap", "-p"], timeout=timeout)
+        # 2026-11-20 修复（F3）：rc=0 但无输出属 adb 偶发抖动；原地退避 1.5s 重试
+        #   1 次，再空才抛，避免打断整轮（match.py said_already → cycle 顶层）。
         if not raw:
-            raise RuntimeError("screencap 空输出 rc=%s err=%r" % (rc, err[:120]))
+            log.warning("screencap 空输出（rc=%s err=%r）→ 退避 1.5s 重试 1 次",
+                        rc, err[:120])
+            time.sleep(1.5)
+            rc, raw, err = self.run(["exec-out", "screencap", "-p"], timeout=timeout)
+            if not raw:
+                raise RuntimeError("screencap 空输出(重试后仍空) rc=%s err=%r"
+                                   % (rc, err[:120]))
         if not raw.startswith(PNG_MAGIC):
             # Windows adb 偶发 CRLF 污染（\n -> \r\n），保守修复后复检
             fixed = raw.replace(b"\r\r\n", b"\n").replace(b"\r\n", b"\n")

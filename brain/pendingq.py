@@ -1131,13 +1131,27 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 #   回复」，直接跳过，不入队、不清额度。
                 if _d_txt:
                     try:
-                        _my_ts = db.my_text_ts(sid, _d_txt)
-                        if _my_ts and abs(int(_d_ts) - int(_my_ts)) <= 120000:
+                        # 🔴 2026-11-20 修复 A2（P1）：my_text_ts 有 sends 兜底返回值，
+                        #   只存 ts 不存文本，是「我方最近发过某句」非「发过这句」。
+                        #   固定话术连发时会误判「她真人新话是我方刚发原句」→ 漏回。
+                        #   改用 my_text_ts_src 区分来源，只有 mirror（精确文本匹配）
+                        #   才硬跳过；sends 兜底命中只记 debug 继续判（让她真人新话入队）。
+                        _my_ts, _my_ts_src = db.my_text_ts_src(sid, _d_txt)
+                        _delta = abs(int(_d_ts) - int(_my_ts)) if _my_ts else -1
+                        if _my_ts and _delta <= 120000 and _my_ts_src == "mirror":
                             scan_stats["mine_last"] += 1
                             log.info("设备未读硬放行·镜像滞后 sid=%s 摘要=%r 是我方 "
-                                     "刚发的原句 → 跳过（不入队、不清额度）",
+                                     "刚发的原句（mirror 精确匹配）→ 跳过（不入队、不清额度）",
                                      sid, _d_txt[:16])
                             continue
+                        if _my_ts and _delta <= 120000 and _my_ts_src == "sends":
+                            # 2026-11-20 修复 A2：sends 兜底命中只作 debug 提示，
+                            #   不硬跳过，让她真人新话继续走正常判据（不漏回）。
+                            scan_stats["mine_last_sends_hint"] = \
+                                scan_stats.get("mine_last_sends_hint", 0) + 1
+                            log.debug("设备未读硬放行·sends兜底不硬跳 sid=%s 摘要=%r "
+                                      "近邻send_ts=%s（非精确文本匹配，继续正常判据）",
+                                      sid, _d_txt[:16], _my_ts)
                     except Exception:
                         # 2026-11-19 修复 FLOW-20：交叉验证异常不能吞掉后继续硬放行——
                         #   否则镜像滞后时摘要=我方原句会误判「她新话」硬入队（自我回声）。
@@ -1161,6 +1175,69 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                 scan_stats["mine_last"] += 1
                 log.debug("跳过末条是我 sid=%s uid=%s（设备未读集合里没有 → 真·无需回）",
                           sid, to_uid)
+                # 🔴🔴 2026-11-20 修复 A1（P0）：此分支不再无条件丢弃——
+                #   「末条是我 + age≥24h + 本回合 sent_total==0」的会话正是
+                #   verdict 状态机里的 PENDING_RESTART（重新开场），却被上面
+                #   `continue`（1164 行）吃掉，永远到不了 1333/1386 的 verdict，
+                #   restart 对这批是死代码（日志证据：候选汇总「我方末条 250」，
+                #   最大连续空烧 156 轮）。
+                #   修法：判据与候选链 1333 同源（_SG.state_of + PENDING_RESTART
+                #   + allowed>0），放行时仍尊重归档/冷却/AWAITING（上游 1058 已滤归档，
+                #   should_skip 在 handle_pending 2508 再卡一道，AWAITING 由 state_of
+                #   自身拦截），只有真正 restart 且能发的才入队走重新开场。
+                #   PENDING（非 restart）仍按原逻辑跳过 —— 本地没有「她真人末条」
+                #   不冒充 her_ts_ms，保守放弃（设备未读那条路 1102 才是她的救生圈）。
+                _her_real = None
+                try:
+                    from brain import flow as _FLOW_ar
+                    _her_real = _FLOW_ar.her_last_real(db, sid, db.uid)
+                except Exception:
+                    _her_real = None
+                if _her_real is not None:
+                    _hr_ts = int(getattr(_her_real, "ts", 0) or 0)
+                    _hr_txt = (getattr(_her_real, "text", "") or "").strip()
+                    _age_h = max(0.0, (time.time() * 1000.0 - _hr_ts) / 3600000.0)
+                    if _age_h < RESTART_H:
+                        log.debug("末条是我·候选restart放弃 sid=%s 她末条 age=%.1fh<%.0fh",
+                                  sid, _age_h, RESTART_H)
+                    elif not _hr_txt:
+                        log.debug("末条是我·候选restart放弃 sid=%s 她末条无文本", sid)
+                    else:
+                        _my_ar = float(_my_last_ts_ms(db, str(sid)) or 0.0)
+                        try:
+                            from data import reply_state as _RS_ar
+                            _rec_ar = _RS_ar.get(str(sid))
+                            _pos_ar = [float(x) for x in (_rec_ar.get("sends") or [])
+                                       if float(x) > 0]
+                            if _pos_ar:
+                                _rs_ar = max(_pos_ar) * 1000.0
+                                if _rs_ar > _my_ar:
+                                    _my_ar = _rs_ar
+                        except Exception:
+                            pass
+                        _vd_ar = None
+                        try:
+                            from brain import sendgate as _SG_ar
+                            from brain import verdict as _VD_ar
+                            _vd_ar = _SG_ar.state_of(str(sid), her_ts_ms=_hr_ts,
+                                                    has_human=True, my_last_ts_ms=_my_ar)
+                        except Exception as _e_ar2:
+                            log.debug("末条是我·候选restart状态机异常 sid=%s: %r",
+                                      sid, _e_ar2)
+                        if _vd_ar is not None and _vd_ar.state == _VD_ar.PENDING_RESTART \
+                                and _vd_ar.allowed > 0:
+                            log.info("末条是我·候选restart放行 sid=%s uid=%s 她末条=%r "
+                                     "age=%.1fh（本回合 0 条 → 走重新开场）",
+                                     sid, to_uid, _hr_txt[:20], _age_h)
+                            scan_stats["restart_recovered"] = \
+                                scan_stats.get("restart_recovered", 0) + 1
+                            out.append((sid, to_uid, _hr_txt, _hr_ts,
+                                        _burst_n(db, sid, db.uid)))
+                            continue
+                        log.debug("末条是我·候选restart放弃 sid=%s state=%s allowed=%s",
+                                  sid,
+                                  getattr(_vd_ar, "state", "err"),
+                                  getattr(_vd_ar, "allowed", "?"))
             continue
         # 🔴 2026-11-03（最老优先的配套闸）：`session.timestamp` 会被「未读推送 /
         #    推荐位刷新」更新，与 chatmsg 里她**真正**的末条时间差得很远 ——

@@ -1172,7 +1172,17 @@ def said_already(dev, snap=None):
     if card and CARD_FRESH_MARK in tree:
         return False, []
 
-    png = dev.screencap()
+    # 2026-11-20 修复（F3）：screencap 失败（含 device.py 重试后仍空）时降级——
+    #   返回 (True, []) 即「按已说过处理 → 跳过这张卡」。
+    #   选这条方向而非 (False, []) 的依据：
+    #     · match_runner.py:97 `if said:` → 打印「不重发，直接点下一个」→ 卡被跳过，绝不重发开场白
+    #     · match.py run_once:894 `if said:` → out["skip_said"]=True → daemon 调 advance，卡被安全略过
+    #   若返回 (False, []) 则两处都会进发送分支，对同一张卡重复轰炸 → 绝对禁止。
+    try:
+        png = dev.screencap()
+    except Exception as e:
+        log.warning("said_already: screencap 失败，fail-closed 跳过本卡（避免重复轰炸）: %r", e)
+        return True, []
     bs = C.bubbles(png)
     real = []
     for b in bs:

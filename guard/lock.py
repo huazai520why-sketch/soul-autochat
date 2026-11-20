@@ -41,6 +41,18 @@ STEP_HANG_S = 8 * 60         # 同一步骤超过 8 分钟 -> 判卡死
 _held = False
 _pid = os.getpid()
 
+# 🔴 2026-11-20 修复（F4 P1）：写锁偶发失败被升级成杀轮
+#   原状：touch() 把「写文件失败」和「锁 owner 已变更」都折叠成 return False，
+#   调用方（daemon._hb）一律走 ensure→失败即 raise → 整轮异常。
+#   实测 07:31:57 `写锁失败: PermissionError(13, '拒绝访问。')`（Windows 文件句柄
+#   竞争 / 杀软瞬时锁定），owner 其实还是自己，却因写不进去被判死、杀掉整轮。
+#   现在用两个**真值均为 False** 的字符串信号区分：
+#     · TOUCH_OWNER_CHANGED → 锁真被别的 pid 占用（互斥被破坏）→ 调用方应 raise
+#     · TOUCH_WRITE_FAILED  → owner 仍是自己、只是这一下没写成 → 调用方降级 warning
+#   两个都保持 falsy，兼容只判真假的既有调用点（见文件头用法示例）。
+TOUCH_OWNER_CHANGED = "owner_changed"
+TOUCH_WRITE_FAILED = "write_failed"
+
 
 # ---------------- 进程存活 ----------------
 def _alive(pid):
@@ -108,8 +120,19 @@ def _write(d):
         os.replace(str(tmp), str(LOCK_FILE))
         return True
     except Exception as e:
-        log.warning("写锁失败: %r", e)
-        return False
+        # 🔴 2026-11-20 修复（F4 P1）：PermissionError(13) 这类 Windows 文件句柄
+        #   竞争 / 杀软瞬时锁定往往是**一瞬间**的，立即重试一次就能成功，不值得
+        #   上升成杀轮。只重试一次（不是无限），仍失败才返回 False，由调用方降级。
+        try:
+            time.sleep(0.05)
+            tmp = LOCK_FILE.with_name(LOCK_FILE.name + ".tmp-%d" % _pid)
+            tmp.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+            os.replace(str(tmp), str(LOCK_FILE))
+            log.info("写锁重试成功（首次失败: %r）", e)
+            return True
+        except Exception as e2:
+            log.warning("写锁失败（重试后仍失败）: %r / %r", e, e2)
+            return False
 
 
 def _atomic_create(d):
@@ -232,7 +255,7 @@ def touch(step=""):
         return False
     d = _read()
     if d.get("pid") != _pid:
-        # 锁被别人接管了（自己的心跳不该续别人的命）
+        # 锁被别人接管了（自己的心跳不该续别人的命）→ 真正的 owner 变更
         log.error("心跳失败：锁 owner 已变为 pid=%s（本进程 pid=%s）→ 尝试原地自愈",
                   d.get("pid"), _pid)
         _held = False
@@ -240,13 +263,19 @@ def touch(step=""):
         if ok:
             return True
         log.error("心跳自愈失败：%s → 本进程应立即停止操作模拟器", why)
-        return False
+        # 🔴 2026-11-20 修复（F4 P1）：返回明确的「owner 变更」信号，
+        #   让调用方知道这是互斥被破坏、必须停下，而不是一次普通的写失败。
+        return TOUCH_OWNER_CHANGED
     d["ts"] = time.time()
     if step:
         if d.get("step") != step:
             d["step"] = step
             d["step_ts"] = time.time()
-    return _write(d)
+    # 🔴 2026-11-20 修复（F4 P1）：到这里 owner 仍是自己，_write 失败只是
+    #   「这一下没写成」（Windows 句柄竞争 / 杀软瞬时锁定），不是丢锁。
+    #   返回 TOUCH_WRITE_FAILED（仍为 falsy）让调用方降级 warning，
+    #   而不是当成 owner 丢失去 raise 杀掉整轮。
+    return True if _write(d) else TOUCH_WRITE_FAILED
 
 
 def step_age():
