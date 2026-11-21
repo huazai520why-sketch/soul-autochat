@@ -135,7 +135,10 @@ def state_of(
         if v > 0:
             raw_sends.append(v)
     # C2：她再发真人消息 → 计数清零。只统计她末条之后的发送。
-    turn = [t for t in raw_sends if t >= her_s - 1.0]
+    # 2026-11-22 修复 D7（P2）：原容差 `-1.0s` 允许「比她末条早 1s 的发送」
+    #   被算进本轮，会把上一轮的最后一条误纳入。改为 `>= her_s`（>=0s 容差）
+    #   —— 发送台账的 ts 是发送成功后的时刻，必 >= 她末条 ts 才属本轮。
+    turn = [t for t in raw_sends if t >= her_s]
     sent_total = len(turn)
     sent_24h = sum(1 for t in raw_sends if t > now_s - 86400.0)
 

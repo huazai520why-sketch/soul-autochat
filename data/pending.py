@@ -243,7 +243,10 @@ def should_reply(db, now_ms=None, include_cooling=False, include_replied=False,
     # 🔴 2026-11-08 03:30（P0 死锁）：时效闸 —— 与 pendingq.STALE_GIVEUP_H 同口径。
     #   红点闸门必须只数「真的还能回的人」，否则过期积压会把闸门永久顶成 True。
     _age_cutoff = 0.0
-    if max_age_h and float(max_age_h) > 0:
+    # 2026-11-22 修复 D6（P1）：`if max_age_h and float(max_age_h)>0` 把 0 当 falsy
+    #   静默吞掉，调用方传 0 会退化成「无时效闸」。改成 `is not None` 且区分 0 与 None
+    #   —— None = 不启用闸，0 = 立即过期（全不返回），>0 = 正常口径。
+    if max_age_h is not None and float(max_age_h) >= 0:
         _age_cutoff = now_ms - float(max_age_h) * 3600000.0
 
     try:
@@ -448,13 +451,14 @@ def summary(db, max_age_h=None):
     if max_age_h is not None:
         _kw["max_age_h"] = max_age_h
     try:
+        # 2026-11-22 修复 D6（P1）：summary 原来调 should_reply 3 次（全量 + ready + ready24），
+        #   每次都全库扫一遍。改为只调 1 次全量（include_cooling=True, include_replied=True），
+        #   然后在内存里派生 ready（不含已回）和 ready24（24h 内可处理）两个口径。
+        #   这样 summary 从 3×全库扫描降到 1×，对 300+ 会话的库效果显著。
         items = should_reply(db, include_cooling=True, include_replied=True, **_kw)
     except Exception as e:
         return "待回 ? 人（统计失败: %r）" % (e,)
     if not items:
-        # 🔴 2026-11-10：原来这里直接 return，一行日志都不打 —— 于是
-        #   「待回 0 人」这种**最该确认的状态**反而在 data.pending.log 里看不见，
-        #   daemon 日志有、本模块日志没有，排查时两边对不上。
         try:
             if _LAST_SUM["v"] != "待回 0 人":
                 _LAST_SUM["v"] = "待回 0 人"
@@ -469,24 +473,14 @@ def summary(db, max_age_h=None):
         old_s = "%.1fh" % (oldest / 3600.0)
     else:
         old_s = "%.0fm" % (oldest / 60.0)
-    # 可立即处理 = 不在冷却、不是已回过
-    try:
-        ready = len(should_reply(db, **_kw))
-    except Exception:
-        ready = -1
-    # 🔴 2026-11-10（日志缺陷修复 + 口径留证）：原来只报一个「可立即处理 N 人」。
-    #   但 pendingq.candidates() 还要再过一层 STALE_GIVEUP_H(24h) 淘汰 **和**
-    #   自己那本 pending_skip.json 冷却台账 → 实测日志喊「可立即处理 11 人」，
-    #   候选队列筛完只剩 1 个，一整夜都是「进 1 人 / 回 1 条」。
-    #   复盘时完全看不出这 10 个的差额是被 24h 淘汰吃掉还是被冷却吃掉。
-    #   这里把 24h 口径单独算一遍并列出来，差额一眼可见。
-    ready24 = -1
-    try:
-        _kw24 = dict(_kw)
-        _kw24["max_age_h"] = 24
-        ready24 = len(should_reply(db, **_kw24))
-    except Exception:
-        pass
+    # 2026-11-22 修复 D6：从 items 派生 ready（不含已回 = cooling+replied 之外的）和 ready24。
+    #   items 已含全部（cooling + replied），所以：
+    #   · ready = 24h 内且不是 replied（不含已回）的条数
+    #   · ready24 = 24h 内的全部条数（含 cooling，但不含超期）
+    _now_ms = time.time() * 1000.0
+    ready = sum(1 for x in items
+                if x.age_s <= 24 * 3600.0 and x.reason != "replied")
+    ready24 = sum(1 for x in items if x.age_s <= 24 * 3600.0)
     txt = ("待回 %d 人（未读 %d / 已读未回 %d），最老 %s 前，可立即处理 %s 人"
            % (len(items), n_unread, n_read, old_s,
               ready if ready >= 0 else "?"))

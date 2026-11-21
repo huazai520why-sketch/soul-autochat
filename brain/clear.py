@@ -203,6 +203,17 @@ def _rows_for_lib(snap, db, lib_sids, handled=None, limit=0):
             if (r.nickname or "") in handled:
                 continue
             if key in (r.blob or ""):
+                # 2026-11-22 修复 F9：blob 前缀子串（前 8 字）匹配短句会话可能撞车
+                #   （两条会话末条都以「嗯」/「好的」开头），误认领会进错会话点错人。
+                #   认领前用 flow.sid_from_row(db, r) 反查该行的真实 sid：
+                #     · 反查命中同一 sid → 确认正确，认领；
+                #     · 反查命中不同 sid → 跳过（撞车，留给正确 sid 认领）；
+                #     · 反查 None（短文本歧义）→ 保留原子串匹配兜底放行（不因保守而空转）。
+                _rev = flow.sid_from_row(db, r)
+                if _rev is not None and str(_rev) != str(sid):
+                    log.debug("行 blob 前缀命中但反查 sid 不符（目标=%s 反查=%s）→ 跳过",
+                              sid, _rev)
+                    continue
                 used.add(id(r))
                 out.append((r, sid))
                 break

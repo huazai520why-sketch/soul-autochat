@@ -1194,6 +1194,14 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
     #        一律判为失败，返回 ""，绝不当成数据往上传。
     _ERR_MARKS = ("su: inaccessible", "su: not found", "Permission denied",
                   "No such file or directory", "inaccessible or not found")
+    # 2026-11-22 修复 D3：裸 sqlite3 端口错误关键词补全 —— 除 su 类外，
+    #   还有「库不存在/损坏/打不开/表不存在/语法错」等非 su 类错误，都
+    #   会被 `2>&1` 混进 stdout。原先 out 非空就 _mark(True) 直接 return，
+    #   错误文本被当数据传给 device_live_uids / device_unread_map → 空集合
+    #   被误判为「App 已不存在」→ 系统性漏回全部真人。
+    _SQLITE_ERR_PAT = ("unable to open", "no such table", "no such column",
+                       "no such database", "not a database", "malformed",
+                       "database is locked", "sqlite3:", "error:")
 
     def _clean(txt):
         t = (txt or "").strip()
@@ -1201,6 +1209,20 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
             if m.lower() in t.lower():
                 return ""
         return t
+
+    def _is_err(txt):
+        """2026-11-22 修复 D3：输出里含 sqlite/su 类错误关键词 → 视为失败。
+        只做纯字符串检查，不引入额外 IO；宁可多触发一次 probe 也不误判成功。"""
+        tl = (txt or "").lower()
+        if not tl:
+            return False
+        for m in _ERR_MARKS:
+            if m.lower() in tl:
+                return True
+        for m in _SQLITE_ERR_PAT:
+            if m.lower() in tl:
+                return True
+        return False
 
     def _mark(ok_):
         if ok is not None:
@@ -1214,9 +1236,15 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
         raw = device.text('sqlite3 "%s/%s" "%s" 2>&1'
                           % (DB_DIR_ANDROID, dbname, sql), timeout=timeout)
         out = _clean(raw)
-        if out:
+        # 2026-11-22 修复 D3：先判错误关键词再判空 —— 原「out 非空就 _mark(True)」
+        #   会把 sqlite 的 error 文本当数据返回；现在错误一律判失败，
+        #   落到 su -c 兜底或上层 None 降级。
+        if out and not _is_err(raw):
             _mark(True)
             return out
+        if _is_err(raw):
+            log.debug("_dev_sql 裸命令判失败（含错误关键词）sid_db=%s sql=%r raw=%r",
+                      dbname, sql[:60], raw[:120])
         # 🔴 A2：裸命令拿到空（可能是成功 0 行，也可能是 stderr 的非 su 类错误），
         #   再用一次「能稳定区分成功/失败」的 probe 复核：跑一次 `select 1` 健康检查。
         #   能拿到 "1" → 库存在 + 连接 OK + SQL 语法合法（同一 shell 都通）→
@@ -1224,10 +1252,13 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
         #   拿不到 "1" → 库/连接/权限有问题 → 判失败（ok=False），不在此处返回，
         #   让流程走到 su -c 兜底，仍失败则上层返回 None 降级。
         try:
-            healthy = _clean(device.text(
+            healthy_raw = device.text(
                 'sqlite3 "%s/%s" "select 1" 2>&1'
-                % (DB_DIR_ANDROID, dbname), timeout=timeout))
-            if healthy.strip() == "1":
+                % (DB_DIR_ANDROID, dbname), timeout=timeout)
+            healthy = _clean(healthy_raw)
+            # 2026-11-22 修复 D3：健康探针也要判错误 —— healthy 为空可能是
+            #   sqlite3 把错误写到 stdout 又被 _clean 削掉；只有干净 "1" 才算通过。
+            if healthy.strip() == "1" and not _is_err(healthy_raw):
                 _mark(True)
                 return out          # 真的是 0 行，原样返回 ""（带 ok=True）
         except Exception:

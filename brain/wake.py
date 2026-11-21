@@ -329,6 +329,29 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
     now = time.time()
     out = []
     _woke_dirty = False
+    # 2026-11-22 修复 F1：候选侧 SG.state_of 预过滤必须与发送闸 SG.allow 同源读取
+    #   我方末条时间 my_last_ts_ms = max(镜像 db 末条, 台账 reply_state.sends×1000)。
+    #   原来 candidates() 两处 state_of 都不传该值 → 恒 0 → 镜像比台账新时（我方在别处
+    #   发过、台账 sends 未写）候选闸放行 → 进会话 + 身份校验后发送闸才拦 →
+    #   一次「搜索+进会话+身份校验」全白烧。异常吞掉置 0（与 state_of 的 0 语义一致）。
+    from brain.pendingq import _my_last_ts_ms as _mltm_wake
+    from data import reply_state as _RSw
+
+    def _my_ts_ms_pre(sid_):
+        _v = 0.0
+        try:
+            _v = float(_mltm_wake(db, str(sid_)) or 0)
+        except Exception:
+            pass
+        try:
+            _rec = _RSw.get(str(sid_))
+            _pos = [float(x) for x in (_rec.get('sends') or []) if float(x) > 0]
+            if _pos and max(_pos) * 1000.0 > _v:
+                _v = max(_pos) * 1000.0
+        except Exception:
+            pass
+        return _v
+
     for sid, n, last_ts in rows:
         s = db.session(sid)
         if s is None or s.is_official:
@@ -364,7 +387,8 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
                     continue
                 _her_ts = _her_last_ts(db, sid)
                 if _her_ts and (time.time() * 1000 - _her_ts) / 3600000.0 >= _ARCHIVE_H:
-                    _v = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True)
+                    _v = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True,
+                                    my_last_ts_ms=_my_ts_ms_pre(sid))
                     if getattr(_v, "state", "") == V.ARCHIVED:
                         log.info("唤醒候选跳过 sid=%s（age>=%gh 归档，不唤醒）", sid, _ARCHIVE_H)
                         continue
@@ -378,7 +402,8 @@ def candidates(db, min_msgs=MIN_MSGS, cold_hours=COLD_HOURS, limit=12,
         #    降级放行：拿不到 state → 不拦。
         try:
             if SG is not None and SG.ON and _her_ts:
-                _st = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True)
+                _st = SG.state_of(str(sid), her_ts_ms=_her_ts, has_human=True,
+                                 my_last_ts_ms=_my_ts_ms_pre(sid))
                 _stn = getattr(_st, "state", "")
                 if _stn in (V.FOLLOWING, V.AWAITING):
                     log.info("唤醒候选跳过 sid=%s（state=%s，不唤醒）", sid, _stn)

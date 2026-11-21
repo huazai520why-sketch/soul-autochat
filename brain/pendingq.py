@@ -503,6 +503,29 @@ def _my_last_ts_ms(db, sid):
         return 0
 
 
+def _my_ts_ms_union(db, sid):
+    """我方末条时间（毫秒）：镜像 db 与 reply_state.sends 取 max（同源口径）。
+
+    🔴 2026-11-22 修复 D1（P0）：restart 复判用纯 `_my_last_ts_ms(db, sid)`
+       （只有镜像，滞后~300s 恒 0）→ 「刚回完、镜像未拉到、sends 已落账」的
+       会话被判 PENDING_RESTART → 对刚回过的人再发开场白。
+    修法：抽本函数供候选闸（约 1392 行）、restart 复判（约 2669 行）、
+       发送闸（约 3173 行）三处共用，避免同源差。
+    """
+    _ms = float(_my_last_ts_ms(db, sid) or 0.0)
+    try:
+        from data import reply_state as _RSu
+        _recu = _RSu.get(str(sid))
+        _posu = [float(x) for x in (_recu.get('sends') or []) if float(x) > 0]
+        if _posu:
+            _rs_ms_u = max(_posu) * 1000.0     # 秒 → 毫秒
+            if _rs_ms_u > _ms:
+                _ms = _rs_ms_u
+    except Exception:
+        pass
+    return _ms
+
+
 def _is_noreply_high(sid):
     """我方发过消息但她长期没回（无回复率高）？
 
@@ -1389,7 +1412,6 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   实测：300 会话中「她末条」50 个，47 个被误判 AWAITING（含 01:48
             #   「和你聊天感觉不像一个人呢」一直没人回）；40 分钟内源 300 → 有效 0。
             #   修法：变量名带单位，毫秒就是毫秒，秒才乘 1000，绝不二次换算。
-            _my_ts_ms = float(_my_last_ts_ms(db, str(sid)) or 0.0)      # 毫秒
             # 🔴 2026-11-18（§46 D-01 P0）：候选闸与发送闸 my_last_ts_ms 必须同源。
             #   原逻辑主取镜像（滞后 ~300s），仅镜像=0 才用 reply_state.sends 兜底；
             #   而真正发送前 sendgate.allow() 用的是实时 reply_state.sends。于是「我刚回完、
@@ -1397,16 +1419,8 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   拦掉 → 候选选出、进会话、被拦 0 发出，循环空烧（重启后窗口「回 0 条」203 次）。
             #   修法：取「镜像值」与「reply_state.sends 最新值」的较大者作 my_last_ts_ms，
             #   保证候选闸看到的时间不早于发送闸会看到的，消除同源差导致的空烧。
-            try:
-                from data import reply_state as _RSx
-                _recx = _RSx.get(str(sid))
-                _posx = [float(x) for x in (_recx.get('sends') or []) if float(x) > 0]
-                if _posx:
-                    _rs_ms = max(_posx) * 1000.0                     # 秒 → 毫秒
-                    if _rs_ms > _my_ts_ms:
-                        _my_ts_ms = _rs_ms
-            except Exception:
-                pass
+            #   2026-11-22 修复 D1：抽 `_my_ts_ms_union` 统一三处（候选闸/restart/发送闸）。
+            _my_ts_ms = _my_ts_ms_union(db, str(sid))
             _vd = _SG3.state_of(str(sid), her_ts_ms=int(last.ts or 0), has_human=True,
                                 my_last_ts_ms=_my_ts_ms)
             if _vd.state == _VD.ARCHIVED:
@@ -1566,17 +1580,42 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   镜像 chatmsg 未同步 → latest() 判「末条是我」），对账却把它当「她新话」硬入队。
             #   与主循环同款交叉验证：末条是我发的且文本与摘要一致 → 视为镜像未拉到我方回复，
             #   直接跳过，不入队、不清额度。
+            # 🔴 2026-11-22 修复 D5（P1）：原来只做 `sender==uid and text==_t` 裸文本匹配，
+            #   比主循环 my_text_ts_src 的 mirror/sends 判据更弱 —— 主循环只有 mirror
+            #   精确匹配才硬跳、sends 兜底命中只 debug 不跳，本对账块却把裸文本匹配
+            #   一律跳过。改成复用同一 mirror/sends 判据，与主循环同源。
             try:
                 _last_chk, _src_chk = db.latest(_s)
             except Exception:
                 _last_chk, _src_chk = None, ""
             if _last_chk is not None \
-                    and str(getattr(_last_chk, "sender", "")) == str(db.uid) \
-                    and (getattr(_last_chk, "text", "") or "").strip() == _t.strip():
-                scan_stats["mine_last"] += 1
-                log.info("设备未读对账·镜像滞后 sid=%s 摘要=%r 是我方刚发的原句 → 跳过"
-                         "（不入队、不清额度）", _s, _t[:16])
-                continue
+                    and str(getattr(_last_chk, "sender", "")) == str(db.uid):
+                # 走与主循环 my_text_ts_src 同源的 mirror/sends 判据
+                try:
+                    _my_ts_rec, _my_ts_src_rec = db.my_text_ts_src(_s, _t.strip())
+                except Exception:
+                    _my_ts_rec, _my_ts_src_rec = 0, ""
+                _delta_rec = abs(int(_ts2 or 0) - int(_my_ts_rec)) if _my_ts_rec else -1
+                if _my_ts_rec and _delta_rec <= 120000 and _my_ts_src_rec == "mirror":
+                    scan_stats["mine_last"] += 1
+                    log.info("设备未读对账·镜像滞后 sid=%s 摘要=%r 是我方刚发的原句 "
+                             "（mirror 精确匹配）→ 跳过（不入队、不清额度）",
+                             _s, _t[:16])
+                    continue
+                if _my_ts_rec and _delta_rec <= 120000 and _my_ts_src_rec == "sends":
+                    # sends 兜底命中只 debug 提示，继续走下方裸文本兜底判据（不漏回）
+                    scan_stats["mine_last_sends_hint"] = \
+                        scan_stats.get("mine_last_sends_hint", 0) + 1
+                    log.debug("设备未读对账·sends兜底不硬跳 sid=%s 摘要=%r "
+                              "近邻send_ts=%s（非精确文本匹配，继续判）",
+                              _s, _t[:16], _my_ts_rec)
+                # 裸文本精确匹配仍作为兜底（原 D-01 行为保留：mirror 未覆盖的极端情况）
+                if (getattr(_last_chk, "text", "") or "").strip() == _t.strip() \
+                        and _my_ts_src_rec != "sends":
+                    scan_stats["mine_last"] += 1
+                    log.info("设备未读对账·镜像滞后 sid=%s 摘要=%r 是我方刚发的原句 → 跳过"
+                             "（不入队、不清额度）", _s, _t[:16])
+                    continue
             log.warning("设备未读对账：sid=%s uid=%s 设备说未读却没进队列 "
                         "（被上游过滤漏掉）→ 强制补入，末条=%r",
                         _s, _uid2, _t[:24])
@@ -2666,8 +2705,12 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             from brain import sendgate as _SG4
             from brain import verdict as _VD4
             # 🔴🔴 2026-11-12（DS-05）：补传 my_last_ts_ms（见上方注释）。
+            # 2026-11-22 修复 D1（P0）：restart 复判必须与候选闸/发送闸同源，
+            #   用 _my_ts_ms_union（镜像∪sends）替换纯镜像 _my_last_ts_ms(db, sid)，
+            #   避免「刚回完、镜像未拉到、sends 已落账」的会话被误判 PENDING_RESTART
+            #   → 对刚回过的人再发开场白。
             _rv = _SG4.state_of(str(sid), her_ts_ms=float(her_ts or 0), has_human=True,
-                                my_last_ts_ms=_my_last_ts_ms(db, str(sid)))
+                                my_last_ts_ms=_my_ts_ms_union(db, str(sid)))
             restart = (_rv.state == _VD4.PENDING_RESTART)
         except Exception as _e_rv:
             log.debug("重启状态机异常（沿用 age 判据）: %r", _e_rv)
@@ -2706,10 +2749,15 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         #
         #   判据全部是纯内存判断（`_usable_word` 只做长度/字符检查），零额外 SQL。
         #   不误伤：她只要历史上说过一句 ≥5 字的正常话，`kw_of` 就会返回它，这里不挡。
+        # 🔴 2026-11-22 修复 D12（P2）：三套 nocue 常量（nocue_hard / stale_nocue /
+        #   nocue）判据高度重叠，统一走 `_no_cue_giveup(sid, txt, age_h, nick, kw)` 按 age 分档。
+        #   档位口径保留原行为：≥48h 走 stale_nocue(6h)，无 nick+无 kw 走 nocue_hard(6h)，
+        #   其余（定位失败时）走 nocue(NO_CUE_H)。返回是否放弃 + 已 mark_skip。
         if not _usable_word(_nick_pre, 2) and not _usable_word(kw, 5):
             log.info("无昵称且无可用内容词（末条 %r，%.0fh 前）→ 翻屏/搜索都不可能有结果，直接放过 uid=%s",
                      (txt or "")[:10], age_h, to_uid)
-            mark_skip(sid, txt, "nocue_hard", hours=6.0)
+            _nc_kind = "nocue_hard" if age_h < 48.0 else "stale_nocue"
+            mark_skip(sid, txt, _nc_kind, hours=6.0)
             out["skipped"] += 1
             continue
 
@@ -2911,7 +2959,13 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             if not _plan:
                 log.info("昵称和独一无二内容都拿不到 → 放弃本轮 uid=%s（等她发新消息再试）",
                          to_uid)
-                mark_skip(sid, txt, "nocue", hours=NO_CUE_H)
+                # 2026-11-22 修复 D12：nocue 与上面 stale_nocue/nocue_hard 统一档位，
+                #   这里 age≥48h 且无 nick 走 stale_nocue(6h)，其余走 nocue(NO_CUE_H)。
+                _nc_kind2 = ("stale_nocue"
+                             if (age_h >= 48.0 and not _usable_word(_nick_pre, 2))
+                             else "nocue")
+                _nc_hours2 = 6.0 if _nc_kind2 == "stale_nocue" else NO_CUE_H
+                mark_skip(sid, txt, _nc_kind2, hours=_nc_hours2)
                 out["skipped"] += 1
                 continue
             if not S.open_search(actor, preempt=_cand_preempt):
@@ -3167,19 +3221,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
         try:
             from brain import sendgate as _SG5
             # 2026-11-19 修复 FLOW-04：发送闸必须与候选闸同源传 my_last_ts_ms。
-            #   _my_ts_ms 在 candidates() 里算过，但那是另一个函数、本作用域不可见，
-            #   故按同款逻辑（镜像∪reply_state.sends 取 max）在此重算一次传入。
-            try:
-                _my_ts_ms_gate = float(_my_last_ts_ms(db, str(sid)) or 0.0)
-                from data import reply_state as _RSp
-                _recp = _RSp.get(str(sid))
-                _posp = [float(x) for x in (_recp.get('sends') or []) if float(x) > 0]
-                if _posp:
-                    _rs_ms_p = max(_posp) * 1000.0        # 秒 → 毫秒
-                    if _rs_ms_p > _my_ts_ms_gate:
-                        _my_ts_ms_gate = _rs_ms_p
-            except Exception:
-                _my_ts_ms_gate = 0.0
+            #   2026-11-22 修复 D1：改用统一 _my_ts_ms_union（镜像∪sends 取 max），
+            #   避免三处口径漂移。
+            _my_ts_ms_gate = _my_ts_ms_union(db, str(sid))
             _gate = None
             try:
                 from brain import contact as _CTc
@@ -3207,7 +3251,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("跟进阶梯拦截 sid=%s state=%s（%s）→ 本轮不回",
                          sid, _gate.state, _gate.reason)
                 out["skipped"] += 1
-                time.sleep(2.0)
+                # 2026-11-22 修复 D4（P1）：去掉该 sleep —— 被闸拦截属正常裁决
+                #   （back settle 在下方），原代码对每个被闸挡的候选白加 2s，
+                #   连续拦截时严重拖慢整轮预算。
                 actor.hand.back(settle=1.5)
                 if row is None:
                     S.leave(actor)

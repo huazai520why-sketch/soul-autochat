@@ -292,8 +292,15 @@ def release():
     d = _read()
     if d.get("pid") == _pid:
         try:
-            LOCK_FILE.unlink()
-            log.info("🔓 释放锁 pid=%s", _pid)
+            # 2026-11-22 修复 F7：读-判-删非原子（TOCTOU）。删前重读一次锁文件，
+            #   确认 pid **此刻**仍是自己再删，避免删掉继任者刚抢到的新锁。
+            _d2 = _read()
+            if _d2.get("pid") != _pid:
+                log.info("释放锁前发现 owner 已变（pid=%s≠本进程 %s）→ 不删，避免误删继任者锁",
+                         _d2.get("pid"), _pid)
+            else:
+                LOCK_FILE.unlink()
+                log.info("🔓 释放锁 pid=%s", _pid)
         except Exception as e:
             log.warning("删锁失败（留孤儿锁）: %r", e)
     _held = False

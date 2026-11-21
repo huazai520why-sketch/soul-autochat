@@ -49,6 +49,8 @@ class Watcher(object):
         self._err = 0
         self._th = None
         self._self_until = 0.0   # 自己刚发过消息的时间护栏（见 mark_self_write）
+        # 2026-11-22 修复 D9：护栏内检测到的变化先挂这里，护栏到期时再决定是否补 dirty。
+        self._pending_change_at = None
 
     # ---------- 指纹 ----------
     def set_path(self, db_path):
@@ -111,13 +113,25 @@ class Watcher(object):
                 sig = self._sig()
                 if sig and self._last and sig != self._last:
                     if time.time() < self._self_until:
-                        # 这是我自己发消息造成的写入，不算「别人来了新消息」，
-                        # 只更新指纹、不置 dirty（否则每回一个人就被自己中断）
+                        # 2026-11-22 修复 D9（P2）：self-write 护栏原来只更新指纹、不置 dirty，
+                        #   导致「护栏 15s 内她真回了」的信号被吞。新行为：
+                        #   护栏内的变化记入 `_pending_change_at`（不立即置 dirty），
+                        #   护栏到期后如果指纹又变（她真回的写入）则补置 dirty。
+                        #   若护栏到期前指纹未再变，视作「只有我方写入」→ 丢弃。
                         self._last = sig
+                        if not getattr(self, "_pending_change_at", None):
+                            self._pending_change_at = time.time()
                         continue
-                    self.dirty = True
-                    self.changed_at = time.time()
-                    log.info("⚡ 库有变化（可能在进新消息）")
+                    # 护栏到期：如有挂起的变化（护栏内指纹变过），补置 dirty
+                    if getattr(self, "_pending_change_at", None):
+                        self.dirty = True
+                        self.changed_at = self._pending_change_at
+                        log.info("⚡ self-write 护栏到期，护栏内仍有变化 → 补置 dirty")
+                        self._pending_change_at = None
+                    else:
+                        self.dirty = True
+                        self.changed_at = time.time()
+                        log.info("⚡ 库有变化（可能在进新消息）")
                 if sig:
                     self._last = sig
                     self._err = 0

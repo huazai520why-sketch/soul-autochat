@@ -112,7 +112,12 @@ def allow(
             # 🔴 不伪造 her_ts 落盘：台账没有真人消息时间戳时，
             #    用本回合最早一条发送时刻作起点（一条都没发则用当前时刻）。
             #    这样 note_sent 写入的 sends 仍能被 state_of 正确归属，额度不会失效。
-            _her = (min(_sends) if _sends else float(now if now is not None else time.time())) * 1000.0
+            # 2026-11-22 修复 F3：兜底取起点必须过滤 0 占位值，与上面 _sends_max_ms
+            #   同口径（[x for x in _sends if x>0]）。原来 `min(_sends)` 用未过滤列表，
+            #   含 0 占位时 min=0 → 传给 state_of 的 her_ts=0 → 水位线判据失真。
+            _pos_sends = [x for x in _sends if float(x) > 0] if _sends else []
+            _her = (min(_pos_sends) if _pos_sends
+                    else float(now if now is not None else time.time())) * 1000.0
             log.info("发送闸 sid=%s 无真实水位线 → 按 sends 起点裁决（不落盘、不污染台账）", sid)
         v = V.state_of(
             sid=sid,
@@ -250,9 +255,16 @@ def state_of(sid: str, **kw):
         _sends_max_ms = (max(_pos) * 1000.0) if _pos else 0.0
         if _sends_max_ms > _my_ms:
             _my_ms = _sends_max_ms
+        # 2026-11-22 修复 D2（P1）：her_ts_ms 取台账值与传入值的 max，与 allow() 口径统一。
+        #   原来用 `rec.get("her_ts_ms") or kw.get("her_ts_ms")` → 台账旧值优先、忽略
+        #   传入的候选 her_ts_ms；而 allow() 在 on_her 已更新台账后取 `max(台账, 传入)`，
+        #   两者相反 → candidates 主判与候选闸复判走 state_of 时用旧值，口径漂移。
+        _her_rs = float(rec.get("her_ts_ms") or 0)
+        _her_kw = float(kw.get("her_ts_ms") or 0)
+        _her = max(_her_rs, _her_kw)
         return V.state_of(
             sid=sid,
-            her_ts_ms=float(rec.get("her_ts_ms") or kw.get("her_ts_ms") or 0),
+            her_ts_ms=_her,
             sends=rec.get("sends") or [],
             now=kw.get("now"),
             my_last_ts_ms=_my_ms,

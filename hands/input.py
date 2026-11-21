@@ -20,6 +20,16 @@ log = get_logger("hands.input")
 BOX_RES = "et_sendmessage"
 SEND_RES = "btn_send"
 PLACEHOLDER = "文明聊天，友善交友~"
+# 2026-11-22 修复 F11：输入框 placeholder 集中维护。App 改文案后旧的单点字符串
+#   `t == PLACEHOLDER` 失效，空框会被当 residual → 重复发送。判「框已清空」改为：
+#   框内文本为空 OR 命中已知 placeholder 集合任一（以输入框节点 text 为唯一判据）。
+PLACEHOLDERS = (
+    PLACEHOLDER,
+    "文明聊天，友善交友",        # 兼容去尾波浪号变体
+    "文明聊天",                  # 兼容精简文案
+    "友善交友",                  # 兼容精简文案
+    "文明聊天，友善交友~",        # 全角标点变体
+)
 
 # 🔴 2026-11-16 13:1x（P0 反转修正, 取证日志实锤）：她热聊/暧昧话题时 App 会在
 #   输入框区域显示「对话由AI生成，非Soul立场」AI 免责声明条——box_text 把它
@@ -72,11 +82,19 @@ class Input(object):
 
     @staticmethod
     def box_text(snap):
+        """读输入框当前文本。返回 ""（空/命中 placeholder）或非空字符串（残留/已灌字）。
+        2026-11-22 修复 F11：判空不再只 `t == PLACEHOLDER` 单点比较，改用 PLACEHOLDERS
+        集合 + 框内文本长度为主判据——空串或命中集合内任一 placeholder 均返回 ""，
+        App 改文案后不会把空框误判为 residual（重复发送风险）。
+        """
         n = Input.box(snap)
         if n is None:
             return None
         t = (n.text or "").strip()
-        return "" if t == PLACEHOLDER else t
+        # 框内已无字 OR 命中已知 placeholder → 视为已清空
+        if not t or any(t == ph for ph in PLACEHOLDERS):
+            return ""
+        return t
 
     # ---------- 写 ----------
     def _reset(self):

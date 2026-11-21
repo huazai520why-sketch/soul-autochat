@@ -261,26 +261,19 @@ def _hb(tag=""):
             「干得越卖力越被判卡死」。
       现在：在长耗时段内部主动打心跳，watchdog 只在「真的没动静」时才动手。
     """
-    try:
-        # 🔴 2026-11-20 修复（F4 P1）：区分「写失败」与「owner 变更」。
-        #   touch() 现在用两个 falsy 信号区分：
-        #     · TOUCH_WRITE_FAILED  → owner 仍是自己，只是这一下写文件失败
-        #       （Windows 句柄竞争 / 杀软瞬时锁定，重试一次仍未成功）
-        #       → 丢一次心跳不至于杀轮，降级 warning，不再 raise。
-        #     · TOUCH_OWNER_CHANGED / False → 锁可能真被别的 pid 占用 / 已丢失
-        #       → 走 ensure 兜底，仍失败才 raise（保住单实例互斥）。
-        _t = lock.touch(tag or "hb")
-        if _t is True:
-            return
-        if _t == lock.TOUCH_WRITE_FAILED:
-            log.warning("心跳写锁失败但锁 owner 仍是本进程 → 降级处理，不杀轮"
-                        "（单次心跳未刷新，下一轮补上）")
-            return
-        ok, why = lock.ensure("daemon")
-        if not ok:
-            raise RuntimeError("daemon 锁已丢失且无法恢复: %s" % why)
-    except Exception:
-        raise
+    # 2026-11-22 修复 F5：删掉原来 `try: ... except Exception: raise` 的死包装
+    #   （捕获后原样 raise，纯噪声）。内部逻辑不变：touch 写失败降级 warning、
+    #   owner 变更走 ensure 兜底、仍失败才 raise。
+    _t = lock.touch(tag or "hb")
+    if _t is True:
+        return
+    if _t == lock.TOUCH_WRITE_FAILED:
+        log.warning("心跳写锁失败但锁 owner 仍是本进程 → 降级处理，不杀轮"
+                    "（单次心跳未刷新，下一轮补上）")
+        return
+    ok, why = lock.ensure("daemon")
+    if not ok:
+        raise RuntimeError("daemon 锁已丢失且无法恢复: %s" % why)
 
 
 def _post_switch_phase(st, db):
@@ -560,20 +553,27 @@ def cycle(a, dev, db, st, dry_run=False):
     #   在这里强制重跑一次 candidates（上面的 invalidate 已经清了设备未读缓存，
     #   这次 candidates 会重新查设备库拿到最新未读集合）。
     #   _dirty 已经在上面 DBW.consume() 里被清掉了，这里用 _dirty_recheck 标志。
-    _has_dot_n = -1
+    _n_cand = -1
     try:
-        _has_dot_n = len(PQ.candidates(db, limit=1) or [])
+        # 2026-11-22 修复 F4：这里 count 只当「候选闸」用（limit=1 → 恒 0/1），
+        #   不再当作「屏上真实红点数」。屏上真实红点数另由 CL.dots(snap) 取。
+        _n_cand = len(PQ.candidates(db, limit=1) or [])
     except Exception as _e:
         log.debug("入口待回判定失败，退回 has_dot_now: %r", _e)
-        _has_dot_n = -1
-    if _has_dot_n >= 0:
+        _n_cand = -1
+    if _n_cand >= 0:
         # 真有可处理候选 → 才去清红点；否则连 sweep 都不启动（省下整轮预算）
-        has_dot = bool(_has_dot_n > 0)
+        has_dot = bool(_n_cand > 0)
         try:
             badge = CL.badge_chat(a.snap()) if has_dot else 0
         except Exception:
             badge = 0
-        ndots = _has_dot_n
+        # 2026-11-22 修复 F4：ndots 改为「屏上真实行内红点数」，来自 CL.dots(snap)，
+        #   与候选闸计数 _n_cand 解耦。日志/ dot_blocks 各按自己语义用。
+        try:
+            ndots = len(CL.dots(a.snap()) or [])
+        except Exception:
+            ndots = 0
         if not has_dot:
             log.debug("入口：24h 内无真待回（7天口径另有 %s 个僵尸）→ 跳过清红点",
                       CL.count_pending(db))
@@ -1309,7 +1309,11 @@ def do_match(a, dev, db, st, dry_run=False, advance_first=False):
     if out["err"] and not out["sent"]:
         log.warning("本轮匹配未发送: %s", out["err"])
         # 没发出去就不要点匹配下一个（白费次数）
-        return "ok" if out["ok"] else "fail"
+        # 2026-11-22 修复 F6：连打循环只认 fail/no_quota/preempted/sent，"ok" 会落进
+        #   else 被当成功 → n_done+1 且重置熔断器，但实际**没发出去**。本分支明确是
+        #   「本轮未发送」，统一归并为显式 "fail"（记一次失败、不 advance、原地重试），
+        #   不再返回 "ok" 这个不在处理集的值域。
+        return "fail"
 
     log.info("✓ 匹配开场白已发 %r", out["text"])
 
