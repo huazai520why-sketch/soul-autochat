@@ -3347,7 +3347,9 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             #   没有任何 UI 动作 → 这次 dump(3~4s) 纯重复。
             #   安全网仍在：真不在 chat 页时 type_and_verify 找不到输入框会直接失败，
             #   不会把话灌进搜索框。
-            if voice_result is None:
+            # 🔴 2026-11-22：语音前置失败（started=False，比如 TTS 缺 key）时
+            #   还没动过 UI → 继续走文字发送，不能整轮沉默。
+            if voice_result is None or not voice_result.get("started"):
                 inp = Input(dev)
                 sent_n = 0
                 for i, r in enumerate(lines):
@@ -3508,7 +3510,7 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 _locfail_clear(sid)
                 # 🔴 §104：按**实际发出条数**落账，不等实时库 pull（5 分钟延迟会重复发）。
                 try:
-                    if voice_result is None:
+                    if voice_result is None or not voice_result.get("sent"):
                         from brain import sendgate as _SG6
                         _ct_done = False
                         if _contact_ok and sent_n >= 2:

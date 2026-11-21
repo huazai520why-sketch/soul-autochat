@@ -22,9 +22,17 @@ from core.device import note_action
 
 log = get_logger("hands.voice")
 
-VOICE_TOGGLE = "menu_tab_voice_inner_outside"
+# 🔴 2026-11-22：Soul 客户端更新后控件改名（实测）：
+#   语音切换键 menu_tab_voice_inner_outside → menu_tab_voice_inner
+#   按住说话   tv_press_to_speak            → c_ct_chat_voice_send_click（文本「按住说话」）
+#   语音模式标志 audio_mode_container        → 不再出现，改以「按住说话」控件存在为准
+# 新名优先、旧名兜底，兼容未更新的客户端。
+VOICE_TOGGLE = "menu_tab_voice_inner"
+VOICE_TOGGLE_LEGACY = "menu_tab_voice_inner_outside"
 VOICE_MODE = "audio_mode_container"
-PRESS_TO_SPEAK = "tv_press_to_speak"
+PRESS_TO_SPEAK = "c_ct_chat_voice_send_click"
+PRESS_TO_SPEAK_LEGACY = "tv_press_to_speak"
+VOICE_MODE_CANDIDATES = (PRESS_TO_SPEAK, PRESS_TO_SPEAK_LEGACY, VOICE_MODE)
 RECORD = "audio_record_view_optimize"
 RECORD_OVERLAY = "c_ct_new_normal_record_view2"
 RECORD_PAUSE = "imvStatus"
@@ -38,9 +46,14 @@ class VoiceSendUnconfirmed(RuntimeError):
 
 
 def _node(snap, suffix):
+    """按 res_id 后缀取节点；suffix 可为字符串或字符串元组（命中任一即返回）。"""
+    cands = (suffix,) if isinstance(suffix, str) else tuple(suffix)
     for node in snap.nodes:
-        if node.res_id and node.res_id.endswith(suffix) and node.visible:
-            return node
+        if not node.res_id or not node.visible:
+            continue
+        for c in cands:
+            if c and node.res_id.endswith(c):
+                return node
     return None
 
 
@@ -58,13 +71,13 @@ def _wait(actor, suffix, timeout=5.0):
 def ensure_voice_mode(actor):
     """确保当前聊天页在语音输入模式，返回 (snap, changed)。"""
     snap = actor.snap(force=True)
-    if _node(snap, VOICE_MODE) is not None:
+    if _node(snap, VOICE_MODE_CANDIDATES) is not None:
         return snap, False
-    toggle = _node(snap, VOICE_TOGGLE)
+    toggle = _node(snap, (VOICE_TOGGLE, VOICE_TOGGLE_LEGACY))
     if toggle is None:
         return snap, False
     actor.hand.tap_node(toggle, settle=0.7)
-    snap, _ = _wait(actor, VOICE_MODE, timeout=4.0)
+    snap, _ = _wait(actor, VOICE_MODE_CANDIDATES, timeout=4.0)
     return snap, True
 
 
@@ -119,17 +132,19 @@ def review_controls(snap):
 
 
 def record_and_release(actor, speech_seconds, play=None, lead=0.35,
-                       control=PRESS_TO_SPEAK):
+                       control=None):
     """按住“按住说话”按钮，播完音频后松开；新版 UI 松开自动发送。
 
     `play` 是同步可调用对象，会在线程里启动，避免阻塞长按。
-    右下角“录音”会进入持续录音层，不能用于松手发送；默认目标是左侧
-    `tv_press_to_speak`。
+    `control` 为空时按 PRESS_TO_SPEAK 找，找不到再用旧名兜底
+    （2026-11-22 Soul 客户端把 tv_press_to_speak 改成
+      c_ct_chat_voice_send_click）。
     """
     snap, _ = ensure_voice_mode(actor)
-    rec = _node(snap, control)
+    rec = _node(snap, control or (PRESS_TO_SPEAK, PRESS_TO_SPEAK_LEGACY))
     if rec is None:
-        raise VoiceSendUnconfirmed("语音模式里没有按住说话控件 %s" % control)
+        raise VoiceSendUnconfirmed(
+            "语音模式里没有按住说话控件 %s" % (control or PRESS_TO_SPEAK))
     hold_s = max(1.0, float(speech_seconds or 0) + float(lead) + 0.45)
     result = {"play": None, "error": None}
 

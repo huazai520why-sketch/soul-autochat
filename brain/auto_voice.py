@@ -84,9 +84,14 @@ def _device_voice_confirmed(dev, uid, sid, since_ms):
 
 
 def send_voice_reply(actor, db, sid, lines, kind="voice", nick=""):
-    """发送一条自动语音并等待数据库落地确认。"""
+    """发送一条自动语音并等待数据库落地确认。
+
+    `started=False` 表示还没动 UI（缺 TTS、不在 chat 页、闸门拦截等），
+    调用方应**照常回文字**，绝不能因为语音前置失败而整轮沉默；
+    `started=True` 表示录音手势已执行，此时不补文字（避免语音+文字重复）。
+    """
     result = {
-        "ok": False, "sent": False, "text": "", "err": "",
+        "ok": False, "sent": False, "started": False, "text": "", "err": "",
         "voice_db": "", "audio_seconds": 0.0, "wav": "",
     }
     if not should_reply(kind, sid):
@@ -123,6 +128,17 @@ def send_voice_reply(actor, db, sid, lines, kind="voice", nick=""):
     except Exception as exc:
         log.debug("语音发送前置闸门异常（降级放行）: %r", exc)
 
+    # 🔴 2026-11-22：TTS 未配置（缺 Speech Key）时不要进录音手势 ——
+    #   否则会录一段静音、语音发不出去又吞掉本轮文字（必回被破坏）。
+    #   这里前置判掉，started 保持 False，调用方回退文字。
+    try:
+        if not T.available():
+            result["err"] = "TTS 未配置（缺 Speech API Key）"
+            log.warning("[%s] %s → 回退文字", nick or str(sid)[-6:], result["err"])
+            return result
+    except Exception as exc:
+        log.debug("TTS 可用性检查异常: %r", exc)
+
     style = None
     try:
         style = VS.infer_from_db(db, str(sid))
@@ -139,6 +155,7 @@ def send_voice_reply(actor, db, sid, lines, kind="voice", nick=""):
         seconds = AO.wav_duration(wav)
         result["audio_seconds"] = round(seconds, 2)
         result["wav"] = str(wav)
+        result["started"] = True          # 已开始录音手势，失败也不补文字
         HV.record_and_release(
             actor, seconds,
             play=lambda: AO.play_wav(wav, device_hint="VB-Audio"))

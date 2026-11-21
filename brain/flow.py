@@ -1145,9 +1145,15 @@ def _reply_and_send(actor, db, out, dry_run):
 
     if voice_result is not None and voice_result["sent"]:
         sent_n, err = 1, ""
-    elif voice_result is not None:
+    elif voice_result is not None and voice_result.get("started"):
         # 录音手势后若无法确认落库，不补发文字，避免同一句语音+文字重复。
         sent_n, err = 0, voice_result.get("err") or "自动语音发送失败"
+    elif voice_result is not None:
+        # 🔴 2026-11-22：前置失败（TTS 未配置 / 不在 chat 页 / 闸门拦截），
+        #   还没动过 UI → 必须回退文字，否则她发语音时整轮沉默（破坏必回）。
+        log.warning("自动语音前置失败，回退文字发送：%s", voice_result.get("err"))
+        sent_n, err = _send_lines(actor, out.lines, out.nick,
+                                  page_checked=not _pic_sent, sid=out.sid or "", db=db)
     else:
         # 刚刚 _enter/wait_page 已确认 chat 页；中间只有模型与库操作，没有 UI 动作。
         # 例外：picreq 真发了照片（动过 UI）→ 不复用，老老实实再校验一次。
