@@ -1270,9 +1270,16 @@ def _dev_sql(device, dbname, sql, timeout=15, ok=None):
         raw2 = device.text('su -c \'sqlite3 "%s/%s" "select 1"\' 2>&1'
                            % (DB_DIR_ANDROID, dbname), timeout=timeout)
         out2 = _clean(raw2)
-        if out2:
+        # 🔴 2026-11-23（RESID-D03，P1）：su兜底缺 _is_err 校验——
+        #   _clean 只滤 _ERR_MARKS，滤不掉 sqlite3 类错误（unable to open/malformed/
+        #   no such table/database is locked），设备库异常时错误文本可能被当数据返回。
+        #   与裸命令分支（1242 行）对齐：`not _is_err(raw2)` 才判成功。
+        if out2 and not _is_err(raw2):
             _mark(True)
             return out2
+        if _is_err(raw2):
+            log.debug("_dev_sql su兜底判失败（含错误关键词）sid_db=%s sql=%r raw=%r",
+                      dbname, sql[:60], raw2[:120])
         _mark(False)
         return out2
     except Exception:

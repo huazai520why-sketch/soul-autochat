@@ -728,9 +728,40 @@ def send_wake(actor, dev, cand, text, db=None):
     _ok = inp.sent_ok(actor, text, timeout=6)
     _why = getattr(inp, "last_reason", "") or ""
     if (not _ok) and _why == "residual":
-        actor.hand.back(settle=1.0)
-        _bump_miss(cand.uid, "发送后输入框未清空(残留)")
-        return False, "发送后输入框未清空(残留)"
+        # 🔴 2026-11-23（RESID-02，P1）：与 pendingq.py:3381 / flow.py:827 / match.py 对齐。
+        #   residual 可能是 AI 声明条误读（banner 过滤漏判），直接判失败→不 mark_woke
+        #   →下轮重复唤醒→浪费唤醒阶梯额度+可能重复发消息。
+        #   先查库交叉验证：末条已含本条 text → 按已发记账；真未发出→仍判失败。
+        #   cand.sid 为空（无 sid 的唤醒候选）无法查库，保留原失败判据（保守）。
+        _landed_r = False
+        _needle_r = (text or "").strip()
+        _sid_r = str(getattr(cand, "sid", "") or "")
+        if _needle_r and _sid_r:
+            try:
+                from data import imdb as _IMr
+                _uid_r = _IMr.current_uid(dev)
+                _nm_r = _IMr._db_name_for_uid(dev, _uid_r)
+                if _nm_r:
+                    _raw_r = _IMr._dev_sql(
+                        dev, _nm_r,
+                        "select ifnull(text,'') from chatmsg where "
+                        "sessionId='%s' order by localTime desc limit 1"
+                        % _sid_r, timeout=8) or ""
+                    _ln_r = ""
+                    for _x in _raw_r.replace("\r", "").splitlines():
+                        if _x.strip():
+                            _ln_r = _x.strip()
+                    if _ln_r and _needle_r in _ln_r:
+                        _landed_r = True
+            except Exception as _e_r:
+                log.debug("wake residual 落库校验异常: %r", _e_r)
+        if _landed_r:
+            log.info("wake residual 但库已落库 → 按已发记账（AI 声明条误读）")
+            _ok = True  # fall through to success accounting below
+        else:
+            actor.hand.back(settle=1.0)
+            _bump_miss(cand.uid, "发送后输入框未清空(残留)")
+            return False, "发送后输入框未清空(残留)"
     # 🔴 2026-11-16（FLOW-03，P1）：unknown ≠ 已发出。原来 unknown 一律「按已发记账」
     #   并 mark_woke(cand.uid)，若实际没发出则次日重复唤醒/重复发消息。与 flow.py:722-768
     #   同口径加落库校验：查末条是否是我方刚发的 text，未落库 → 不 mark_woke、不记成功，

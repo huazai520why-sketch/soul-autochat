@@ -592,7 +592,37 @@ def send(actor, dev, text, sid=""):
     _ok = inp.sent_ok(actor, text, timeout=6)
     _why = getattr(inp, "last_reason", "") or ""
     if (not _ok) and _why == "residual":
-        return False, "发送后输入框未清空(残留)"
+        # 🔴 2026-11-23（RESID-01，P1）：与 pendingq.py:3381 / flow.py:827 对齐。
+        #   residual 可能是 AI 声明条误读（hands/input.py banner 过滤漏判时），
+        #   直接判失败→不记账→浪费匹配次数 + 下轮重发（违反平台「未获回复最多2条」）。
+        #   先查库交叉验证：末条已含本条 text → 按已发记账；真未发出→仍判失败。
+        #   sid 为空（新会话开场白）无法查库，保留原失败判据（保守）。
+        _landed_r = False
+        _needle_r = (text or "").strip()
+        if _needle_r and sid:
+            try:
+                from data import imdb as _IMr
+                _uid_r = _IMr.current_uid(dev)
+                _nm_r = _IMr._db_name_for_uid(dev, _uid_r)
+                if _nm_r:
+                    _raw_r = _IMr._dev_sql(
+                        dev, _nm_r,
+                        "select ifnull(text,'') from chatmsg where "
+                        "sessionId='%s' order by localTime desc limit 1"
+                        % str(sid), timeout=8) or ""
+                    _ln_r = ""
+                    for _x in _raw_r.replace("\r", "").splitlines():
+                        if _x.strip():
+                            _ln_r = _x.strip()
+                    if _ln_r and _needle_r in _ln_r:
+                        _landed_r = True
+            except Exception as _e_r:
+                log.debug("match.send residual 落库校验异常: %r", _e_r)
+        if _landed_r:
+            log.info("match.send residual 但库已落库 → 按已发记账（AI 声明条误读）")
+            _ok = True  # fall through to success accounting below
+        else:
+            return False, "发送后输入框未清空(残留)"
     # 🔴 2026-11-16（FLOW-02，P1）：unknown ≠ 已发出。原来 unknown 一律按「已发」
     #   记账（SG.note_sent + 返回已发送），若实际没发出则静默丢账。与 flow.py:722-768
     #   同口径加落库校验：查末条是否是我方刚发的 text，未落库则不记账、返回失败。
