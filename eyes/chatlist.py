@@ -306,6 +306,23 @@ def _descend_to_rows(snap, root):
     for _ in range(6):
         kids = _kids_of(snap, node)
         if len(kids) >= 2:
+            # 🔴 2026-11-22：外壳层可能是「列表壳 + 装饰兄弟」两个孩子。实测 13:41:57 帧：
+            #     swipe_refresh_layout kids=2
+            #       ├ RelativeLayout(0,136,900,1502)  ← 真外壳（内含 recycler_view 9 行）
+            #       └ ImageView(410,312,490,392)      ← 80px 刷新/回到顶部浮标
+            #   在此层返回 → 整张列表被当成 1 行（center=(450,819)）→ rows()==1
+            #   → page.detect 判 unknown。修法：恰有一个孩子几乎撑满父容器（宽高都
+            #   >=90%）时，它才是真外壳，继续下钻；真正的行层不满足（行高 153px vs
+            #   父容器 1366px），行为完全不变。
+            big = [
+                c for c in kids
+                if node.width > 0 and node.height > 0
+                and c.width >= node.width * 0.9
+                and c.height >= node.height * 0.9
+            ]
+            if len(big) == 1 and _kids_of(snap, big[0]):
+                node = big[0]
+                continue
             return kids
         if len(kids) != 1:
             break                            # 0 个孩子：到底了

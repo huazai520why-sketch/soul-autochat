@@ -359,14 +359,17 @@ def cmd_voice_send(text, speaker=None, sid=None):
     voice_db = ""
     if sid and db is not None:
         try:
-            _vm, _vsrc = db.latest(sid)
-            if _vm is not None and int(_vm.msg_type) == 5 \
-                    and str(_vm.sender) == str(db.uid):
+            # 🔴 2026-11-22：原实现查本地镜像 db.latest()，镜像 REFRESH_S=300s，
+            #   发完立刻查必然还是旧数据 → 稳定假阴性。改查设备实时库，与生产
+            #   brain.auto_voice._device_voice_confirmed 同源。
+            from brain.auto_voice import _device_voice_confirmed
+            _ok5, _why5 = _device_voice_confirmed(
+                actor.dev, db.uid, sid, int(time.time() * 1000) - 30000)
+            if _ok5:
                 voice_db = "msgType5-confirmed"
                 outcome = "sent"
             else:
-                voice_db = "msgType5-missing(sender=%s type=%s)" % (
-                    getattr(_vm, "sender", None), getattr(_vm, "msg_type", None))
+                voice_db = "msgType5-missing(%s)" % (_why5,)
         except Exception as _ve:
             voice_db = "msgType5-err:%r" % (_ve,)
     payload = {

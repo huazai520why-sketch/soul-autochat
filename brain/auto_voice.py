@@ -61,9 +61,14 @@ def _device_voice_confirmed(dev, uid, sid, since_ms):
     dbname = IM._db_name_for_uid(dev, str(uid), timeout=8)
     if not dbname:
         return False, "找不到当前账号设备库"
+    # 🔴 2026-11-22：原写法先取「会话末条」再判 msgType==5 —— 只要她在这个确认窗口
+    #   内发来任何一条文字，末条就不是语音，于是误判「未落库」（§58 假阴性根因）。
+    #   改为直接按「本人 + msgType=5 + 时间窗」过滤，命中即确认。
     sql = (
         "select senderId,msgType,localTime from chatmsg "
-        "where sessionId='%s' order by localTime desc limit 1" % str(sid)
+        "where sessionId='%s' and msgType=5 and senderId='%s' and localTime>=%d "
+        "order by localTime desc limit 1"
+        % (str(sid), str(uid), int(since_ms))
     )
     ok = {}
     raw = IM._dev_sql(dev, dbname, sql, timeout=8, ok=ok) or ""
@@ -149,7 +154,9 @@ def send_voice_reply(actor, db, sid, lines, kind="voice", nick=""):
         W.mark_self_write(20.0)
         before_snap = actor.snap(force=True)
         before_bubbles = _right_voice_bubbles(before_snap)
-        since_ms = int(time.time() * 1000) - 3000
+        # 🔴 2026-11-22：设备时钟实测快 ~2s、App 落库还要 1~3s，3s 窗余量不足 1s。
+        #   放宽到 15s（仍在 14s 轮询窗口内），避免「已发出却判未落库」。
+        since_ms = int(time.time() * 1000) - 15000
         tts = T.synthesize(text, output_format="pcm", style=style)
         wav = AO.pcm_to_wav(tts["path"], sample_rate=tts["sample_rate"])
         seconds = AO.wav_duration(wav)
