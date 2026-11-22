@@ -168,6 +168,29 @@ OPENERS = (
     "你这会儿是刚忙完还是闲着呢",
     "这会儿在忙啥呢",
     "最近在追啥剧没",
+    # E 生活切片型（2026-11-22 补：原库仅 24 条，48 次/天必然重复 42%）
+    "刚把手机从沙发缝里摸出来，正好瞧见你",
+    "下午一直在外头跑，这会儿才坐下来",
+    "今天这天气怪得很，一会儿晴一会儿阴",
+    "我刚泡了碗面，还加了两根火腿肠",
+    "手机快没电了，趁这会儿说句话",
+    "刚把店里那盏坏灯换了，手上蹭了点灰",
+    "我这两天睡得晚，白天脑子有点木",
+    "刚在楼下转了一圈，风比昨天凉",
+    "今天忙到现在才吃上第一口饭",
+    "刚把攒了三天的衣服洗了，阳台都挂满",
+    "我这人不太会开场，想到啥说啥",
+    "刚看到你头像，停了一下",
+    "我这会儿正靠窗坐着，外头车挺多",
+    "今天走路走多了，脚有点酸",
+    "刚跟朋友通完电话，聊了半个钟头",
+    "我最近在学着早睡，成效一般",
+    "刚把桌上那堆东西收了，看着顺眼多了",
+    "这会儿安静得很，正好想找个人说说话",
+    "我今天没出门，在家待了一整天",
+    "刚喝完一杯热水，嗓子舒服点了",
+    "我这人记性差，但聊过的事记得住",
+    "刚才想给你发消息，又不知道说啥",
 )
 
 
@@ -327,7 +350,7 @@ def _should_ask_now(used):
     return random.random() < OPEN_ASK_RATE
 
 
-def pick_opener(avoid_recent=12):
+def pick_opener(avoid_recent=30):
     """从通用开场白库挑一条，避开最近用过的。
 
     🔴 2026-11-08（_report/14：match 开场白问句率 31.3% → 目标 <12%）：
@@ -369,7 +392,15 @@ def pick_opener(avoid_recent=12):
     t = random.choice(pool) if pool else (FALLBACK[0])
     try:
         used = (used + [t])[-40:]
-        _head_file().write_text(json.dumps(used, ensure_ascii=False), "utf-8")
+        # 2026-11-22：写盘前先去重并只保留最近 30 条。
+        #   原版直接 append，同一句会重复入栈（实测 41 条里 3 条是同一句），
+        #   把「避开最近 12 条」的窗口挤掉，去重效果大打折扣。
+        _uniq = []
+        for x in used:
+            if x not in _uniq:
+                _uniq.append(x)
+        _head_file().write_text(
+            json.dumps(_uniq[-30:], ensure_ascii=False), "utf-8")
     except Exception as e:
         log.warning("记开场白失败: %r", e)
     return t
@@ -526,6 +557,27 @@ def send(actor, dev, text, sid=""):
     except Exception as e:
         log.debug("match.send 页面校验异常（继续）: %r", e)
 
+    # 🔴 2026-11-22（PLAT-01，P0）：平台「未获回复前最多发 2 条」保护闸。
+    #   平台实测原文（设备库 msgType=35 / type=male_chat_protect_tips）：
+    #     「未获回复前最多发送2条消息，可以送礼获得会话置顶和额外通知…」
+    #   历史漏洞：本函数调用方（bell:435 / bell:775 / clear:519 / match:948）
+    #   一律传 sid=""，而 sendgate.allow("") 直接返回「无主会话，放行且不计
+    #   额度」→ 对同一个人连发 6 条开场白也没人拦，第 3 条起全被服务端拒收
+    #   （msgStatus=5 = 气泡上的红色感叹号）。此处补一道与平台同口径的硬闸。
+    #   fail-open：任何异常只降级放行，绝不掐死必回链路。
+    try:
+        from brain import protect as _PG
+        if _PG.ui_blocked(actor):
+            log.warning("match.send 页面已有「未获回复前最多发送2条」提示 → 放弃发送")
+            return False, "平台限发(未获回复最多%d条)" % _PG.LIMIT
+        _sid_pg = sid or _PG.guess_sid(dev)
+        _okp, _whyp = _PG.guard(dev, _sid_pg)
+        if not _okp:
+            log.warning("match.send 被平台保护闸拦截 sid=%s: %s", _sid_pg, _whyp)
+            return False, _whyp
+    except Exception as _e:
+        log.debug("平台保护闸异常（降级放行）: %r", _e)
+
     inp = Input(dev)
     ok, got = inp.type_and_verify(text, actor)
     if not ok:
@@ -589,6 +641,19 @@ def send(actor, dev, text, sid=""):
             SG.note_sent(sid, 1)
         except Exception:
             pass
+    # 🔴 2026-11-22（PLAT-02）：发送后按平台口径复核。本条若被服务端拒收，
+    #   设备库会在同一秒插一条 male_chat_protect_tips（type=35）并把本条落成
+    #   msgStatus=5。此时必须返回失败，让调用方停止记账/停止继续跟进，
+    #   否则「已发」台账会把被拒的消息也算成功，下一轮继续对着墙发。
+    try:
+        from brain import protect as _PG2
+        _sid_now = _PG2.remember(dev, sid)
+        _okv, _whyv = _PG2.verify(dev, _sid_now)
+        if not _okv:
+            log.warning("match.send 发送后被平台拒收：%s（sid=%s）", _whyv, _sid_now)
+            return False, _whyv
+    except Exception as _e2:
+        log.debug("发送后平台校验异常（按已发处理）: %r", _e2)
     return True, "已发送"
 
 
