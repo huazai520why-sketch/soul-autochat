@@ -86,7 +86,12 @@ MATCH_STREAK_FAIL_MAX = 3   # 连打里连续失败几次就停（通道坏了�
 #    这条路径空转 55 次（2h46m）全机零产出。下面加自愈梯度。
 DEV_RESCUE_GAP = 300.0     # 两次自愈动作最短间隔（别把刚起来的设备又打断）
 DEV_RESCUE_L3 = os.environ.get("SOUL_DEV_RESCUE_L3", "1") != "0"
-_RESCUE = {"at": 0.0}
+# 🔴 2026-11-23 12h 停摆教训：脏杀后的冷启动实测 30s~4min+，旧版 _rebuild_emulator
+#    只等 60s 就放弃，DEV_RESCUE_GAP 之后的下一轮 L3 又把启动中的 VM 强杀重来
+#    → 永远起不来（设备不可用连续 240 次）。①等待判据升级 + 可调；②重建保护窗。
+DEV_RESCUE_L3_WAIT = float(os.environ.get("SOUL_DEV_RESCUE_L3_WAIT", "300") or 300)
+DEV_RESCUE_L3_GUARD = float(os.environ.get("SOUL_DEV_RESCUE_L3_GUARD", "600") or 600)
+_RESCUE = {"at": 0.0, "l3_at": 0.0}
 # 启动首巡只在本进程内布防一次（不写盘）：每次启动/重启后也按「先红点、后奇遇铃」走一遍。
 _BOOT_SWEEP = {"armed": False}
 ROUND_BUDGET = 600.0      # 单轮墙钟上限（超了就结束本轮，防阶段闸自杀）
@@ -168,10 +173,34 @@ def _adb_raw(dev, args, timeout=20):
         return -1
 
 
+def _boot_completed(adb, serial):
+    """sys.boot_completed==1 才算开机完成（adbd 在线≠Android 起完）。"""
+    import subprocess as _sp
+    try:
+        r = _sp.run([adb, "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                    capture_output=True, timeout=10)
+        return (r.stdout or b"").decode("utf-8", "replace").strip() == "1"
+    except Exception:
+        return False
+
+
 def _rebuild_emulator(dev):
-    """MuMu 深层挂死时的重建（2026-10-31 实测解药：约 66s 恢复）。"""
+    """MuMu 深层挂死时的重建（2026-10-31 实测解药：约 66s 恢复）。
+
+    🔴 2026-11-23 12h 停摆教训：脏杀后的冷启动实测 30s~4min+，旧版只等
+    60s 就 return False，下一轮 L3 又把启动中的 VM 杀掉 → 永起不来。
+    修法：①等最多 DEV_RESCUE_L3_WAIT（默认 300s），判据 = adb 在线 +
+    sys.boot_completed=1；②入口记 l3_at，DEV_RESCUE_L3_GUARD（默认 600s）
+    内 _dev_rescue 不再发起下一次重建，保护启动中的模拟器。
+    """
     import subprocess as _sp
     from core.paths import MUMU_MANAGER_CANDIDATES
+    try:
+        from core.device import _find_adb
+        adb = _find_adb()
+    except Exception:
+        adb = ""
+    _RESCUE["l3_at"] = time.time()
     mm = ""
     for p in MUMU_MANAGER_CANDIDATES:
         if os.path.exists(p):
@@ -189,22 +218,29 @@ def _rebuild_emulator(dev):
             _sp.run([mm, "control", "-v", "0", "launch"], capture_output=True, timeout=120)
         except Exception as e:
             log.warning("MuMuManager launch 异常: %r", e)
-    for i in range(12):
+    n_iter = max(12, int(DEV_RESCUE_L3_WAIT // 5))
+    for i in range(n_iter):
         time.sleep(5)
         try:
             ser = dev.probe_serial()
-            if ser:
-                dev.serial = ser
-                log.info("[自愈L3] 设备已上线 serial=%s（等了 %ds）", ser, (i + 1) * 5)
-                for fn in ("ensure_root", "reset_u2"):
-                    try:
-                        getattr(dev, fn)()
-                    except Exception:
-                        pass
-                return True
         except Exception:
-            pass
-    log.warning("[自愈L3] 重建后 60s 仍未上线")
+            continue
+        if not ser:
+            continue
+        done = _boot_completed(adb, ser) if adb else True
+        if not done:
+            if i % 12 == 0:
+                log.info("[自愈L3] adb 已通但 Android 仍在开机（%ds）", (i + 1) * 5)
+            continue
+        dev.serial = ser
+        log.info("[自愈L3] 设备已上线并完成开机 serial=%s（等了 %ds）", ser, (i + 1) * 5)
+        for fn in ("ensure_root", "reset_u2"):
+            try:
+                getattr(dev, fn)()
+            except Exception:
+                pass
+        return True
+    log.warning("[自愈L3] 重建后 %ds 仍未完成开机（不再立刻重杀，保护观察）", int(DEV_RESCUE_L3_WAIT))
     return False
 
 
@@ -227,6 +263,12 @@ def _dev_rescue(dev, fails):
     level = 1 if fails < 6 else (2 if fails < 9 else 3)
     if level >= 3 and not DEV_RESCUE_L3:
         level = 2
+    if level >= 3:
+        gap_l3 = now_t - float(_RESCUE.get("l3_at", 0) or 0)
+        if gap_l3 < DEV_RESCUE_L3_GUARD:
+            log.warning("⚡ 设备自愈降级 L2（距上次重建仅 %.0fs < %.0fs，保护启动中的模拟器）",
+                        gap_l3, DEV_RESCUE_L3_GUARD)
+            level = 2
     log.warning("⚡ 设备自愈 L%d（连续失败 %d 次）", level, fails)
     _adb_raw(dev, ["kill-server"])
     time.sleep(1.5)
