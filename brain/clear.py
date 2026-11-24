@@ -570,8 +570,12 @@ def sweep(actor, db, dry_run=False, max_enter=MAX_ENTER, dev=None, budget_s=240.
             log.warning("本小时发送已达上限 → 本轮不清红点（避免封号）")
             out["left"] = badge_chat(actor.snap())
             return out
-    except Exception:
-        pass
+    except Exception as e:
+        # 🔴 2026-11-24 (P0): 原为 except:pass 静默放行 → 限流模块异常时小时上限失效
+        #    改为 fail-closed（本轮不发），避免超发触发平台风控
+        log.warning("限流模块异常(%r) → 本轮跳过发送（fail-closed）", e)
+        out["left"] = badge_chat(actor.snap())
+        return out
 
     handled = set()
     handled_sids = set()   # 已处理的库 sid（库直读路径用；与 handled 昵称集合并行）

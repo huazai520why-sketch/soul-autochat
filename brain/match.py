@@ -399,8 +399,14 @@ def pick_opener(avoid_recent=30):
         for x in used:
             if x not in _uniq:
                 _uniq.append(x)
-        _head_file().write_text(
-            json.dumps(_uniq[-30:], ensure_ascii=False), "utf-8")
+        # 🔴 2026-11-24 (P0): 原为 write_text 直接覆盖 → 并发损坏 JSON → used=[] → 开场白重复
+        #    改为写 tmp 再 os.replace 原子写（与 pending_ledger._save_json 同款）
+        import os as _os
+        _hf = _head_file()
+        _tmp = str(_hf) + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(_uniq[-30:], ensure_ascii=False))
+        _os.replace(_tmp, str(_hf))
     except Exception as e:
         log.warning("记开场白失败: %r", e)
     return t
@@ -468,7 +474,14 @@ def _fallback():
     pick = pick or FALLBACK[0]
     try:
         used = (used + [pick])[-6:]
-        _head_file().write_text(json.dumps(used, ensure_ascii=False), "utf-8")
+        # 🔴 2026-11-24 (P0): 原为 write_text 直接覆盖 → 并发损坏 JSON → used=[] → 开场白重复
+        #    改为写 tmp 再 os.replace 原子写
+        import os as _os
+        _hf = _head_file()
+        _tmp = str(_hf) + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(used, ensure_ascii=False))
+        _os.replace(_tmp, str(_hf))
     except Exception as e:
         log.warning("记兜底句失败: %r", e)
     log.warning("四条候选全废，改用兜底句 %r", pick)
@@ -524,8 +537,10 @@ def send(actor, dev, text, sid=""):
         from brain import ratelimit as _RL
         if not _RL.can_send():
             return False, "本小时发送已达上限"
-    except Exception:
-        pass
+    except Exception as e:
+        # 🔴 2026-11-24 (P0): 原为 except:pass 静默放行 → 限流模块异常时小时上限失效
+        #    改为 fail-closed（本轮不发），避免超发触发平台封号
+        return False, "限流模块异常(%r) → fail-closed" % e
 
     # 跟进阶梯发送闸：sid 为空（奇遇铃 / 匹配 / 新招呼等新会话开场白）
     # 过闸放行，但不占 2/6 条跟进额度；将来调用方拿到 sid 传进来即自动受约束。

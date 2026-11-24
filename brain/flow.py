@@ -232,8 +232,12 @@ def sid_from_row(db, row):
         return None
     if len(hits) == 1:
         return hits[0][0]
-    if hits[0][1] > hits[1][1]:          # 命中数明显更高才算
-        return hits[0][0]
+    # 🔴 2026-11-24（P1，契约 S2.2 对齐）：多命中时不再「命中数明显更高」就猜第一个。
+    #    旧逻辑 hits[0][1] > hits[1][1] 就取第一个 —— 短句（嗯/好的）在多会话都出现时
+    #    仅多命中 1 条就会进错会话、把历史发给错人（串号）。契约要求「多命中一律放弃
+    #    + 留日志」，宁可不回（走慢路径 OCR），不可发错人。
+    log.warning("行文本反查多命中 %d 条（%r）→ 一律放弃走慢路径（契约 S2.2）",
+                len(hits), [(h[0][-6:], h[1]) for h in hits[:5]])
     return None
 
 

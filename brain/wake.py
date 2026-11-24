@@ -493,8 +493,10 @@ def send_wake(actor, dev, cand, text, db=None):
         from brain import ratelimit as _RL
         if not _RL.can_send():
             return False, "本小时发送已达上限"
-    except Exception:
-        pass
+    except Exception as e:
+        # 🔴 2026-11-24 (P0): 原为 except:pass 静默放行 → 限流模块异常时小时上限失效
+        #    改为 fail-closed（本轮不发），避免超发触发平台封号
+        return False, "限流模块异常(%r) → fail-closed" % e
 
     # 🔴 2026-11-03：关键词改为多候选（她原话 → 我原话），逐个试。
     #    原来只用 cand.last_text（= 我发的最后一句），1~2 字时直接放弃。
