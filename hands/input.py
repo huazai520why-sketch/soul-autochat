@@ -134,18 +134,25 @@ class Input(object):
                 return False
 
     def type_text(self, text, settle=1.0):
-        """灌字。返回 True/False（以输入框实际文本为准，不看返回值）。"""
-        try:
-            self.d.send_keys(text)
-        except Exception as e:
-            # 🔴 2026-11-03 修复 P2：原来只打日志返回 False，连接保持失效，
-            #    后续 type_and_verify 重试也打同一失效连接。
-            log.warning("send_keys 异常: %r → 重置 u2 重试", e)
-            self._reset()
+        """灌字。返回 True/False（以输入框实际文本为准，不看返回值）。
+
+        🔴 2026-11-23 修复（send_keys OSError(22) 连续失败自愈）：
+           u2 的 send_keys 偶发 OSError(22)（Invalid argument，Windows 下
+           uiautomator2 与设备 socket 状态不同步），连续失败会让上层
+           type_and_verify 重试同样失败 → 该轮整条发送被拖死。
+           每次异常都重置 u2 连接 + 退避递增（0.5s/1.0s），避免同一条失效
+           连接被反复猛撞；首败立即重试一次（保留原行为），仍败返回 False。
+        """
+        for _i, _wait in enumerate((0.5, 1.0)):
             try:
                 self.d.send_keys(text)
-            except Exception as e2:
-                log.warning("send_keys 重试仍失败: %r", e2)
+                break
+            except Exception as e:
+                log.warning("send_keys 异常: %r → 重置 u2，退避 %.1fs 重试", e, _wait)
+                self._reset()
+                time.sleep(_wait)
+                if _i == 0:
+                    continue
                 return False
         if settle:
             time.sleep(settle)
@@ -299,7 +306,9 @@ class Input(object):
                 self.last_reason = "ok"
                 return True
             if got is None:
-                log.warning("发送校验：找不到输入框，无法确认是否发出 → 按未发出处理")
+                # 2026-11-23 注释修正：语义是 unknown（找不到输入框=大概率已发，
+                #   上层按已发记账防重复），原日志「按未发出处理」与实际语义矛盾。
+                log.warning("发送校验：找不到输入框，无法确认是否发出 → unknown（大概率已发，上层按已发记账）")
                 self.last_reason = "unknown"
                 return False
         self.last_reason = "residual"

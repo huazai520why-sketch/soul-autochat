@@ -207,13 +207,37 @@ def _rebuild_emulator(dev):
             mm = p
             break
     log.warning("[自愈L3] 重建模拟器（MuMuManager=%s）", mm or "未找到")
+    # 🔴 2026-11-24 修复（用户报「副机模拟器又崩了」·session0 假死）
+    #   daemon 由 SoulAutoGuard（S4U / Session 0）拉起时，若直接在此跑
+    #   `MuMuManager control -v 0 launch`，新起 MuMuNxMain.exe 会继承 session0
+    #   → Android 层永不 boot，adb 永远 offline，L3 自愈循环永不收敛（§64 同款）。
+    #   修法：daemon 自身 Sess=0 时改走 Start-ScheduledTask MuMuLaunch0
+    #   （InteractiveToken / Highest），与 tools/watchdog_live.launch_mumu() 同路径。
+    #   Sess=1 时（人工从桌面拉起）仍保留原 MuMuManager 路径。
+    def _daemon_in_session0():
+        try:
+            import ctypes
+            _sid = ctypes.c_ulong(0)
+            _ok = ctypes.windll.kernel32.ProcessIdToSessionId(int(os.getpid()), ctypes.byref(_sid))
+            return bool(_ok) and int(_sid.value) == 0
+        except Exception:
+            return False
     try:
         _sp.run(["taskkill", "/F", "/T", "/IM", "MuMuNxMain.exe"],
                 capture_output=True, timeout=30)
     except Exception as e:
         log.warning("taskkill MuMuNxMain 异常: %r", e)
     time.sleep(3)
-    if mm:
+    _used_schedtask = False
+    if _daemon_in_session0():
+        log.warning("[自愈L3] daemon 在 session0 → 走 Start-ScheduledTask MuMuLaunch0 避开 session0 假死")
+        try:
+            _sp.run(["schtasks", "/Run", "/TN", "MuMuLaunch0"],
+                    capture_output=True, timeout=30)
+            _used_schedtask = True
+        except Exception as e:
+            log.warning("schtasks MuMuLaunch0 异常: %r", e)
+    if not _used_schedtask and mm:
         try:
             _sp.run([mm, "control", "-v", "0", "launch"], capture_output=True, timeout=120)
         except Exception as e:

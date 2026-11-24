@@ -286,7 +286,7 @@ class Device:
             raise box["err"]
         return box["d"]
 
-    def u2(self, timeout=60):
+    def u2(self, timeout=60, _retries=2):
         """uiautomator2 连接（懒加载）。失败抛 RuntimeError，由上层决定是否降级 adb。
 
         🔴 2026-11-19 修复 FLOW-08：原实现只对「connect 不接受 timeout kw（TypeError）」
@@ -295,6 +295,16 @@ class Device:
         正常抛异常路径根本兜不住，主线程被永久阻塞。修法：把整段 connect+d.info
         探测放进 daemon 子线程，主线程 join(timeout+5) 兜底，超时即放弃并抛
         可捕获的 TimeoutError，绝不拖死整条链路。
+
+        🔴 2026-11-23 修复（间歇掉线自愈）：现网 01:41/02:34/18:42 三次「单轮异常」
+        全部根因 `u2 连接失败(...) device not online` —— 设备**间歇掉线**时
+        u2.connect 快速失败（非硬超时），原实现立即 raise，整轮被掐断。
+        修法：连接失败且**非超时类**错误（线程已结束、错误不含 timeout/无响应）时，
+        先 `adb connect` 重挂 adb 通道 + 指数退避，再重试最多 _retries 次。
+        硬超时（线程仍 alive 或错误确为超时）**不重试**，避免半死设备把重试时间
+        乘倍拖死整条链路。
+        注意：本函数不触碰 L3 自愈（§51 等待300s+boot_completed=1+600s保护窗），
+        重试仅作用于 connect 路径（最多 3 次、总附加约 2.4s），互不干扰。
         """
         if self._u2 is not None:
             return self._u2
@@ -305,42 +315,63 @@ class Device:
         t0 = time.time()
         self.__dict__.setdefault("_u2_timeout_ok", None)
 
-        # 2026-11-19 修复 FLOW-08：复用 _connect_no_timeout 的 daemon 线程模式兜底整段 connect
-        box = {}
+        last_err = None
+        for _attempt in range(max(0, _retries) + 1):
+            # 2026-11-19 修复 FLOW-08：复用 _connect_no_timeout 的 daemon 线程模式兜底整段 connect
+            box = {}
 
-        def _u2_connect_run():
-            try:
+            def _u2_connect_run():
                 try:
-                    if self._u2_timeout_ok is None or self._u2_timeout_ok:
-                        try:
-                            d = u2mod.connect(self.serial, timeout=timeout)
-                            self._u2_timeout_ok = True
-                        except TypeError:
-                            # 该版本 connect() 不接受 timeout kw —— 记下来，之后直接走无 timeout 路径
-                            self._u2_timeout_ok = False
+                    try:
+                        if self._u2_timeout_ok is None or self._u2_timeout_ok:
+                            try:
+                                d = u2mod.connect(self.serial, timeout=timeout)
+                                self._u2_timeout_ok = True
+                            except TypeError:
+                                # 该版本 connect() 不接受 timeout kw —— 记下来，之后直接走无 timeout 路径
+                                self._u2_timeout_ok = False
+                                d = self._connect_no_timeout(u2mod, timeout)
+                        else:
                             d = self._connect_no_timeout(u2mod, timeout)
-                    else:
+                    except TypeError:
+                        # 兜底：万一探测路径本身仍以 TypeError 暴露（极老版本）
                         d = self._connect_no_timeout(u2mod, timeout)
-                except TypeError:
-                    # 兜底：万一探测路径本身仍以 TypeError 暴露（极老版本）
-                    d = self._connect_no_timeout(u2mod, timeout)
-                d.info  # 触发一次通信，确认真的可用
-                box["d"] = d
-            except Exception as e:            # noqa: BLE001
-                box["err"] = e
+                    d.info  # 触发一次通信，确认真的可用
+                    box["d"] = d
+                except Exception as e:            # noqa: BLE001
+                    box["err"] = e
 
-        th = threading.Thread(target=_u2_connect_run, daemon=True)
-        th.start()
-        th.join(timeout + 5)  # 2026-11-19 修复 FLOW-08：外层硬兜底，比内层 timeout 略宽
-        if th.is_alive():
-            raise RuntimeError(
-                "u2 连接硬超时(>%.0fs，设备无响应): %s" % (timeout + 5, self.serial))
-        if "err" in box:
-            raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, box["err"]))
-        d = box["d"]
-        log.info("u2 已连接 %s (%.1fs) ver=%s", self.serial, time.time() - t0, u2_version())
-        self._u2 = d
-        return d
+            th = threading.Thread(target=_u2_connect_run, daemon=True)
+            th.start()
+            th.join(timeout + 5)  # 2026-11-19 修复 FLOW-08：外层硬兜底，比内层 timeout 略宽
+            if th.is_alive():
+                raise RuntimeError(
+                    "u2 连接硬超时(>%.0fs，设备无响应): %s" % (timeout + 5, self.serial))
+            if "err" not in box:
+                d = box["d"]
+                log.info("u2 已连接 %s (%.1fs) ver=%s",
+                         self.serial, time.time() - t0, u2_version())
+                self._u2 = d
+                return d
+            last_err = box["err"]
+            # 超时类错误（设备半死/无响应）：重试无益且会乘倍拖死 → 直接抛
+            _es = str(last_err)
+            if (isinstance(last_err, TimeoutError)
+                    or "timeout" in _es.lower() or "无响应" in _es
+                    or "hard" in _es.lower()):
+                raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, last_err))
+            if _attempt < _retries:
+                log.warning("u2 连接第%d次失败(%s)→ adb 重挂+退避 %.1fs 后重试: %r",
+                            _attempt + 1, self.serial, 0.8 * (_attempt + 1), last_err)
+                try:
+                    subprocess.run([self.adb, "connect", self.serial],
+                                   capture_output=True, timeout=10)
+                except Exception as _ce:
+                    log.debug("u2 重试前 adb connect 重挂失败(忽略): %r", _ce)
+                time.sleep(0.8 * (_attempt + 1))
+                continue
+            break
+        raise RuntimeError("u2 连接失败(%s): %r" % (self.serial, last_err))
 
     def u2_alive(self):
         try:

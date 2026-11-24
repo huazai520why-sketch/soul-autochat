@@ -3328,6 +3328,14 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("[dry] 会回 %d 条: %r", len(lines), lines)
         else:
             from brain import auto_voice as AV
+            # 🔴 2026-11-23（P0）：sent_n 必须恒有定义。AV.send_voice_reply 可能返回
+            #   {"sent": False, "started": True}（录音手势后无法确认落库），此时下面
+            #   line 3352 的 `voice_result is None or not started` 为 False → 跳过文字
+            #   发送块 → sent_n 从未赋值 → line 3508 `if sent_n` 抛 UnboundLocalError
+            #   （生产日志 2026-11-23 18:56/58/19:00/19:02 四连发，整轮记账全丢）。
+            #   与 flow.py 同口径：进 else 分支即置 0，voice sent 时再置 1，
+            #   彻底消除未赋值路径（不补发文字、不重复记账）。
+            sent_n = 0
             voice_result = None
             if AV.should_reply("voice" if str(sid) in _VOICE_SIDS else "text", str(sid)):
                 voice_result = AV.send_voice_reply(

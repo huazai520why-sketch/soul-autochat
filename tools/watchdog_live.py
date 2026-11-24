@@ -35,7 +35,7 @@ if getattr(sys.stderr, "buffer", None) is not None:
 else:
     sys.stderr = io.StringIO()
 
-ROOT = r"E:\soul1.0"
+ROOT = r"D:\soul-autochat"
 LOGDIR = os.path.join(ROOT, "logs")
 ALERT = os.path.join(LOGDIR, "alerts.log")
 PYW = os.environ.get("SOUL_PYW") or sys.executable.replace("python.exe", "pythonw.exe")
@@ -103,7 +103,7 @@ def start_daemon():
     """必须用计划任务拉起 —— 直接 Start-Process 会被 ssh 会话结束时连带杀掉。"""
     try:
         subprocess.run(["powershell", "-NoProfile", "-Command",
-                        "Start-ScheduledTask -TaskName 'SoulGuard'"],
+                        "Start-ScheduledTask -TaskName 'SoulAutoGuard'"],
                        capture_output=True, timeout=60)
         return True
     except Exception as e:
@@ -194,10 +194,13 @@ def launch_mumu():
         os.makedirs(os.path.dirname(LAUNCH_STATE), exist_ok=True)
         with open(LAUNCH_STATE, "w", encoding="ascii") as f:
             f.write(str(now))
-        r = subprocess.run([MM, "control", "-v", "0", "launch"],
-                           capture_output=True, timeout=120)
+        # 🔴 2026-11-24 修复：watchdog_live 本身可能跑在 session0（计划任务 S4U），
+        #   直跑 MuMuManager 会让 MuMu 挂在 session0 → Android 不 boot → adb 永远 offline。
+        #   改走 Start-ScheduledTask MuMuLaunch0（InteractiveToken / Highest）。
+        r = subprocess.run(["schtasks", "/Run", "/TN", "MuMuLaunch0"],
+                           capture_output=True, timeout=30)
         out = (r.stdout or b"").decode("utf-8", "replace").strip()
-        say("adb 不通 → MuMu launch rc=%s %s" % (r.returncode, out[:120]))
+        say("adb 不通 → Start-ScheduledTask MuMuLaunch0 rc=%s %s" % (r.returncode, out[:120]))
     except Exception as e:
         say("MuMu launch 失败: %r" % (e,))
         return False
