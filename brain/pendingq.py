@@ -574,7 +574,9 @@ except Exception:
     _LIVE_TTL_S = float(os.environ.get("SOUL_LIVE_TTL_S", "120") or 120)
 _DEV_REF = {"dev": None}
 # 2026-11-20 修复 X-01：同 _LIVE_CACHE，加 uid 维度防切号污染。
-_UNREAD_CACHE = {"uid": None, "ts": 0.0, "sids": set()}
+# 2026-11-25 夜修（P0-02 收口）：加 ttl 字段 —— 空集只缓存 10s，非空 60s。
+#   原来失败扫描返回的 None 被洗成空集并缓存 60s，新消息在缓存期内两道闸都漏。
+_UNREAD_CACHE = {"uid": None, "ts": 0.0, "sids": set(), "ttl": 0.0}
 _CANDIDATE_CACHE = {"key": None, "at": 0.0, "value": []}
 CANDIDATE_CACHE_S = float(os.environ.get("SOUL_CANDIDATE_CACHE_S", "8") or 8)
 
@@ -593,23 +595,70 @@ def _device_unread_sids(db):
     #   与 _device_live_uids 同款结构：非空 + 未过 60s 才复用，否则重扫设备库。
     now = time.time()
     _cur_uid = str(getattr(db, "uid", None))  # 2026-11-20 修复 X-01：按 uid 分桶判命中
+    _ttl_c = float(_UNREAD_CACHE.get('ttl', 0.0) or 0.0) or 60.0
     if _UNREAD_CACHE and _UNREAD_CACHE.get('uid') == _cur_uid \
-            and now - float(_UNREAD_CACHE.get('ts', 0)) < 60.0 \
+            and now - float(_UNREAD_CACHE.get('ts', 0)) < _ttl_c \
             and _UNREAD_CACHE.get('sids') is not None:
         return _UNREAD_CACHE['sids']
     out = set()
+    _scanned = False
     try:
         from data import imdb as _IM
         dev = getattr(db, "dev", None) or _DEV_REF.get("dev")
         if dev is not None:
             m = _IM.device_unread_map(dev, timeout=6, uid=getattr(db, "uid", None))
-            if m:
+            # 2026-11-25 夜修（P0-02）：None = 设备库读不到（失败），不得当成
+            #   「0 个未读」写缓存；{} = 查询成功且确实 0 个未读，可以缓存但缩短 TTL。
+            if m is not None:
                 out = {str(k) for k, v in m.items() if v}
+                _scanned = True
     except Exception as e:
         log.debug("设备未读集合取不到（降级为不硬放行）: %r", e)
     # 2026-11-20 修复 X-01：写入时记 uid，切号后视为未命中强制重扫
-    _UNREAD_CACHE.update(uid=_cur_uid, ts=now, sids=out)
+    # 2026-11-25 夜修（P0-02）：只有扫描成功才写缓存；空集 10s、非空 60s。
+    if _scanned:
+        _UNREAD_CACHE.update(uid=_cur_uid, ts=now, sids=out,
+                             ttl=(60.0 if out else 10.0))
     return out
+
+
+# 2026-11-25 夜修（P0 漏回）：设备摘要核对缓存（sid -> (ts, result)），30s TTL。
+#   candidates() 一轮会调 6+ 次，同一 sid 每次查设备（0.1~0.3s）代价太高。
+_DEV_DIG_CACHE = {}
+
+
+def _device_digest_newer(db, sid, mir_text, mir_ts):
+    """设备 session 摘要是否明显比镜像新；是则返回设备摘要，否则 None。
+
+    只在「镜像摘要看起来是我方旧句」这条路径上调（对账块），用于防止
+    mirror 丢 WAL 尾部时把她的真新话永久当成我方原句跳过。
+    判据：设备 ts 比镜像 ts 新 >=30s，且设备文本与镜像文本不同（不是同一句）。
+    """
+    dev = getattr(db, "dev", None) or _DEV_REF.get("dev")
+    name = getattr(getattr(db, "path", None), "name", "") or ""
+    if dev is None or not name:
+        return None
+    key = str(sid)
+    now = time.time()
+    _hit = _DEV_DIG_CACHE.get(key)
+    if _hit and now - _hit[0] < 30.0:
+        return _hit[1]
+    res = None
+    try:
+        from data import imdb as _IM
+        d = _IM.device_session_digest(dev, name, sid, timeout=6)
+        if d:
+            _dts = int(d.get("ts") or 0)
+            _dtx = (d.get("text") or "").strip()
+            if _dts > int(mir_ts or 0) + 30000 and _dtx \
+                    and _dtx != (mir_text or "").strip():
+                res = d
+    except Exception as e:
+        log.debug("设备摘要核对失败（按镜像继续）sid=%s: %r", sid, e)
+    if len(_DEV_DIG_CACHE) > 800:
+        _DEV_DIG_CACHE.clear()
+    _DEV_DIG_CACHE[key] = (now, res)
+    return res
 
 
 def invalidate_live_cache():
@@ -639,7 +688,8 @@ def invalidate_unread_cache():
     让紧接着的 candidates() 重新查设备库拿到最新的未读集合。
     """
     # 2026-11-20 修复 X-01：清缓存时一并清 uid 标记，避免残留桶被误判命中
-    _UNREAD_CACHE.update(uid=None, ts=0.0, sids=set())
+    # 2026-11-25 夜修（P0-02）：ttl 一并归零，避免旧 TTL 残留
+    _UNREAD_CACHE.update(uid=None, ts=0.0, sids=set(), ttl=0.0)
     _CANDIDATE_CACHE.update(key=None, at=0.0, value=[])
     log.info("设备未读缓存已清除（库变化信号触发）")
 
@@ -1130,6 +1180,19 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     _dig = {}
                 _d_txt = (_dig.get("text") or "").strip()
                 _d_ts = int(_dig.get("ts") or 0)
+                # 2026-11-25 夜修（P0 漏回）：镜像丢 WAL 尾部时，_d_txt/_d_ts 都是
+                #   几小时前的我方旧句，下面的「镜像滞后」判据会自我印证后跳过。
+                #   设备 session 行才是真值；设备明显更新且文本不同 → 用设备摘要。
+                if _d_txt:
+                    _dd = _device_digest_newer(db, sid, _d_txt, _d_ts)
+                    if _dd:
+                        log.warning("设备未读硬放行：sid=%s 镜像摘要落后（%r → %r）"
+                                    " → 以设备为准（防漏回）", sid,
+                                    _d_txt[:16], (_dd.get("text") or "")[:16])
+                        _d_txt = (_dd.get("text") or "").strip() or _d_txt
+                        _d_ts = int(_dd.get("ts") or 0) or _d_ts
+                        if _dd.get("to_uid"):
+                            to_uid = str(_dd["to_uid"])
                 # 🔴 2026-11-12 夜班修复（D5）：设备未读硬放行前先过系统文本过滤。
                 #   改前该分支 out.append + continue 跳过了后面 996-1016 的 SYS_TEXTS /
                 #   is_human 系统文本过滤 → 可能把系统卡（如「互相关注后即可…」）当
@@ -1584,6 +1647,20 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
             #   比主循环 my_text_ts_src 的 mirror/sends 判据更弱 —— 主循环只有 mirror
             #   精确匹配才硬跳、sends 兜底命中只 debug 不跳，本对账块却把裸文本匹配
             #   一律跳过。改成复用同一 mirror/sends 判据，与主循环同源。
+            # 2026-11-25 夜修（P0 漏回）：mirror 可能丢 WAL 尾部（设备已有她新话，
+            #   镜像仍是几小时前我方旧句）。此时下面的「镜像滞后」判据会拿两份
+            #   同样陈旧的镜像数据互相印证 → delta≈0 → 把真消息永久跳过。
+            #   设备 session 行是唯一真值：设备 ts 明显更新且文本不是镜像这句时，
+            #   以设备摘要为准继续走补入（后续仍过系统文本/noreply/身份校验）。
+            if _t:
+                _dd = _device_digest_newer(db, _s, _t, _ts2)
+                if _dd:
+                    log.warning("设备未读对账：sid=%s 镜像摘要落后（%r → %r）→ "
+                                "以设备为准防漏回", _s,
+                                (_t or "")[:16], (_dd.get("text") or "")[:16])
+                    _t = (_dd.get("text") or "").strip() or _t
+                    _uid2 = str(_dd.get("to_uid") or "") or _uid2
+                    _ts2 = int(_dd.get("ts") or 0) or _ts2
             try:
                 _last_chk, _src_chk = db.latest(_s)
             except Exception:

@@ -1014,11 +1014,34 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
         #    SQLite 就按它的 mxFrame 截断 wal 尾部 ⇒ 她最新的话在库里「不存在」，
         #    latest() 判「最后一条是我发的」→ candidates 静默吞掉必回。
         #    本地 shm 由 SQLite 打开时自行重建，不需要也不该从设备搬。
-        for suffix in ("", "-wal"):
+        # 2026-11-26 夜修（P0 漏回根因）：**先 pull -wal，再 pull 主库**。
+        #   原顺序（主库先、wal 后）有一个致命窗口：App 在两次 pull 之间做
+        #   checkpoint → 主库被拉成「checkpoint 前」的旧快照，wal 被拉成
+        #   checkpoint 后被清空的 0 字节 → WAL 尾部（她最新的话）永久丢失。
+        #   生产实测：镜像连续 28 分钟落后设备、丢 2 条消息，session_digest
+        #   仍是几小时前我方旧句 → pendingq「镜像滞后」把真消息跳过（漏回）。
+        #   先拉 wal 后拉主库：checkpoint 发生在中间时，主库已含尾部（更新），
+        #   旧 wal 会被 SQLite 按 salt/mxFrame 忽略；没发生 checkpoint 时
+        #   wal+主库正常回放。两种时序都不丢。
+        for suffix in ("-wal", ""):
             src = "%s/%s%s" % (DB_DIR_ANDROID, name, suffix)
             dst = str(dest_dir / (name + suffix))
             rc, out, err = device.run(["pull", src, dst], timeout=120)
-            if rc != 0 and suffix == "":
+            if suffix == "-wal":
+                _wsz = 0
+                try:
+                    _pw = Path(dst)
+                    _wsz = _pw.stat().st_size if _pw.exists() else -1
+                except OSError:
+                    _wsz = -1
+                if rc != 0:
+                    log.warning("pull WAL 失败（主库可能是 checkpoint 前旧快照，"
+                                "本轮可能丢最新消息）rc=%s err=%r",
+                                rc, (err or "")[:140])
+                elif _wsz <= 0:
+                    # WAL 为空是合法的（App 刚 checkpoint 过），不刷 WARNING。
+                    log.debug("pull WAL 为空（size=%s，主库应已含尾部）", _wsz)
+            elif rc != 0:
                 # 🔴 DS-03：pull 失败时恢复备份，别让本地镜像裸奔（历史数据优先）。
                 for _k in _keep_files:
                     try:
@@ -1081,6 +1104,32 @@ def sync(device, name, dest_dir=None, keep=3, retries=3):
             _c.close()
     except Exception as e:
         log.warning("wal checkpoint 失败（只影响读到 wal 尾部）: %r", e)
+
+    # 2026-11-25 夜修（P0 漏回告警）：pull 顺序/时机竞争可能丢 WAL 尾部，镜像静默
+    #   落后设备（实测 2 小时 + 2 条消息）。这里同步后做一次「设备 max(session.ts)
+    #   vs 镜像」核对，落后 >120s 打 WARNING（10 分钟限流），把静默丢数据暴露出来。
+    try:
+        _now_lag = time.time()
+        if _now_lag - float(_LAST.get("lag_log_ts", 0.0) or 0.0) > 600.0:
+            _raw_d = _dev_sql(device, name,
+                              "select ifnull(max(timestamp),0) from session",
+                              timeout=8) or ""
+            _ln_d = [x.strip() for x in _raw_d.replace("\r", "").splitlines() if x.strip()]
+            _dmax = int(_ln_d[-1]) if _ln_d and _ln_d[-1].isdigit() else 0
+            _lmax = 0
+            _cl = sqlite3.connect(str(local), timeout=5)
+            try:
+                _r_l = _cl.execute("select ifnull(max(timestamp),0) from session").fetchone()
+                _lmax = int(_r_l[0] or 0) if _r_l else 0
+            finally:
+                _cl.close()
+            if _dmax > 0 and _lmax > 0 and _dmax - _lmax > 120000:
+                _LAST["lag_log_ts"] = _now_lag
+                log.warning("镜像落后设备 %.0f 秒（设备 max_ts=%s / 镜像 max_ts=%s）"
+                            "—— 可能丢 WAL 尾部，回复判据会漏新消息，下一轮请复核",
+                            (_dmax - _lmax) / 1000.0, _dmax, _lmax)
+    except Exception as _e_lag:
+        log.debug("镜像时效核对失败（忽略）: %r", _e_lag)
 
     # 简单清理：只留最近 keep 份库（按 mtime）
     files = sorted(dest_dir.glob("*.db*"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1565,8 +1614,49 @@ def device_unread_map(device, timeout=15, uid=None, strict=True):
     # ---- ③ 只查这一个库，并过滤群/官方会话 ----
     q = ("select sessionId,unReadCount from session "
          "where unReadCount>0 and toUserId>0")
-    got = _parse_kv(_dev_sql(device, owner, q, timeout=timeout))
-    return got if got else None
+    # 2026-11-25 夜修（P0-02 收口）：用 ok 哨兵区分「成功 0 行」与「查询失败」。
+    #   原来 `got if got else None` 把两者都洗成 None，调用方（pendingq
+    #   _device_unread_sids）无法区分「真没未读」与「设备库读不到」，会把失败
+    #   当成空集缓存 60s → 新消息在缓存期内被硬放行/对账两道闸同时漏掉。
+    #   现在：成功 0 行返回 {}（可安全缓存），失败返回 None（调用方不得缓存）。
+    _ok = {}
+    _txt = _dev_sql(device, owner, q, timeout=timeout, ok=_ok)
+    if not _ok.get("v"):
+        log.debug("设备未读查询失败（ok=False，非空集）uid=%s owner=%s", want, owner)
+        return None
+    return _parse_kv(_txt)
+
+
+def device_session_digest(device, dbname, session_id, timeout=8):
+    """设备端 session 行摘要（只读，0.05~0.3s）。
+
+    2026-11-25 夜修（P0 漏回）：镜像 pull 会偶发丢 WAL 尾部（生产实测
+    sid=96691646486483065：设备已有她 23:38 的新话，镜像仍是 2 小时前的
+    我方旧句），pendingq 的「镜像滞后 → 跳过」于是把真消息当成我方原句
+    永久跳过。设备 session 行是唯一真值，用它做兜底核对。
+    返回 dict 或 None（查询失败/无该行）；text/ts 与 session_digest 同口径。
+    """
+    _ok = {}
+    _q = ("select toUserId,unReadCount,lastMsgText,timestamp from session "
+          "where sessionId='%s' limit 1" % str(session_id).replace("'", "''"))
+    _txt = _dev_sql(device, dbname, _q, timeout=timeout, ok=_ok)
+    if not _ok.get("v"):
+        return None
+    _ln = ""
+    for _x in (_txt or "").replace("\r", "").splitlines():
+        if _x.strip():
+            _ln = _x.strip()
+            break
+    if not _ln:
+        return None
+    _p = _ln.split("|", 3)
+    if len(_p) < 4:
+        return None
+    try:
+        return {"to_uid": str(_p[0] or ""), "unread": int(_p[1] or 0),
+                "text": (_p[2] or "").strip(), "ts": int(_p[3] or 0)}
+    except Exception:
+        return None
 
 
 def _unread_scan_all(device, dbs, timeout=15):
