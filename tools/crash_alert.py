@@ -156,15 +156,23 @@ def patrol() -> int:
             old_size = old["size"]
             inc = _increment(path, old_size)
             if inc:
-                hits = re_sig.findall(inc)
-                if hits:
+                # 2026-11-26 夜修（P2 误报）：SoulAutoGuard 每 5 分钟拉起一次 daemon，
+                #   第二实例抢锁失败会写「ERROR 拿不到锁：被 pid=... 占用」，实测 285 次/日
+                #   全部被当成 daemon 异常 → crash_alert 455 条 tickets=1，淹没真崩溃。
+                #   锁竞争是已知良性噪声，不纳入崩溃告警。
+                hit_lines = [
+                    ln for ln in inc.splitlines()
+                    if re_sig.search(ln) and "拿不到锁" not in ln
+                ]
+                if hit_lines:
+                    inc_hits = "\n".join(hit_lines)
                     # 异常类型（daemon.out）单独提取；看门狗命中则是「动作词」
                     if fname == "daemon.out":
-                        types = [t for t in (_EXC_RE.findall(inc)) if t]
+                        types = [t for t in (_EXC_RE.findall(inc_hits)) if t]
                         detail = "命中=%d行 异常=%s" % (
-                            len(hits), ",".join(types[:3]) if types else "未知")
+                            len(hit_lines), ",".join(types[:3]) if types else "未知")
                     else:
-                        detail = "命中=%d行" % len(hits)
+                        detail = "命中=%d行" % len(hit_lines)
                     _append_alert(now, fname, kind, detail)
                     emitted += 1
             current[fname] = sig

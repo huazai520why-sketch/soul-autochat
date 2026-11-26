@@ -425,6 +425,9 @@ def ensure_fresh(actor, db, rounds=1):
             try:
                 _dig = db.session_digest(_sid) or {}
                 _t = (_dig.get("text") or "").strip()
+                # 2026-11-26 夜修（P2）：系统占位卡不是真人话，清红点不应为它反复刷新。
+                if _t.startswith("当前版本不支持该消息"):
+                    continue
                 if _t:
                     unread.append(type("S", (), {"last_text": _t})())
             except Exception:

@@ -779,8 +779,10 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
                     log.info("[%s] 联系方式轮：保留完整 %d 条分片（不裁剪）", nick, len(lines))
                 else:
                     lines = lines[:_d.n]
-    except Exception:
-        pass
+    except Exception as _e_sg:
+        # P2：原来裸 pass，发送闸异常时静默 fail-open；保留放行语义（可用性优先），
+        #   但必须留 WARNING，方便巡检发现「闸没生效」而不是完全无感。
+        log.warning("发送闸异常（按放行处理，需人工核查）: %r", _e_sg)
     # 🔴 灌字前必须确认在会话页：搜索页也有输入框，一旦页面没退干净，
     #    整句话会灌进搜索框（实测截图里搜索框残留「这娃儿笑起来乖得很撒，你」），
     #    消息永远发不出去，还会把搜索状态彻底搞乱。

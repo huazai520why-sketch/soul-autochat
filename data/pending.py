@@ -194,6 +194,14 @@ def unread_sids(db, now_ms=None):
             continue
         if _skip_uid(to_uid):
             continue
+        # 2026-11-26 夜修（P1 噪声/假红点）：App 的「当前版本不支持该消息」占位卡
+        #   不是真人未读，但 unReadCount 恒为 1；清红点把它当目标却永远认领不到，
+        #   实测每轮误判「列表比库旧」→ 下拉刷新 499 次/24h。这里直接排除。
+        try:
+            if (r["lastMsgText"] or "").strip().startswith("当前版本不支持该消息"):
+                continue
+        except Exception:
+            pass
         out.append(sid)
     return out
 

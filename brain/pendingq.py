@@ -109,7 +109,10 @@ RESTART_H = float(os.environ.get("SOUL_RESTART_H", "24") or 24)
 #   17 个 >72h 的会话要 17 轮（约 1 小时）才轮到一遍 —— 现在 2 个/轮。
 RESTART_PER_ROUND = int(os.environ.get("SOUL_RESTART_PER_ROUND", "2") or 2)
 # 系统类会话文本（不是真人说的话，回了等于对机器说话）
-SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消息]")
+# 2026-11-26 夜修（P1）：补 App 的「当前版本不支持该消息」占位卡；设备未读对账
+#   原本只认 4 个方括号文案，会把它当真人话每轮强制补入（实测两个 sid 1526/503 次）。
+SYS_TEXTS = ("[互动消息]", "[互动提醒]", "[系统消息]", "[官方消息]",
+             "当前版本不支持该消息，请升级到最新版本")
 
 # 🔴 失败台账（用户 2026-11-02：「都出现未找到相关结果了 为什么还有无限次的重试」）
 #   搜不到的会话如果每轮都重试，每次白烧 11s（搜索接口本身要 11s 才返回"未找到"）。
@@ -1659,12 +1662,17 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                     log.debug("设备未读对账：sid=%s 摘要与末条均无法定位 → 1h 抑制期内（降噪 DEBUG）", _s)
                 else:
                     _NO_DIGEST_SEEN[str(_s)] = _nd_now
+                    # P2：dict 长期运行不设上限会缓慢增长；顺手清掉已过 1h TTL 的旧键。
+                    if len(_NO_DIGEST_SEEN) > 256:
+                        _cut_nd = _nd_now - _NO_DIGEST_TTL
+                        for _k_nd in [k for k, v in _NO_DIGEST_SEEN.items() if v < _cut_nd]:
+                            _NO_DIGEST_SEEN.pop(_k_nd, None)
                     log.warning("设备未读对账：sid=%s 摘要与末条均无法定位收件人/文本 → 本轮无法补入"
                                 "（已尝试 session_digest + db.latest + 设备直查）", _s)
                 continue
             if _uid2.startswith(SKIP_UID_PREFIX):
                 continue
-            if _t in SYS_TEXTS:
+            if _t in SYS_TEXTS or _t.startswith("当前版本不支持该消息"):
                 log.info("设备未读对账：sid=%s 末条是系统文本 %r → 不补", _s, _t[:16])
                 continue
             # 🔴 2026-11-16（DATA-04 P1）：对账补入块此前完全没过 noreply_high 闸 ——
