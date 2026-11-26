@@ -1621,10 +1621,31 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                         log.warning("设备未读对账：sid=%s 摘要不完整 → 已用 db.latest 降级补"
                                     "（source=%s，sender=%s text=%r ts=%s）",
                                     _s, _src_fb, _fb_sender[-6:], _t[:16], _ts2)
+            # 🔴 2026-11-26 晨修（P1 漏回·对账第三级兜底）：镜像 session/chatmsg 连行
+            #   都没有时（切号换库遗留/增量同步缺行，实测 sid=…398936023/…337985965
+            #   连续 5h+ 每 15s 重复「无法定位」告警），镜像双源皆空，上面的
+            #   session_digest 与 db.latest 都救不了。设备库才是真值源：复用 §73
+            #   的 device_session_digest 直查设备 session 行（硬放行路径已接、
+            #   对账块漏接）。mir_text=""/mir_ts=0 传参语义＝镜像无行，设备任何
+            #   非空摘要即视为可补；拿到后继续走下方 SYS_TEXTS / noreply_high /
+            #   镜像滞后 全部过滤 + 定位/身份校验/发送三态，不会发错人。
+            #   设备查询失败（None）→ 落回原「无法定位」告警，行为不变。
+            if not _t or not _uid2 or not _ts2:
+                try:
+                    _dd = _device_digest_newer(db, _s, "", 0)
+                except Exception:
+                    _dd = None
+                if _dd:
+                    _t = (_dd.get("text") or "").strip()
+                    _uid2 = str(_dd.get("to_uid") or "")
+                    _ts2 = int(_dd.get("ts") or 0)
+                    if _t and _uid2 and _ts2:
+                        log.warning("设备未读对账：sid=%s 镜像无行 → 已用设备直查兜底定位"
+                                    "（text=%r ts=%s）", _s, _t[:16], _ts2)
             if not _t or not _uid2 or not _ts2:
                 _missing_no_digest.append(_s)
                 log.warning("设备未读对账：sid=%s 摘要与末条均无法定位收件人/文本 → 本轮无法补入"
-                            "（已尝试 session_digest + db.latest）", _s)
+                            "（已尝试 session_digest + db.latest + 设备直查）", _s)
                 continue
             if _uid2.startswith(SKIP_UID_PREFIX):
                 continue
