@@ -13,6 +13,7 @@
     「这三江偶尔也会想起你。」「看你在三江卖数码挺巧的。」
   匹配次数按天限量，宁可发一句稳的通用句，也不能浪费一次匹配。
 """
+import os
 import re
 import time
 
@@ -24,6 +25,10 @@ log = get_logger("brain.match")
 NEXT_TEXT = "匹配下一个"      # 会话页左上角；实测 res=tv_rem
 MATCH_ENTRY_TEXTS = ("灵魂匹配", "开始匹配", "立即寻找懂你的人")
 REMAIN_RE = re.compile(r"今日剩余\s*(\d+)\s*次")
+# 🔴 2026-11-26 夜修（P0 匹配停摆）：新版左卡不显示剩余次数时，允许「盲点」一次，
+#   靠 quota_out 弹层判断是否 0；同一进程 2 分钟内不重复盲点，防未知页面反复点击。
+BLIND_CLICK_COOL_S = float(os.environ.get("SOUL_MATCH_BLIND_COOL_S", "120") or 120)
+_BLIND_CLICK_LAST = [0.0]
 LIMIT = 20                    # 与旧引擎 opening_line 默认一致
 # 🔴 2026-11-08（_report/14 实测：match 开场白问句率 31.3%）
 #   目标线：硬问句 ≤12%（对齐回复侧 12.5% 的水平，不再做「问句优先」）。
@@ -739,16 +744,27 @@ def match_entry(snap):
     left, top, right, bottom = entry.bounds
     remain = None
     labels = []
+    saw_label = False
     for n in snap.nodes:
         if not n.visible or "今日剩余" not in (n.label or ""):
             continue
         x, y = n.center
         if left <= x <= right and top <= y <= bottom:
+            saw_label = True
             m = REMAIN_RE.search(n.label)
             if m:
                 labels.append(int(m.group(1)))
     if labels:
         remain = labels[0]
+    elif not saw_label:
+        # 🔴 2026-11-26 夜修（P0 匹配停摆 18.5h）：新版星球页左卡只渲染
+        #   「灵魂匹配 / 立即寻找懂你的人 / 开始匹配」，**完全没有「今日剩余 N 次」**。
+        #   实弹探针 00:07 原文：ENTRY=(37,141,438,479) REMAIN=None，而右卡语音匹配
+        #   仍有「今日剩余3次」。旧逻辑把「无次数文案」与「有文案但读不出」混成 None
+        #   → 每轮 fail-closed 不点 → 05:27 之后匹配通道永久停摆。
+        #   -1 = 「卡片没有次数文案」（新版 UI，允许点一次，由 quota_out 弹层兜底）；
+        #   None = 「有次数文案但解析失败」（仍保持 fail-closed，防误点扣费）。
+        remain = -1
     return entry, remain
 
 
@@ -949,6 +965,17 @@ def start_match(actor, max_wait=25):
         if remain is None:
             log.warning("灵魂匹配剩余次数读不到（重读仍 None）→ 本轮不点，避免盲点扣费")
             return snap, "no_start"
+    if remain == -1:
+        # 新版 UI 左卡没有「今日剩余」文案：说明服务端/客户端改版，不是额度 0。
+        # 允许点一次；若额度真的用完，点击后会出现「今日免费匹配机会已用完」弹层，
+        # 下面的 quota_out 会关弹层并返回 no_quota，daemon 记 match_quota_day 停到明天。
+        _now_blind = time.time()
+        if _now_blind - _BLIND_CLICK_LAST[0] < BLIND_CLICK_COOL_S:
+            log.info("灵魂匹配卡片无剩余次数文案（新版UI）→ 距上次盲点不足 %.0fs，本轮不重复点",
+                     BLIND_CLICK_COOL_S)
+            return snap, "no_start"
+        _BLIND_CLICK_LAST[0] = _now_blind
+        log.warning("灵魂匹配卡片无剩余次数文案（新版UI）→ 盲点一次，靠额度弹层兜底")
     log.info("点灵魂匹配 %s，今日剩余=%s", n.bounds, remain if remain is not None else "未知")
 
     before = snap.signature()
