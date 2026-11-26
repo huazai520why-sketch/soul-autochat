@@ -899,6 +899,14 @@ def quota_out(snap):
     """
     try:
         _texts = " ".join(snap.texts())
+        # 🔴 2026-11-26 夜修（P0 续）：真实弹层原文是「今日免费匹配机会已用完 (25/25)」，
+        #   实测弹层不在下半屏（旧 y>1000 区域判据不命中）→ quota_out 返回 False，
+        #   盲点后仍被当 timeout，继续每 30 分钟空点一次。精确文案带 (N/N) 已足够唯一，
+        #   直接判额度用完，不再依赖弹层位置。
+        _exact = re.search(r"今日免费匹配机会已用完\s*\(\s*\d+\s*/\s*\d+\s*\)", _texts)
+        if _exact:
+            log.debug("quota_out 命中精确额度弹层文案: %r", _exact.group(0))
+            return True
         if QUOTA_HINT not in _texts:
             return False
         if not re.search(r"今日.*用完", _texts):
@@ -975,7 +983,15 @@ def start_match(actor, max_wait=25):
                      BLIND_CLICK_COOL_S)
             return snap, "no_start"
         _BLIND_CLICK_LAST[0] = _now_blind
-        log.warning("灵魂匹配卡片无剩余次数文案（新版UI）→ 盲点一次，靠额度弹层兜底")
+        # 🔴 2026-11-26 夜修（P0 续）：卡片容器中心 (237,310) 是空白区，点了不触发；
+        #   真实按钮是「开始匹配」文本 (61,394,197,447)，中心 (129,420)。
+        #   `snap.hit()` 只会返回整张卡的 ratioContainer，必须用 find_one 拿文本节点。
+        _btn = snap.find_one(text="开始匹配")
+        if _btn is not None:
+            n = _btn
+            log.warning("灵魂匹配卡片无剩余次数文案（新版UI）→ 改点「开始匹配」按钮 %s", n.bounds)
+        else:
+            log.warning("灵魂匹配卡片无剩余次数文案（新版UI）→ 未找到「开始匹配」按钮，退回点卡片 %s", n.bounds)
     log.info("点灵魂匹配 %s，今日剩余=%s", n.bounds, remain if remain is not None else "未知")
 
     before = snap.signature()
