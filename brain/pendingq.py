@@ -626,6 +626,14 @@ def _device_unread_sids(db):
 #   candidates() 一轮会调 6+ 次，同一 sid 每次查设备（0.1~0.3s）代价太高。
 _DEV_DIG_CACHE = {}
 
+# 2026-11-26 晨修（P2 噪声）：对账「无法定位」per-sid 抑制（1h TTL）。
+#   实测 sid=…398936023/…337985965：设备 session.lastMsgText 为空（疑语音/图片类
+#   未读，无文本不可安全发送=保守正确）+ 镜像无行 → 每 15s 重复「无法定位」WARNING
+#   一天约 1.7 万行淹没日志。同 sid 1h 内重复降 DEBUG；新面孔/超 1h 仍 WARNING；
+#   若设备摘要后来有真文本，设备直查路径照常补入（抑制只影响日志级别）。
+_NO_DIGEST_SEEN = {}
+_NO_DIGEST_TTL = 3600.0
+
 
 def _device_digest_newer(db, sid, mir_text, mir_ts):
     """设备 session 摘要是否明显比镜像新；是则返回设备摘要，否则 None。
@@ -1643,9 +1651,16 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                         log.warning("设备未读对账：sid=%s 镜像无行 → 已用设备直查兜底定位"
                                     "（text=%r ts=%s）", _s, _t[:16], _ts2)
             if not _t or not _uid2 or not _ts2:
+                # 2026-11-26 晨修（P2 噪声）：同一 sid 1h 内重复失败 → 降 DEBUG。
+                _nd_now = time.time()
+                _nd_prev = _NO_DIGEST_SEEN.get(str(_s))
                 _missing_no_digest.append(_s)
-                log.warning("设备未读对账：sid=%s 摘要与末条均无法定位收件人/文本 → 本轮无法补入"
-                            "（已尝试 session_digest + db.latest + 设备直查）", _s)
+                if _nd_prev and _nd_now - _nd_prev < _NO_DIGEST_TTL:
+                    log.debug("设备未读对账：sid=%s 摘要与末条均无法定位 → 1h 抑制期内（降噪 DEBUG）", _s)
+                else:
+                    _NO_DIGEST_SEEN[str(_s)] = _nd_now
+                    log.warning("设备未读对账：sid=%s 摘要与末条均无法定位收件人/文本 → 本轮无法补入"
+                                "（已尝试 session_digest + db.latest + 设备直查）", _s)
                 continue
             if _uid2.startswith(SKIP_UID_PREFIX):
                 continue
@@ -1730,9 +1745,16 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                         "SOUL_RECONCILE_CAP 调高；补入的 %d 个仍走定位/身份校验/发送三态）",
                         _recon_cap, _dropped_by_cap, _added)
         if _missing_no_digest:
-            log.warning("设备未读对账：%d 个 sid 摘要与末条均无法定位 → 本轮漏回，"
-                        "sid=%s（巡检若频发需查镜像完整性/sync 时序）",
-                        len(_missing_no_digest), _missing_no_digest[:8])
+            # 2026-11-26 晨修（P2 噪声）：全部 sid 都在 1h 抑制期内 → 降 INFO，
+            #   只让「新面孔」触发 WARNING（真正的新漏回才能浮出来）。
+            _nd_now2 = time.time()
+            _nd_all_sup = bool(_NO_DIGEST_SEEN) and all(
+                _nd_now2 - _NO_DIGEST_SEEN.get(str(_s), 0.0) < _NO_DIGEST_TTL
+                for _s in _missing_no_digest)
+            _nd_lv = log.info if _nd_all_sup else log.warning
+            _nd_lv("设备未读对账：%d 个 sid 摘要与末条均无法定位 → 本轮漏回，"
+                   "sid=%s（巡检若频发需查镜像完整性/sync 时序；已知空文本/缺行 sid 1h 内降 INFO）",
+                   len(_missing_no_digest), _missing_no_digest[:8])
     except Exception as _e:
         log.warning("设备未读对账异常（不影响已有候选）: %r", _e)
 
