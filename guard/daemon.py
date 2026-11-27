@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,19 @@ from eyes.page import detect  # noqa: E402
 from guard import lock  # noqa: E402
 
 log = get_logger("guard.daemon")
+
+# 🔴 2026-11-27 晨修（P1 时区口径）：副机系统时区为 UTC+9（比北京快 1h），而 Soul 平台
+#   的匹配额度/奇遇铃按北京 0 点（=副机 01:00）刷新。原先按副机本地日期记账：
+#   副机本地日：北京 23:00 后额度耗尽会被记成「次日」，平台刷新后仍被
+#   「match_quota_day == 今天」闸到副机次日 24 点——实测 11-26 北京 23:28（副机 00:28）
+#   弹「今日免费匹配机会已用完 (25/25)」记成 2026-11-27，北京 11-27 00:00 额度已刷新
+#   但匹配通道瘫痪至副机 11-28 00:00（全天 0 匹配）。日键统一改用北京（UTC+8）日期。
+_BJ_TZ = timezone(timedelta(hours=8))
+
+
+def _bj_day():
+    """平台口径的「今天」（北京 UTC+8）——匹配额度/奇遇铃日键统一用它。"""
+    return datetime.now(_BJ_TZ).strftime("%Y-%m-%d")
 
 # ---- 节奏（用户 2026-11-02 定；写死不给外部 json 覆盖，防 wake_tuning.json 重演）----
 # 🔴🔴 2026-11-08（用户口径：「现在脚本没人聊天去连续匹配吧 灵魂匹配次数花光」）
@@ -438,8 +452,8 @@ def cycle(a, dev, db, st, dry_run=False):
             st.pop("post_switch_bell_done", None)
             log.info("启动首巡布防：先清红点 → 再进奇遇铃「稍后再聊」（uid=%s）", db.uid)
         # 跨天也重置一次（daemon 连续跑几天时不至于永久卡住）
-        if st.get("bell_list_day") != time.strftime("%Y-%m-%d"):
-            st["bell_list_day"] = time.strftime("%Y-%m-%d")
+        if st.get("bell_list_day") != _bj_day():
+            st["bell_list_day"] = _bj_day()
             st.pop("bell_list_n", None)
         # 🔴 2026-11-04（P0-2）：切号后 IM 库文件名会变（token 进文件名），
         #   而 watch 原来只在启动 attach 一次 ⇒ 切号后一直在看旧账号的库，
@@ -881,7 +895,7 @@ def cycle(a, dev, db, st, dry_run=False):
         _can_match = (
             _now_r - float(st.get("last_match", 0) or 0) >= MATCH_EVERY
             and (_now_r - t_round) < (ROUND_BUDGET * 0.5)
-            and st.get("match_quota_day") != time.strftime("%Y-%m-%d")
+            and st.get("match_quota_day") != _bj_day()
         )
         if _can_match:
             _lm = float(st.get("last_match", 0) or 0)
@@ -1027,7 +1041,7 @@ def cycle(a, dev, db, st, dry_run=False):
             return "replied"
 
     now = time.time()
-    if st.get("match_quota_day") == time.strftime("%Y-%m-%d"):
+    if st.get("match_quota_day") == _bj_day():
         log.info("今日匹配额度已用完（已记）→ 跳过匹配，直接走唤醒")
     elif now - float(st.get("last_match", 0)) >= MATCH_EVERY:
         broken = float(st.get("match_broken_at", 0) or 0)
@@ -1168,7 +1182,7 @@ def cycle(a, dev, db, st, dry_run=False):
                 # ④ 额度用完就是终点（用户要的是"花光"）
                 if res == "no_quota":
                     log.info("今日匹配额度已用完（本轮共匹配 %d 个）→ 转唤醒", n_done)
-                    st["match_quota_day"] = time.strftime("%Y-%m-%d")
+                    st["match_quota_day"] = _bj_day()
                     break
                 # ⑤ 被人打断（新消息/铃）就立刻让位
                 if res == "preempted":
@@ -1250,7 +1264,7 @@ def cycle(a, dev, db, st, dry_run=False):
     #        IDLE_DEADEND_BACKOFF_S(600s) 的一次性长退避，期间仍分片扫铃不被打断。
     #   **没有**加强制切号、**没有**改匹配额度 / 唤醒阶梯 / 冷却时长 / 切号逻辑——
     #   那些属产品策略，待用户确认后由相应单元处理。
-    _quota_gone = (st.get("match_quota_day") == time.strftime("%Y-%m-%d"))
+    _quota_gone = (st.get("match_quota_day") == _bj_day())
     if _wake_ran and _quota_gone:
         _zz = int(st.get("pending_zero_rounds", 0) or 0)
         log.warning(
@@ -1326,7 +1340,7 @@ def do_match(a, dev, db, st, dry_run=False, advance_first=False):
         if _pg0 == "chat" and M.has_card(_s0):
             _s1, _pg1, _how = M.advance(a)
             if _how == "no_quota":
-                st["match_quota_day"] = time.strftime("%Y-%m-%d")
+                st["match_quota_day"] = _bj_day()
                 log.warning("今日匹配额度已用完（点下一个时发现）→ 今天不再匹配")
                 return "no_quota"
             if _how != "next":
@@ -1351,7 +1365,7 @@ def do_match(a, dev, db, st, dry_run=False, advance_first=False):
         # 今日额度 50/50 用完：当天不再尝试（明天自然恢复）。
         # 不去点「购次数卡」也不做任务 —— 那是花钱/耗时的事，不归我们干。
         log.warning("⚡ 今日匹配额度已用完 → 今天不再匹配（明天 0 点恢复）")
-        st["match_quota_day"] = time.strftime("%Y-%m-%d")
+        st["match_quota_day"] = _bj_day()
         return "no_quota"
     if pg != "chat":
         # 🔴 2026-11-08 21:0x（P0 空烧的第二个根因）：
