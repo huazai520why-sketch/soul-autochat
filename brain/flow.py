@@ -779,6 +779,15 @@ def _send_lines(actor, lines, nick, page_checked=False, sid="", db=None):
                     log.info("[%s] 联系方式轮：保留完整 %d 条分片（不裁剪）", nick, len(lines))
                 else:
                     lines = lines[:_d.n]
+        # 🔴 2026-11-28 §81 可观测性：线下信号命中但模型没带号 → 明确 WARNING
+        if _contact_ok:
+            try:
+                from brain import contact as _CTf3
+                if not _CTf3.is_contact_lines(lines):
+                    log.warning("[%s] 联系方式轮：线下信号命中但模型未带号（lines=%r）",
+                                nick, " | ".join(lines)[:80])
+            except Exception:
+                pass
     except Exception as _e_sg:
         # P2：原来裸 pass，发送闸异常时静默 fail-open；保留放行语义（可用性优先），
         #   但必须留 WARNING，方便巡检发现「闸没生效」而不是完全无感。

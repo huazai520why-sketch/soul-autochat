@@ -3467,6 +3467,17 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("联系方式轮：保留完整 %d 条分片（不裁剪）", len(lines))
             else:
                 lines = lines[:_gate_n]
+        # 🔴 2026-11-28 §81 可观测性：线下信号命中、台账还没给过，但模型没带号 →
+        #   明确记 WARNING（而不是静默什么也没发生）。下次巡检看这一行就知道
+        #   「有设计无执行」卡在模型还是卡在发送。
+        if _contact_ok:
+            try:
+                from brain import contact as _CTc3
+                if not _CTc3.is_contact_lines(lines):
+                    log.warning("联系方式轮：线下信号命中但模型未带号（sid=%s lines=%r）",
+                                sid, " | ".join(lines)[:80])
+            except Exception:
+                pass
                 log.info("发送闸裁剪：本轮最多发 %d 条（额度）", _gate_n)
 
         if dry_run:
