@@ -1498,7 +1498,20 @@ def run(once=False, dry_run=False):
 
     ok, why = lock.acquire("daemon")
     if not ok:
-        log.error("拿不到锁：%s（另一个实例在跑？）", why)
+        # 🔴 2026-11-28 夜修（P2 噪声）：SoulAutoGuard 每 5 分钟拉起一次 daemon，
+        #   正常单实例下必被锁挡 → 实测 289 条/日 ERROR 噪声。锁新鲜（owner 心跳
+        #   < HEARTBEAT_S）说明正是健壮 daemon 在跑，保活重试属正常，降 INFO；
+        #   锁陈旧/owner 已死才值得 ERROR（真双实例或接管异常）。
+        try:
+            _busy_lk, _info_lk = lock.status()
+            _age_lk = time.time() - float((_info_lk or {}).get("ts") or 0)
+            _fresh_lk = bool(_busy_lk) and 0 <= _age_lk < lock.HEARTBEAT_S
+        except Exception:
+            _fresh_lk = False
+        _lv_lk = log.info if _fresh_lk else log.error
+        _lv_lk("拿不到锁：%s（另一个实例在跑？）%s", why,
+               "——正常保活重试（daemon 心跳新鲜，非故障）" if _fresh_lk
+               else "——请检查是否有异常双实例")
         return 3
 
     log.info("=== soul1.0 daemon 启动 pid=%s ===", os.getpid())

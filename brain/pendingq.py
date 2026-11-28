@@ -46,6 +46,8 @@ CAND_SCAN = int(os.environ.get("SOUL_CAND_SCAN", "60") or 60)
 FIND_PAGES = int(os.environ.get("SOUL_FIND_PAGES", "5") or 5)
 SKIP_UID_PREFIX = ("2042683",                    # 官方营销号段（实测 2042683xx 全是积分/礼物推送）
                    "388335289", "388335475",     # 官方 AI_PARTNER 号（Soul 官方 AI 助手，不能当真人回）
+                   "478918501",                  # 🔴 2026-11-28 夜修（§79 遗留③）：官方 AI 陪聊号
+                                                 #   （§79 实测连续 4 天被当真人计入/回复，21 条+今日 2 条）
                    )
 LOOKBACK_DAYS = 7
 SCAN_SESSIONS = 300
@@ -1637,6 +1639,29 @@ def candidates(db, limit=MAX_N, days=LOOKBACK_DAYS):
                         log.warning("设备未读对账：sid=%s 摘要不完整 → 已用 db.latest 降级补"
                                     "（source=%s，sender=%s text=%r ts=%s）",
                                     _s, _src_fb, _fb_sender[-6:], _t[:16], _ts2)
+            # 🔴 2026-11-28 夜修（P1 伪漏回噪声）：她（或双方）在镜像里只有
+            #   无文本系统消息（msgType 27/35，如互动/占位类）→ 没有任何可回内容，
+            #   不应计「漏回」。实测 5 个固定 sid（type=35 配对空消息、lastMsgText=''）
+            #   每轮被判「无法定位→本轮漏回」刷 INFO 908 行/天，污染漏回口径。
+            #   注意必须用 skip_system=False：db.latest/默认 messages 会滤掉 27/35，
+            #   拿到 None 反而看不到这些消息（first fix 实测不生效的原因）。
+            #   判据收得很窄：她**有**消息、且全部是 27/35、且全部无文本才跳过；
+            #   她有任何一条真文本（哪怕末条是空消息）都不跳，防止误吞真待回。
+            try:
+                _raw_msgs = list(db.messages(str(_s), limit=20, skip_system=False) or [])
+                _her_scan = [m for m in _raw_msgs
+                             if str(getattr(m, "sender", "") or "") != str(db.uid)]
+                _her_scan_txts = [m for m in _her_scan
+                                  if (getattr(m, "text", "") or "").strip()]
+                _her_scan_kinds = [int(getattr(m, "msg_type", 0) or 0)
+                                   for m in _her_scan]
+            except Exception:
+                _her_scan_txts, _her_scan_kinds = [], []
+            if (not _her_scan_txts and _her_scan_kinds
+                    and all(k in (27, 35) for k in _her_scan_kinds)):
+                log.debug("设备未读对账：sid=%s 她的消息全是无文本系统消息"
+                          "（types=%s）→ 不可回，不计漏回", _s, _her_scan_kinds[:4])
+                continue
             # 🔴 2026-11-26 晨修（P1 漏回·对账第三级兜底）：镜像 session/chatmsg 连行
             #   都没有时（切号换库遗留/增量同步缺行，实测 sid=…398936023/…337985965
             #   连续 5h+ 每 15s 重复「无法定位」告警），镜像双源皆空，上面的
