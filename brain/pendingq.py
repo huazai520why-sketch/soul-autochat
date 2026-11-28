@@ -104,6 +104,11 @@ STALE_GIVEUP_H = float(os.environ.get("SOUL_STALE_GIVEUP_H", "72") or 72)
 # 🔴 2026-11-10 §104：72 → 24（用户「超过 24h 的积压重新开场」）。
 #   判据不再只看 age：handle_pending 改用 verdict 状态机（age>=24h 且本回合 0 条）。
 RESTART_H = float(os.environ.get("SOUL_RESTART_H", "24") or 24)
+# 🔴 2026-11-28 §81（用户拍板）：断档 >= RESUME_ACK_H 小时，先补一句回应她最后说的，
+#   不许用新话题覆盖。实测 23% 的「她说完→我方下一条」隔 6h+、12% 隔天；
+#   全库唯一一次线下邀约（芝士就是力量 11-19）就是被 21h 的断档 + 新话题覆盖毁掉的。
+#   0 = 关闭（退回旧行为）。
+RESUME_ACK_H = float(os.environ.get("SOUL_RESUME_ACK_H", "2") or 0)
 # 每轮最多处理几个「重新开场」：29 个一次性发出去像群发，
 #   而且老会话会占掉本轮的发送名额。原来 1 个/轮，配 2 条/轮的额度，
 #   17 个 >72h 的会话要 17 轮（约 1 小时）才轮到一遍 —— 现在 2 个/轮。
@@ -3404,9 +3409,21 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
             # 🔴 用户 2026-11-03 定 B 方案：她那条已经 %.0fh 前，**不当接话处理**。
             #   不喂 hist（旧对话）、不喂她那条（喂了模型就会去答「嗯」），
             #   由引擎「重新开场」模式出一句新由头，只发一条。
-            log.info("她末条已 %.0fh（>%.0fh）→ 不接旧话，走重新开场", age_h, RESTART_H)
-            hist = []
-            lines = R.generate(sid, "", hist=[], n_cand=1, restart_h=age_h)
+            # 🔴 2026-11-28 §81 改：只有「她那条没内容」（空/系统卡/语音占位/极短）
+            #   才走重新开场；有实质内容时必须先接住她最后那句，不能用新话题覆盖。
+            _her_last_q = (txt or "").strip()
+            _no_content = (not _her_last_q) or (_her_last_q in SYS_TEXTS) \
+                or (_her_last_q == V.PLACEHOLDER) or len(_her_last_q) < 4
+            if _no_content:
+                log.info("她末条已 %.0fh（>%.0fh）且无实质内容 → 走重新开场", age_h, RESTART_H)
+                hist = []
+                lines = R.generate(sid, "", hist=[], n_cand=1, restart_h=age_h)
+            else:
+                log.info("她末条已 %.0fh（>%.0fh）但有内容 → 先回应她最后一句（不重新开场）",
+                         age_h, RESTART_H)
+                hist = []
+                _n_resume = max(1, min(2, _gate_n or 2))
+                lines = R.generate(sid, _her_last_q, hist=[], n_cand=_n_resume, resume_h=age_h)
         else:
             msgs = db.messages(sid, limit=12)
             hist = R.build_hist(msgs, db.uid)
@@ -3427,7 +3444,11 @@ def handle_pending(actor, dev, db, max_n=MAX_N, dry_run=False, budget_s=60.0):
                 log.info("联系方式轮：强制出 3 条（3-4-4 拆发）")
             if _gate_n:
                 n = max(1, min(n, _gate_n))
-            lines = R.generate(sid, feed, hist=hist, n_cand=n)
+            # 2026-11-28 §81：2h 以上的断档，先补一句回应她最后说的（restart 已在上面分流）
+            _resume_h = age_h if (RESUME_ACK_H > 0 and age_h >= RESUME_ACK_H) else 0.0
+            if _resume_h:
+                log.info("断档 %.1fh（>=%.0fh）→ 先回应她最后一句再往下", age_h, RESUME_ACK_H)
+            lines = R.generate(sid, feed, hist=hist, n_cand=n, resume_h=_resume_h)
         if not lines:
             # 🔴 必回铁律：已读未回同样是「她说过话」，引擎给不出话也必须回一句，
             #    不能因为生成失败就静默跳过（flow.py 里同样处理）

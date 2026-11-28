@@ -881,7 +881,22 @@ def generate_restart(sid, restart_h, nick=""):
     return [line]
 
 
-def generate(sid, her_msg, hist=None, nick="", n_cand=1, restart_h=0.0):
+def _resume_alert(hours):
+    """断档提示：隔了很久才回，必须先接住她最后那句，不许重新开场。
+
+    2026-11-28 §81（用户拍板）：跨天回复不得用「新话题覆盖」。实测唯一一次
+    线下邀约就是被这条毁掉的（芝士就是力量：她 09:20 递邀约，我方隔 21h 回
+    「22号早上出发，车加满油」，她 10:22 已报团）。
+    """
+    return (
+        "【断档提示·这条已隔 %.0f 小时】\n"
+        "· 第一条**必须先回应她最后说的那件事**（具体内容，不是「在吗」「最近咋样」）。\n"
+        "· **不要**重新开场、**不要**说「好久不见/这几天忙/不好意思刚看到」、**不要**道歉解释。\n"
+        "· 接住之后再自然往下带一句，别一上来就换新话题。\n"
+    ) % float(hours or 0.0)
+
+
+def generate(sid, her_msg, hist=None, nick="", n_cand=1, restart_h=0.0, resume_h=0.0):
     """生成回复，返回 **list**（1~n_cand 条）。失败返回 []（上层负责兜底）。
 
     🔴 2026-11-02 三处口径改造：
@@ -890,6 +905,7 @@ def generate(sid, her_msg, hist=None, nick="", n_cand=1, restart_h=0.0):
       · her_msg 可以已经是「她连发 N 条」的合并文本（见 merge_burst）。
 
     restart_h > 0：走**重新开场**（不接她的话），见 `generate_restart`。
+    resume_h > 0：断档但仍有内容可接 → 先回应她最后一句（2026-11-28 §81）。
     """
     if float(restart_h or 0.0) > 0.0:
         return generate_restart(sid, restart_h, nick=nick)
@@ -908,9 +924,13 @@ def generate(sid, her_msg, hist=None, nick="", n_cand=1, restart_h=0.0):
     #   「后处理」这条路：优先用 v10 出话，但**出了关门句就换兜底**。
     #   不侵入 engine/（那是别的 agent 的写域）。
     _hook = _hook_hit(her_msg)
+    _extra = _hook_alert(_hook) if _hook else ""
+    if float(resume_h or 0.0) > 0.0:
+        # 断档提示优先：先接她最后那句，再谈别的（可与情绪钩子叠加）
+        _extra = (_resume_alert(resume_h) + ("\n" + _extra if _extra else "")).strip()
     try:
         got = b.respond(her_msg, sid=sid, hist=hist or [], max_n=n,
-                        extra_system=_hook_alert(_hook) if _hook else "") or []
+                        extra_system=_extra) or []
     except Exception as e:
         log.warning("v10 出话异常（已兜底）: %r", e)
         got = []

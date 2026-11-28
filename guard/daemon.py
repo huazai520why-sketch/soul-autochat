@@ -1041,7 +1041,21 @@ def cycle(a, dev, db, st, dry_run=False):
             return "replied"
 
     now = time.time()
-    if st.get("match_quota_day") == _bj_day():
+    # 🔴 2026-11-28 §81（用户拍板）：凌晨只回复、不主动开场。
+    #   实测（11-25~11-28）76% 的开场砸在 0-6 点、夜间零回率 64%（白天 55%），
+    #   402 账号甚至北京 04:51 就把当天额度打完 → 白天没匹配可做。
+    #   窗口用环境变量可调：SOUL_MATCH_OPEN_START / SOUL_MATCH_OPEN_END（默认 6 / 24，
+    #   即 0-6 点禁主动开场；设 0/24 恢复全天）。
+    _h_bj = datetime.now(_BJ_TZ).hour
+    _open_lo = int(os.environ.get("SOUL_MATCH_OPEN_START", "6") or 0)
+    _open_hi = int(os.environ.get("SOUL_MATCH_OPEN_END", "24") or 24)
+    if _open_lo <= _open_hi:
+        _in_open_window = _open_lo <= _h_bj < _open_hi
+    else:  # 跨零点窗口，如 22-6
+        _in_open_window = _h_bj >= _open_lo or _h_bj < _open_hi
+    if not _in_open_window:
+        log.info("北京 %02d 点不在主动开场时段（%02d-%02d）→ 只回复，不匹配", _h_bj, _open_lo, _open_hi)
+    elif st.get("match_quota_day") == _bj_day():
         log.info("今日匹配额度已用完（已记）→ 跳过匹配，直接走唤醒")
     elif now - float(st.get("last_match", 0)) >= MATCH_EVERY:
         broken = float(st.get("match_broken_at", 0) or 0)
@@ -1212,7 +1226,11 @@ def cycle(a, dev, db, st, dry_run=False):
 
     # ⑤ 唤醒老友（用户流程：「匹配 → 好友唤醒」；按人计，24h 同人只唤一次）
     now = time.time()
-    if now - float(st.get("last_wake", 0)) >= WAKE_EVERY:
+    # 🔴 2026-11-28 §81：唤醒也是主动开场（给冷掉的人发新话），凌晨同样禁。
+    if not _in_open_window:
+        log.info("北京 %02d 点不在主动开场时段 → 跳过唤醒（只回复）", _h_bj)
+        _wake_ran = False
+    elif now - float(st.get("last_wake", 0)) >= WAKE_EVERY:
         n = do_wake(a, dev, db, st, dry_run=dry_run)
         st["last_wake"] = time.time()
         lock.touch("waked")
